@@ -63,7 +63,7 @@ WIRE_HEADERS = {
     "Accept": "application/rss+xml, application/xml;q=0.9, text/html;q=0.8, */*;q=0.7",
     "Accept-Language": "en-US,en;q=0.9",
 }
-WIRE_ATTEMPTS = 2                # one retry on timeout / 5xx
+WIRE_ATTEMPTS = 3                # retries on timeout / redirect / 5xx
 TOKEN_RE = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
 SEC_BLOCK_SECONDS = 600          # wait 10 minutes after 403/429 from SEC
@@ -645,7 +645,8 @@ class SecBlocked(Exception):
 def describe_error(exc: Exception) -> str:
     """Short, readable error text (httpx timeouts have an empty str())."""
     if isinstance(exc, httpx.HTTPStatusError):
-        return f"HTTP {exc.response.status_code}"
+        location = exc.response.headers.get("Location")
+        return f"HTTP {exc.response.status_code}" + (f" → {location}" if location else "")
     if isinstance(exc, httpx.TimeoutException):
         return f"timeout ({type(exc).__name__})"
     return str(exc).split("\n")[0] or type(exc).__name__
@@ -668,7 +669,8 @@ class Fetcher:
     def is_sec(url: str) -> bool:
         return urlparse(url).netloc.lower().endswith("sec.gov")
 
-    async def get(self, url: str, conditional: bool = False) -> httpx.Response | None:
+    async def get(self, url: str, conditional: bool = False,
+                  follow_redirects: bool = True) -> httpx.Response | None:
         """Returns the response, or None when a conditional request got 304."""
         sec = self.is_sec(url)
         headers = {"User-Agent": self.sec_user_agent} if sec else {"User-Agent": self.wire_user_agent, **WIRE_HEADERS}
@@ -686,7 +688,7 @@ class Fetcher:
                 if wait > 0:
                     await asyncio.sleep(wait)
                 self._sec_last = time.monotonic()
-        resp = await self.client.get(url, headers=headers)
+        resp = await self.client.get(url, headers=headers, follow_redirects=follow_redirects)
         if resp.status_code == 304:
             return None
         if sec and resp.status_code in (403, 429):
@@ -1044,23 +1046,30 @@ class Radar:
 
     # ----- wires ---------------------------------------------------------
 
-    async def poll_wire(self, url: str) -> None:
-        name = wire_source_name(url)
-        resp = None
+    async def fetch_wire_feed(self, url: str, conditional: bool = True) -> httpx.Response | None:
+        """GET a wire RSS feed with retries. Redirects are NOT followed: PR Newswire
+        intermittently 301s to a URL that 404s, while retrying the feed URL works."""
         for attempt in range(1, WIRE_ATTEMPTS + 1):
             try:
-                resp = await self.fetcher.get(url, conditional=True)
-                break
+                return await self.fetcher.get(url, conditional=conditional, follow_redirects=False)
             except Exception as exc:  # noqa: BLE001
-                retryable = isinstance(exc, httpx.TransportError) or (
-                    isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code >= 500)
-                if retryable and attempt < WIRE_ATTEMPTS:
-                    await asyncio.sleep(2)
-                    continue
-                error = describe_error(exc)
-                log.warning("%s poll failed: %s", name, error)
-                self._source_error(name, error)
-                return
+                status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else 0
+                retryable = isinstance(exc, httpx.TransportError) or 300 <= status < 400 or status >= 500
+                if not retryable or attempt == WIRE_ATTEMPTS:
+                    raise
+                log.info("%s: %s, retrying", wire_source_name(url), describe_error(exc))
+                await asyncio.sleep(2)
+        return None  # unreachable
+
+    async def poll_wire(self, url: str) -> None:
+        name = wire_source_name(url)
+        try:
+            resp = await self.fetch_wire_feed(url)
+        except Exception as exc:  # noqa: BLE001
+            error = describe_error(exc)
+            log.warning("%s poll failed: %s", name, error)
+            self._source_error(name, error)
+            return
         if resp is None:
             self._source_ok(name)
             return
@@ -1473,7 +1482,7 @@ class Radar:
             cands += found[:per_source]
         for url in self.cfg.wire_feeds:
             try:
-                resp = await self.fetcher.get(url)
+                resp = await self.fetch_wire_feed(url, conditional=False)
             except Exception as exc:  # noqa: BLE001
                 log.warning("demo: %s failed: %s", wire_source_name(url), describe_error(exc))
                 continue

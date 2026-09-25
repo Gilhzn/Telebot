@@ -754,6 +754,33 @@ class RobustnessTest(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertTrue(radar.state.sources["PR Newswire"]["ok"])
 
+    def test_wire_redirect_is_retried_not_followed(self) -> None:
+        world = base_world()
+        calls: list[str] = []
+
+        def redirect_then_ok(request: httpx.Request) -> httpx.Response:
+            calls.append(str(request.url))
+            if len(calls) == 1:
+                return httpx.Response(301, headers={"Location": "https://www.prnewswire.com/broken"})
+            return httpx.Response(200, content=rss_feed([rss_item("a", "t", "d", "https://x.test/a")]).encode())
+
+        world.routes[PRN] = redirect_then_ok
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(asyncio, "sleep", new=mock.AsyncMock()):
+            async def scenario() -> bot.Radar:
+                async with world.client() as client:
+                    radar = bot.Radar(make_cfg(Path(d)), client)
+                    await radar.poll_wire(PRN)
+                    return radar
+            radar = run(scenario())
+        self.assertEqual(calls, [PRN, PRN])  # the broken redirect target was never requested
+        self.assertTrue(radar.state.sources["PR Newswire"]["ok"])
+
+    def test_redirect_error_shows_location(self) -> None:
+        req = httpx.Request("GET", PRN)
+        resp = httpx.Response(301, headers={"Location": "https://x.test/moved"}, request=req)
+        err = httpx.HTTPStatusError("x", request=req, response=resp)
+        self.assertEqual(bot.describe_error(err), "HTTP 301 → https://x.test/moved")
+
     def test_wire_timeout_error_is_readable(self) -> None:
         world = base_world()
 
