@@ -14,9 +14,9 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "once = regular pass, test = send a sample alert"
+        description: "once = regular pass, test = send a sample alert, diag = check wire feed connectivity"
         type: choice
-        options: [once, test]
+        options: [once, test, diag]
         default: once
 permissions:
   contents: write
@@ -42,8 +42,26 @@ jobs:
         if: inputs.mode == 'test'
         run: python bot.py --test
 
+      - name: diag
+        if: inputs.mode == 'diag'
+        run: |
+          BROWSER="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+          probe() {  # label, url, user-agent
+            printf '%-34s ' "$1"
+            curl -sS -o /tmp/body -m 30 -A "$3" -H "Accept: application/rss+xml, application/xml;q=0.9, */*;q=0.7" \
+              -w 'HTTP %{http_code}  %{time_total}s  %{size_download} bytes  (%{http_version})\n' "$2" || echo "curl failed"
+            head -c 120 /tmp/body 2>/dev/null | tr '\n' ' '; echo
+          }
+          GLOBE="https://www.globenewswire.com/RssFeed/orgclass/1/feedTitle/GlobeNewswire%20-%20News%20about%20Public%20Companies"
+          probe "globe rss / browser UA"   "$GLOBE" "$BROWSER"
+          probe "globe rss / curl UA"      "$GLOBE" "curl/8.5.0"
+          probe "globe rss / reader UA"    "$GLOBE" "Feedly/1.0 (+http://www.feedly.com/fetcher.html)"
+          probe "globe atom / browser UA"  "https://www.globenewswire.com/AtomFeed/orgclass/1/feedTitle/GlobeNewswire%20-%20News%20about%20Public%20Companies" "$BROWSER"
+          probe "globe home / browser UA"  "https://www.globenewswire.com/" "$BROWSER"
+          probe "prnewswire rss / browser" "https://www.prnewswire.com/rss/news-releases-list.rss" "$BROWSER"
+
       - name: load state
-        if: inputs.mode != 'test'
+        if: inputs.mode != 'test' && inputs.mode != 'diag'
         run: |
           if git fetch --depth 1 origin state 2>/dev/null; then
             git show FETCH_HEAD:state.json > state.json && echo "state loaded"
@@ -52,11 +70,11 @@ jobs:
           fi
 
       - name: run
-        if: inputs.mode != 'test'
+        if: inputs.mode != 'test' && inputs.mode != 'diag'
         run: python bot.py --once
 
       - name: save state
-        if: inputs.mode != 'test' && hashFiles('state.json') != ''
+        if: inputs.mode != 'test' && inputs.mode != 'diag' && hashFiles('state.json') != ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
