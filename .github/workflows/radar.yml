@@ -52,7 +52,7 @@ jobs:
             curl -sS --http1.1 -o /tmp/body -m 30 -A "$UA" \
               -H "Accept: application/rss+xml, application/xml;q=0.9, text/html;q=0.8, */*;q=0.7" \
               -H "Accept-Language: en-US,en;q=0.9" \
-              -w 'HTTP %{http_code}  %{time_total}s  %{size_download} bytes\n' "$2" || echo "curl failed"
+              -w 'HTTP %{http_code}  %{time_total}s  %{size_download} bytes  %{redirect_url}\n' "$2" || echo "curl failed"
             echo "    $(head -c 100 /tmp/body 2>/dev/null | tr '\n' ' ')"
           }
           GLOBE="https://www.globenewswire.com/RssFeed/orgclass/1/feedTitle/GlobeNewswire%20-%20News%20about%20Public%20Companies"
