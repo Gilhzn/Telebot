@@ -1479,6 +1479,23 @@ class Radar:
 # ---------------------------------------------------------------------------
 
 
+async def detect_private_chat(tg: Telegram) -> str | None:
+    """The chat id of the latest private chat that messaged the bot (last 24h), if any."""
+    try:
+        updates = await tg.call("getUpdates", {"timeout": 0})
+    except TelegramError as exc:
+        print(f"⚠️ getUpdates נכשל: {exc}")
+        return None
+    private = [
+        str(u["message"]["chat"]["id"]) for u in updates or []
+        if u.get("message", {}).get("chat", {}).get("type") == "private"
+    ]
+    return private[-1] if private else None
+
+
+NO_CHAT_HELP = ("   פתח את הבוט בטלגרם, לחץ Start (או שלח לו הודעה כלשהי), והרץ שוב את הבדיקה.")
+
+
 async def run_test(cfg: Config, client: httpx.AsyncClient) -> int:
     tg = Telegram(client, cfg.telegram_token)
     try:
@@ -1490,39 +1507,62 @@ async def run_test(cfg: Config, client: httpx.AsyncClient) -> int:
         else:
             print(f"❌ שגיאה בחיבור לטלגרם: {exc}")
         return 1
-    print(f"✅ הטוקן תקין: @{me.get('username')}")
+    bot_name = f"@{me.get('username')}"
+    print(f"✅ הטוקן תקין: {bot_name}")
+
     chat_id = cfg.chat_id
+    if chat_id and chat_id == str(me.get("id")):
+        print("❌ TELEGRAM_CHAT_ID הוא המספר של הבוט עצמו (המספר שבתחילת הטוקן), "
+              "ולא ה-chat id שלך. מנסה לזהות את ה-chat id הנכון...")
+        chat_id = ""
+
     if not chat_id:
-        try:
-            updates = await tg.call("getUpdates", {"timeout": 0})
-        except TelegramError as exc:
-            print(f"❌ getUpdates נכשל: {exc}")
+        detected = await detect_private_chat(tg)
+        if not detected:
+            print(f"⚠️ לא נמצאה שיחה פרטית עם {bot_name}.")
+            print(NO_CHAT_HELP)
             return 1
-        private = [
-            str(u["message"]["chat"]["id"]) for u in updates or []
-            if u.get("message", {}).get("chat", {}).get("type") == "private"
-        ]
-        if not private:
-            print("⚠️ לא נמצא chat id. פתח את הבוט בטלגרם, לחץ Start (או שלח הודעה) והרץ שוב.")
-            return 1
-        chat_id = private[-1]
+        # Configured but wrong, or running in CI (public logs): tell the user privately, don't save.
+        if cfg.chat_id or os.getenv("GITHUB_ACTIONS") == "true":
+            return await _send_detected(tg, detected, bot_name)
+        chat_id = detected
         try:
             save_env_var(cfg.env_file, "TELEGRAM_CHAT_ID", chat_id)
             print(f"✅ זוהה chat id {chat_id} ונשמר ב-{cfg.env_file}")
         except OSError as exc:
             print(f"⚠️ זוהה chat id {chat_id} אבל השמירה ל-{cfg.env_file} נכשלה: {exc}")
+
     try:
         await tg.send(chat_id, sample_alert())
     except TelegramError as exc:
         if exc.status == 400:
-            print(f"❌ chat id שגוי או לא קיים ({chat_id}): {exc.description}")
+            print(f"❌ טלגרם לא מכיר את הצ'אט שב-TELEGRAM_CHAT_ID ({exc.description}).")
+            print(f"   או שעוד לא לחצת Start ב-{bot_name}, או שה-chat id שגוי. מנסה לזהות אוטומטית...")
+            detected = await detect_private_chat(tg)
+            if detected and detected != chat_id:
+                return await _send_detected(tg, detected, bot_name)
+            print(NO_CHAT_HELP)
         elif exc.status == 403:
-            print("❌ הבוט חסום או שעוד לא לחצת Start בצ'אט עם הבוט (403).")
+            print(f"❌ הבוט חסום, או שעוד לא לחצת Start בצ'אט עם {bot_name} (403).")
         else:
             print(f"❌ שליחה נכשלה: {exc}")
         return 1
     print("✅ התראת דוגמה נשלחה לטלגרם")
     return 0
+
+
+async def _send_detected(tg: Telegram, chat_id: str, bot_name: str) -> int:
+    """Send the detected chat id to that chat privately (CI logs of a public repo are public)."""
+    text = (f"🔑 זה ה-chat id שלך: <code>{esc(chat_id)}</code>\n"
+            "עדכן אותו בסוד TELEGRAM_CHAT_ID ב-GitHub והרץ שוב את הבדיקה.\n\n" + sample_alert())
+    try:
+        await tg.send(chat_id, text)
+    except TelegramError as exc:
+        print(f"❌ גם השליחה לצ'אט שזוהה נכשלה: {exc}")
+        return 1
+    print(f"📨 נמצאה שיחה פרטית עם {bot_name}. שלחתי לך שם הודעה עם ה-chat id הנכון.")
+    print("   עדכן את הסוד TELEGRAM_CHAT_ID לפי ההודעה בטלגרם, והרץ שוב את הבדיקה.")
+    return 1
 
 
 # ---------------------------------------------------------------------------

@@ -113,6 +113,7 @@ class World:
         self.updates: list[dict[str, Any]] = []
         self.get_updates_payloads: list[dict[str, Any]] = []
         self.send_status = 200
+        self.bad_chats: set[str] = set()
         self.me_status = 200
         self.claude: Callable[[dict[str, Any]], httpx.Response] | None = None
         self.claude_calls: list[dict[str, Any]] = []
@@ -154,6 +155,9 @@ class World:
             result = [u for u in self.updates if u["update_id"] >= offset]
             return httpx.Response(200, json={"ok": True, "result": result})
         if method == "sendMessage":
+            if str(payload.get("chat_id")) in self.bad_chats:
+                return httpx.Response(400, json={
+                    "ok": False, "error_code": 400, "description": "Bad Request: chat not found"})
             if self.send_status != 200:
                 return httpx.Response(self.send_status, json={
                     "ok": False, "error_code": self.send_status, "description": "Bad Request: chat not found"})
@@ -683,6 +687,26 @@ class TestModeTest(unittest.TestCase):
     def test_bad_chat_400(self) -> None:
         self.world.send_status = 400
         self.assertEqual(self.run_test_mode(make_cfg(self.tmp)), 1)
+
+    def test_wrong_chat_id_detects_and_sends_privately(self) -> None:
+        self.world.bad_chats = {"42"}
+        self.world.updates = [{"update_id": 1, "message": {"text": "/start", "chat": {"id": 555, "type": "private"}}}]
+        with mock.patch("builtins.print") as printed:
+            self.assertEqual(self.run_test_mode(make_cfg(self.tmp)), 1)
+        self.assertEqual(self.world.sent[0]["chat_id"], "555")
+        self.assertIn("<code>555</code>", self.world.sent[0]["text"])
+        self.assertNotIn("555", " ".join(str(c) for c in printed.call_args_list))  # not in public logs
+        self.assertFalse((self.tmp / ".env").exists())
+
+    def test_chat_id_equal_to_bot_id(self) -> None:
+        self.world.updates = [{"update_id": 1, "message": {"text": "hi", "chat": {"id": 555, "type": "private"}}}]
+        self.assertEqual(self.run_test_mode(make_cfg(self.tmp, chat_id="1")), 1)  # getMe id is 1
+        self.assertEqual(self.world.sent[0]["chat_id"], "555")
+
+    def test_wrong_chat_id_and_no_updates(self) -> None:
+        self.world.bad_chats = {"42"}
+        self.assertEqual(self.run_test_mode(make_cfg(self.tmp)), 1)
+        self.assertEqual(self.world.sent, [])
 
     def test_blocked_403(self) -> None:
         self.world.send_status = 403
