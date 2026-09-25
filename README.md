@@ -90,6 +90,7 @@ python bot.py               # הרצה רציפה
 | `EDGAR_POLL_SECONDS` | `2` | תדירות דגימת EDGAR |
 | `WIRE_POLL_SECONDS` | `10` | תדירות דגימת הוואיירים |
 | `WIRE_FEEDS` | PR Newswire, GlobeNewswire | כתובות RSS מופרדות בפסיקים |
+| `WIRE_USER_AGENT` | `StockNewsRadar/1.0 (...)` | הזיהוי מול אתרי הוואיירים. אתרים חוסמים זיהוי מזויף של דפדפן |
 | `DEDUP_HOURS` | `6` | חלון מניעת כפילות לטיקר |
 | `MAX_ALERTS_PER_CYCLE` | `15` | תקרת מועמדים למחזור לכל מקור |
 | `STATE_FILE` | `state.json` | נתיב קובץ המצב |
@@ -125,6 +126,7 @@ New Project → Deploy from GitHub repo. ב-Variables להגדיר את הסוד
    - `ANTHROPIC_API_KEY` (אופציונלי)
 3. **הפעלת ה-workflow:** באותו מסך, בלשונית **Variables** → New repository variable: `RADAR_MODE` = `actions`.
 4. **בדיקה:** בלשונית Actions → radar → Run workflow → mode = `test`. תוך דקה תגיע לטלגרם התראת דוגמה.
+   `mode = diag` בודק את החיבור ל-PR Newswire ול-GlobeNewswire משרתי GitHub, בלי לשלוח כלום לטלגרם.
 5. **הרצה ראשונה:** Run workflow → mode = `once`, או לחכות להרצה המתוזמנת. ההרצה הראשונה רק מאתחלת את הפידים ולא שולחת כלום. מההרצה השנייה מגיעות התראות, ו-`/status` בטלגרם יקבל תשובה בהרצה הבאה.
 
 **מגבלות:**

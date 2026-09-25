@@ -45,20 +45,23 @@ jobs:
       - name: diag
         if: inputs.mode == 'diag'
         run: |
-          BROWSER="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-          probe() {  # label, url, user-agent
-            printf '%-34s ' "$1"
-            curl -sS -o /tmp/body -m 30 -A "$3" -H "Accept: application/rss+xml, application/xml;q=0.9, */*;q=0.7" \
-              -w 'HTTP %{http_code}  %{time_total}s  %{size_download} bytes  (%{http_version})\n' "$2" || echo "curl failed"
-            head -c 120 /tmp/body 2>/dev/null | tr '\n' ' '; echo
+          # Same identity and protocol (HTTP/1.1) as the bot's httpx client.
+          UA=$(python -c "import bot; print(bot.WIRE_USER_AGENT)")
+          probe() {  # label, url
+            printf '%-22s ' "$1"
+            curl -sS --http1.1 -o /tmp/body -m 30 -A "$UA" \
+              -H "Accept: application/rss+xml, application/xml;q=0.9, text/html;q=0.8, */*;q=0.7" \
+              -H "Accept-Language: en-US,en;q=0.9" \
+              -w 'HTTP %{http_code}  %{time_total}s  %{size_download} bytes\n' "$2" || echo "curl failed"
+            echo "    $(head -c 100 /tmp/body 2>/dev/null | tr '\n' ' ')"
           }
           GLOBE="https://www.globenewswire.com/RssFeed/orgclass/1/feedTitle/GlobeNewswire%20-%20News%20about%20Public%20Companies"
-          probe "globe rss / browser UA"   "$GLOBE" "$BROWSER"
-          probe "globe rss / curl UA"      "$GLOBE" "curl/8.5.0"
-          probe "globe rss / reader UA"    "$GLOBE" "Feedly/1.0 (+http://www.feedly.com/fetcher.html)"
-          probe "globe atom / browser UA"  "https://www.globenewswire.com/AtomFeed/orgclass/1/feedTitle/GlobeNewswire%20-%20News%20about%20Public%20Companies" "$BROWSER"
-          probe "globe home / browser UA"  "https://www.globenewswire.com/" "$BROWSER"
-          probe "prnewswire rss / browser" "https://www.prnewswire.com/rss/news-releases-list.rss" "$BROWSER"
+          PRN="https://www.prnewswire.com/rss/news-releases-list.rss"
+          for i in 1 2 3; do
+            probe "globenewswire #$i" "$GLOBE"
+            probe "prnewswire #$i" "$PRN"
+            sleep 2
+          done
 
       - name: load state
         if: inputs.mode != 'test' && inputs.mode != 'diag'

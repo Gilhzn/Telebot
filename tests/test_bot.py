@@ -446,6 +446,11 @@ class PipelineTest(unittest.TestCase):
         sec_reqs = [r for r in self.world.requests if r.url.host == "www.sec.gov"]
         self.assertTrue(sec_reqs)
         self.assertTrue(all(r.headers["User-Agent"] == "Test Tester test@example.com" for r in sec_reqs))
+        # Wire requests identify honestly as an RSS reader, not as a browser.
+        wire_reqs = [r for r in self.world.requests if r.url.host == "www.prnewswire.com"]
+        self.assertTrue(wire_reqs)
+        self.assertTrue(all(r.headers["User-Agent"] == bot.WIRE_USER_AGENT for r in wire_reqs))
+        self.assertNotIn("Mozilla", bot.WIRE_USER_AGENT)
 
     def test_claude_engine_and_fallback(self) -> None:
         def claude(payload: dict[str, Any]) -> httpx.Response:

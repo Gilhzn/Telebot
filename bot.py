@@ -56,10 +56,9 @@ ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 
-WIRE_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/128.0.0.0 Safari/537.36"
-)
+# An honest RSS-reader identity. Wire sites' bot protection drops requests that claim
+# to be a browser without behaving like one (seen from GitHub Actions: timeouts / 503).
+WIRE_USER_AGENT = "StockNewsRadar/1.0 (personal RSS reader; +https://github.com/Gilhzn/Telebot)"
 WIRE_HEADERS = {
     "Accept": "application/rss+xml, application/xml;q=0.9, text/html;q=0.8, */*;q=0.7",
     "Accept-Language": "en-US,en;q=0.9",
@@ -274,6 +273,7 @@ class Config:
     edgar_poll: float = 2.0
     wire_poll: float = 10.0
     wire_feeds: list[str] = field(default_factory=lambda: _split(DEFAULT_WIRE_FEEDS))
+    wire_user_agent: str = WIRE_USER_AGENT
     dedup_hours: float = 6.0
     max_per_cycle: int = 15
     state_file: Path = Path("state.json")
@@ -296,6 +296,7 @@ class Config:
             edgar_poll=max(1.0, _env_float("EDGAR_POLL_SECONDS", 2.0)),
             wire_poll=max(2.0, _env_float("WIRE_POLL_SECONDS", 10.0)),
             wire_feeds=_split(_env("WIRE_FEEDS", DEFAULT_WIRE_FEEDS)),
+            wire_user_agent=_env("WIRE_USER_AGENT", WIRE_USER_AGENT),
             dedup_hours=_env_float("DEDUP_HOURS", 6.0),
             max_per_cycle=max(1, _env_int("MAX_ALERTS_PER_CYCLE", 15)),
             state_file=Path(_env("STATE_FILE", "state.json")),
@@ -653,9 +654,11 @@ def describe_error(exc: Exception) -> str:
 class Fetcher:
     """GET with ETag / If-Modified-Since, SEC rate limiting and SEC block handling."""
 
-    def __init__(self, client: httpx.AsyncClient, sec_user_agent: str):
+    def __init__(self, client: httpx.AsyncClient, sec_user_agent: str,
+                 wire_user_agent: str = WIRE_USER_AGENT):
         self.client = client
         self.sec_user_agent = sec_user_agent
+        self.wire_user_agent = wire_user_agent
         self.validators: dict[str, tuple[str | None, str | None]] = {}
         self.sec_blocked_until = 0.0
         self._sec_lock = asyncio.Lock()
@@ -668,7 +671,7 @@ class Fetcher:
     async def get(self, url: str, conditional: bool = False) -> httpx.Response | None:
         """Returns the response, or None when a conditional request got 304."""
         sec = self.is_sec(url)
-        headers = {"User-Agent": self.sec_user_agent} if sec else {"User-Agent": WIRE_USER_AGENT, **WIRE_HEADERS}
+        headers = {"User-Agent": self.sec_user_agent} if sec else {"User-Agent": self.wire_user_agent, **WIRE_HEADERS}
         if conditional and url in self.validators:
             etag, modified = self.validators[url]
             if etag:
@@ -937,7 +940,7 @@ class Radar:
         self.client = client
         self.once = once
         self.state = State.load(cfg.state_file, cfg.watchlist)
-        self.fetcher = Fetcher(client, cfg.sec_user_agent)
+        self.fetcher = Fetcher(client, cfg.sec_user_agent, cfg.wire_user_agent)
         self.tickers = TickerMap()
         self.tg = Telegram(client, cfg.telegram_token)
         self.chat_id = cfg.chat_id
