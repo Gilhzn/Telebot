@@ -8,16 +8,22 @@
 #
 # state.json lives on its own branch "state" as a single commit that is replaced on every
 # run, so the code branch history stays clean.
+#
+# Modes: once (regular pass) · test (sample alert) · diag (wire connectivity)
+#        demo (score the newest REAL items and send the best one + a summary; no state)
+# A push that changes .github/run-request runs the mode written in that file.
 name: radar
 on:
-  schedule: [{cron: "*/5 * * * *"}]
+  schedule: [{cron: "2-59/5 * * * *"}]
   workflow_dispatch:
     inputs:
       mode:
-        description: "once = regular pass, test = send a sample alert, diag = check wire feed connectivity"
+        description: "once = regular pass, test = sample alert, diag = feed connectivity, demo = real-news demo"
         type: choice
-        options: [once, test, diag]
+        options: [once, test, diag, demo]
         default: once
+  push:
+    paths: [".github/run-request"]
 permissions:
   contents: write
 concurrency: {group: radar, cancel-in-progress: false}
@@ -38,12 +44,25 @@ jobs:
         with: {python-version: "3.12", cache: pip}
       - run: pip install -r requirements.txt
 
+      - name: mode
+        env:
+          INPUT_MODE: ${{ inputs.mode }}
+        run: |
+          case "$GITHUB_EVENT_NAME" in
+            workflow_dispatch) MODE="$INPUT_MODE" ;;
+            push) MODE=$(awk 'NF {print $1; exit}' .github/run-request) ;;
+            *) MODE=once ;;
+          esac
+          case "$MODE" in once|test|diag|demo) ;; *) MODE=once ;; esac
+          echo "MODE=$MODE" >> "$GITHUB_ENV"
+          echo "mode: $MODE ($GITHUB_EVENT_NAME)"
+
       - name: test
-        if: inputs.mode == 'test'
+        if: env.MODE == 'test'
         run: python bot.py --test
 
       - name: diag
-        if: inputs.mode == 'diag'
+        if: env.MODE == 'diag'
         run: |
           # Same identity and protocol (HTTP/1.1) as the bot's httpx client.
           UA=$(python -c "import bot; print(bot.WIRE_USER_AGENT)")
@@ -63,8 +82,12 @@ jobs:
             sleep 2
           done
 
+      - name: demo
+        if: env.MODE == 'demo'
+        run: python bot.py --demo
+
       - name: load state
-        if: inputs.mode != 'test' && inputs.mode != 'diag'
+        if: env.MODE == 'once'
         run: |
           if git fetch --depth 1 origin state 2>/dev/null; then
             git show FETCH_HEAD:state.json > state.json && echo "state loaded"
@@ -73,11 +96,11 @@ jobs:
           fi
 
       - name: run
-        if: inputs.mode != 'test' && inputs.mode != 'diag'
+        if: env.MODE == 'once'
         run: python bot.py --once
 
       - name: save state
-        if: inputs.mode != 'test' && inputs.mode != 'diag' && hashFiles('state.json') != ''
+        if: env.MODE == 'once' && hashFiles('state.json') != ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

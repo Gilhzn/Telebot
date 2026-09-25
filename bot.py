@@ -1175,31 +1175,38 @@ class Radar:
                 log.warning("Claude scoring failed for %s, falling back to rules: %s", c.ticker, exc)
                 return None
 
-    async def process(self, c: Candidate) -> None:
-        self.stats["candidates"] += 1
+    async def evaluate(self, c: Candidate) -> tuple[int, str, str | None]:
+        """Fetch the text and score it. Returns (score, reason_he, rejected_label)."""
         try:
             text = await self.fetch_text(c)
         except Exception as exc:  # noqa: BLE001
             log.warning("Fetching text for %s failed: %s", c.link, exc)
             text = c.summary
         body = strip_boilerplate(text)
-        head = f"{c.title}\n{body}" if c.title else body
+        neg = negative_hit(f"{c.title}\n{body[:NEGATIVE_CHARS]}")
+        if neg:
+            return -5, neg, neg
+        rules = rule_score(f"{c.title}\n{body[:LEAD_CHARS]}", c.company)
+        score, reason = rules.score, rules.reason_he
+        if self.cfg.anthropic_key and (rules.score >= 1 or c.watch):
+            head = f"{c.title}\n{body}" if c.title else body
+            ai = await self.claude_score(c, head)
+            if ai is not None:
+                score = ai["score"]
+                reason = ai["reason_he"] or reason
+                if not c.ticker and ai["ticker"]:
+                    c.ticker = normalize_ticker(ai["ticker"])
+        return score, reason, None
+
+    async def process(self, c: Candidate) -> None:
+        self.stats["candidates"] += 1
         score: int | None = None
         reason = ""
         if self.cfg.positive_only or not c.watch:
-            neg = negative_hit(f"{c.title}\n{body[:NEGATIVE_CHARS]}")
-            if neg:
-                log.info("Rejected %s (%s): %s", c.ticker, neg, c.title or c.items)
+            score, reason, rejected = await self.evaluate(c)
+            if rejected:
+                log.info("Rejected %s (%s): %s", c.ticker, rejected, c.title or c.items)
                 return
-            rules = rule_score(f"{c.title}\n{body[:LEAD_CHARS]}", c.company)
-            score, reason = rules.score, rules.reason_he
-            if self.cfg.anthropic_key and (rules.score >= 1 or c.watch):
-                ai = await self.claude_score(c, head)
-                if ai is not None:
-                    score = ai["score"]
-                    reason = ai["reason_he"] or reason
-                    if not c.ticker and ai["ticker"]:
-                        c.ticker = normalize_ticker(ai["ticker"])
             if score < self.cfg.min_score:
                 log.info("Below threshold %s (%s): %s", c.ticker, score, c.title or c.items)
                 return
@@ -1450,6 +1457,59 @@ class Radar:
             self.state.dirty = True
             self.save_state()
 
+    async def run_demo(self, per_source: int = 4) -> int:
+        """Score the newest REAL items in every feed (ignoring 'seen' and the threshold) and
+        send the best one plus a summary to Telegram. State is not touched."""
+        await self.refresh_tickers()
+        cands: list[Candidate] = []
+        for form in self.cfg.edgar_forms:
+            try:
+                resp = await self.fetcher.get(EDGAR_FEED_URL.format(form=quote(form)))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("demo: SEC %s failed: %s", form, describe_error(exc))
+                continue
+            found = [c for f in parse_edgar_feed(resp.content) if f.form == form
+                     for c in [self.edgar_candidate(f)] if c]
+            cands += found[:per_source]
+        for url in self.cfg.wire_feeds:
+            try:
+                resp = await self.fetcher.get(url)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("demo: %s failed: %s", wire_source_name(url), describe_error(exc))
+                continue
+            found = [c for it in parse_wire_feed(resp.content)
+                     for c in [self.wire_candidate(it, wire_source_name(url))] if c]
+            cands += found[:per_source]
+        if not cands:
+            await self.reply("🧪 הדגמה: לא נמצאו כרגע ידיעות עם טיקר אמריקאי בפידים.")
+            return 1
+
+        results = []
+        for c in cands:
+            score, reason, rejected = await self.evaluate(c)
+            results.append((c, score, reason, rejected))
+            log.info("demo: %-6s %+d %s %s", c.ticker, score, f"[{rejected}]" if rejected else "",
+                     c.title or c.items)
+
+        ok = [r for r in results if not r[3]]
+        best = max(ok or results, key=lambda r: r[1])
+        c, score, reason, rejected = best
+        passed = score >= self.cfg.min_score and not rejected
+        header = ("🧪 <b>הדגמה עם ידיעה אמיתית</b> — "
+                  + ("הייתה נשלחת כהתראה" if passed else
+                     f"לא הייתה נשלחת (סף {self.cfg.min_score})") + "\n\n")
+        await self.reply(header + format_alert(c, score, reason or (rejected or "")))
+
+        lines = [f"📋 <b>נבדקו {len(results)} ידיעות אמיתיות מהפידים</b> (ציון · טיקר · מקור)"]
+        for c2, sc, _, rej in sorted(results, key=lambda r: -r[1]):
+            what = esc((c2.title or ", ".join(f"Item {i}" for i in c2.items) or c2.form)[:70])
+            tag = f"❌ נפסל: {esc(rej)}" if rej else f"{sc:+d}"
+            lines.append(f"{tag} · <b>{esc(c2.ticker or '—')}</b> · {esc(c2.source_label)} · {what}")
+        lines.append(f"\nרק ציון {self.cfg.min_score}+ נשלח כהתראה אמיתית.")
+        await self.reply("\n".join(lines))
+        log.info("demo done: %d items, best %s %+d", len(results), c.ticker, score)
+        return 0
+
     async def run_once(self) -> int:
         """One pass. Returns 1 when Telegram rejects the token (so CI shows red), else 0."""
         await self.refresh_tickers()
@@ -1585,7 +1645,9 @@ async def _main_async(args: argparse.Namespace, cfg: Config) -> int:
     async with make_client() as client:
         if args.test:
             return await run_test(cfg, client)
-        radar = Radar(cfg, client, once=args.once)
+        radar = Radar(cfg, client, once=args.once or args.demo)
+        if args.demo:
+            return await radar.run_demo()
         if args.once:
             return await radar.run_once()
         loop = asyncio.get_running_loop()
@@ -1603,6 +1665,8 @@ def main(argv: list[str] | None = None) -> int:
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--test", action="store_true", help="check token, detect chat id, send a sample alert")
     group.add_argument("--once", action="store_true", help="single pass over all sources, then exit")
+    group.add_argument("--demo", action="store_true",
+                       help="score the newest real items and send the best one + a summary (no state)")
     args = parser.parse_args(argv)
 
     load_dotenv(Path(_env("ENV_FILE", ".env")))
@@ -1619,8 +1683,8 @@ def main(argv: list[str] | None = None) -> int:
         missing.append("TELEGRAM_BOT_TOKEN")
     if not args.test and not cfg.sec_user_agent:
         missing.append("SEC_USER_AGENT")
-    if args.once and not cfg.chat_id:
-        missing.append("TELEGRAM_CHAT_ID (חובה במצב --once)")
+    if (args.once or args.demo) and not cfg.chat_id:
+        missing.append("TELEGRAM_CHAT_ID (חובה במצב --once / --demo)")
     if missing:
         print("❌ חסרים משתני סביבה: " + ", ".join(missing))
         return 2

@@ -787,6 +787,29 @@ class RobustnessTest(unittest.TestCase):
             self.assertEqual(run(scenario()), 1)
 
 
+class DemoTest(unittest.TestCase):
+    def test_demo_scores_real_items_and_leaves_state_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(bot, "SEC_MIN_INTERVAL", 0.0):
+            tmp = Path(d)
+            ctx = type("Ctx", (), {"world": base_world()})()
+            PipelineTest.add_new_items(ctx)  # type: ignore[arg-type]
+            world = ctx.world
+
+            async def scenario() -> int:
+                async with world.client() as client:
+                    return await bot.Radar(make_cfg(tmp), client, once=True).run_demo()
+
+            self.assertEqual(run(scenario()), 0)
+            self.assertFalse((tmp / "state.json").exists())
+        self.assertEqual(len(world.sent), 2)
+        best, summary = world.sent[0]["text"], world.sent[1]["text"]
+        self.assertIn("הדגמה עם ידיעה אמיתית", best)
+        self.assertIn("הייתה נשלחת כהתראה", best)
+        self.assertIn("<b>OKLO</b>", best)
+        self.assertIn("❌ נפסל: הנפקה ודילול", summary)  # DLUT offering
+        self.assertIn("TBIO", summary)                    # conference, +0
+
+
 class StateTest(unittest.TestCase):
     def test_seen_is_capped_and_atomic(self) -> None:
         with tempfile.TemporaryDirectory() as d:
