@@ -57,9 +57,15 @@ ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 
 WIRE_USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/126.0 Safari/537.36 StockNewsRadar/1.0"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/128.0.0.0 Safari/537.36"
 )
+WIRE_HEADERS = {
+    "Accept": "application/rss+xml, application/xml;q=0.9, text/html;q=0.8, */*;q=0.7",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+WIRE_ATTEMPTS = 2                # one retry on timeout / 5xx
+TOKEN_RE = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
 SEC_BLOCK_SECONDS = 600          # wait 10 minutes after 403/429 from SEC
 SEC_MIN_INTERVAL = 0.15          # <= ~7 requests/second, well under SEC's 10/s
@@ -276,7 +282,7 @@ class Config:
     @classmethod
     def from_env(cls) -> "Config":
         return cls(
-            telegram_token=_env("TELEGRAM_BOT_TOKEN"),
+            telegram_token=clean_token(_env("TELEGRAM_BOT_TOKEN")),
             chat_id=_env("TELEGRAM_CHAT_ID"),
             sec_user_agent=_env("SEC_USER_AGENT"),
             anthropic_key=_env("ANTHROPIC_API_KEY"),
@@ -295,6 +301,23 @@ class Config:
             state_file=Path(_env("STATE_FILE", "state.json")),
             env_file=Path(_env("ENV_FILE", ".env")),
         )
+
+
+def clean_token(raw: str) -> str:
+    """Forgive common copy/paste mistakes: quotes, whitespace, a leading 'bot'."""
+    token = re.sub(r"\s+", "", raw.strip().strip("'\""))
+    if re.match(r"(?i)^bot\d+:", token):
+        token = token[3:]
+    return token
+
+
+def token_hint(token: str) -> str:
+    """Describe the token's shape without revealing it."""
+    if TOKEN_RE.match(token):
+        return "הפורמט תקין, אבל טלגרם לא מכיר את הטוקן — כנראה בוטל (/revoke) או הועתק מבוט אחר."
+    return (f"הטוקן לא בפורמט הנכון (אורך {len(token)}, "
+            f"{'יש' if ':' in token else 'אין'} נקודתיים). "
+            "טוקן תקין נראה כך: 123456789:AAH... — מספר, נקודתיים ואז כ-35 תווים.")
 
 
 def save_env_var(path: Path, key: str, value: str) -> None:
@@ -615,6 +638,15 @@ class SecBlocked(Exception):
     pass
 
 
+def describe_error(exc: Exception) -> str:
+    """Short, readable error text (httpx timeouts have an empty str())."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"HTTP {exc.response.status_code}"
+    if isinstance(exc, httpx.TimeoutException):
+        return f"timeout ({type(exc).__name__})"
+    return str(exc).split("\n")[0] or type(exc).__name__
+
+
 class Fetcher:
     """GET with ETag / If-Modified-Since, SEC rate limiting and SEC block handling."""
 
@@ -633,7 +665,7 @@ class Fetcher:
     async def get(self, url: str, conditional: bool = False) -> httpx.Response | None:
         """Returns the response, or None when a conditional request got 304."""
         sec = self.is_sec(url)
-        headers = {"User-Agent": self.sec_user_agent if sec else WIRE_USER_AGENT}
+        headers = {"User-Agent": self.sec_user_agent} if sec else {"User-Agent": WIRE_USER_AGENT, **WIRE_HEADERS}
         if conditional and url in self.validators:
             etag, modified = self.validators[url]
             if etag:
@@ -951,8 +983,8 @@ class Radar:
             self._source_error(name, "חסימת SEC — ממתין 10 דקות")
             return
         except Exception as exc:  # noqa: BLE001
-            log.warning("%s poll failed: %s", name, exc)
-            self._source_error(name, str(exc) or type(exc).__name__)
+            log.warning("%s poll failed: %s", name, describe_error(exc))
+            self._source_error(name, describe_error(exc))
             return
         self._source_ok(name)
         if resp is None:
@@ -1008,12 +1040,21 @@ class Radar:
 
     async def poll_wire(self, url: str) -> None:
         name = wire_source_name(url)
-        try:
-            resp = await self.fetcher.get(url, conditional=True)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("%s poll failed: %s", name, exc)
-            self._source_error(name, str(exc) or type(exc).__name__)
-            return
+        resp = None
+        for attempt in range(1, WIRE_ATTEMPTS + 1):
+            try:
+                resp = await self.fetcher.get(url, conditional=True)
+                break
+            except Exception as exc:  # noqa: BLE001
+                retryable = isinstance(exc, httpx.TransportError) or (
+                    isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code >= 500)
+                if retryable and attempt < WIRE_ATTEMPTS:
+                    await asyncio.sleep(2)
+                    continue
+                error = describe_error(exc)
+                log.warning("%s poll failed: %s", name, error)
+                self._source_error(name, error)
+                return
         if resp is None:
             self._source_ok(name)
             return
@@ -1403,10 +1444,17 @@ class Radar:
             self.state.dirty = True
             self.save_state()
 
-    async def run_once(self) -> None:
+    async def run_once(self) -> int:
+        """One pass. Returns 1 when Telegram rejects the token (so CI shows red), else 0."""
         await self.refresh_tickers()
         try:
             await self.process_updates(timeout=0)
+        except TelegramError as exc:
+            if exc.status in (401, 404):
+                log.error("Telegram rejected TELEGRAM_BOT_TOKEN (%s). %s", exc.status,
+                          token_hint(self.cfg.telegram_token))
+                return 1
+            log.warning("Processing pending Telegram commands failed: %s", exc)
         except Exception as exc:  # noqa: BLE001
             log.warning("Processing pending Telegram commands failed: %s", exc)
         for form in self.cfg.edgar_forms:
@@ -1417,6 +1465,10 @@ class Radar:
         self.save_state()
         log.info("Once run done: checked=%d candidates=%d alerts=%d",
                  self.stats["checked"], self.stats["candidates"], self.stats["alerts"])
+        for name, s in sorted(self.state.sources.items()):
+            log.info("  %s %s%s", "✅" if s.get("ok") else "❌", name,
+                     "" if s.get("ok") else f" — {s.get('error')}")
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1430,7 +1482,8 @@ async def run_test(cfg: Config, client: httpx.AsyncClient) -> int:
         me = await tg.call("getMe")
     except TelegramError as exc:
         if exc.status in (401, 404):
-            print("❌ הטוקן שגוי או בוטל (401). הנפק טוקן ב-@BotFather ועדכן את TELEGRAM_BOT_TOKEN.")
+            print(f"❌ טלגרם דחה את הטוקן ({exc.status}). {token_hint(cfg.telegram_token)}")
+            print("   העתק מחדש את הטוקן מ-@BotFather ועדכן את TELEGRAM_BOT_TOKEN.")
         else:
             print(f"❌ שגיאה בחיבור לטלגרם: {exc}")
         return 1
@@ -1488,8 +1541,7 @@ async def _main_async(args: argparse.Namespace, cfg: Config) -> int:
             return await run_test(cfg, client)
         radar = Radar(cfg, client, once=args.once)
         if args.once:
-            await radar.run_once()
-            return 0
+            return await radar.run_once()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:

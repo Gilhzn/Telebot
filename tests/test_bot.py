@@ -689,6 +689,74 @@ class TestModeTest(unittest.TestCase):
         self.assertEqual(self.run_test_mode(make_cfg(self.tmp)), 1)
 
 
+class RobustnessTest(unittest.TestCase):
+    def test_clean_token(self) -> None:
+        good = "123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw"
+        self.assertEqual(bot.clean_token(f'  "{good}"\n'), good)
+        self.assertEqual(bot.clean_token(f"bot{good}"), good)
+        self.assertEqual(bot.clean_token(good[:20] + " " + good[20:]), good)
+
+    def test_token_hint_does_not_leak(self) -> None:
+        bad = "not-a-token-secret"
+        hint = bot.token_hint(bad)
+        self.assertNotIn(bad, hint)
+        self.assertIn("לא בפורמט", hint)
+        self.assertIn("בוטל", bot.token_hint("123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw"))
+
+    def test_wire_retry_then_success(self) -> None:
+        world = base_world()
+        calls: list[int] = []
+
+        def flaky(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            if len(calls) == 1:
+                return httpx.Response(502, text="bad gateway")
+            return httpx.Response(200, content=rss_feed([rss_item("a", "t", "d", "https://x.test/a")]).encode())
+
+        world.routes[PRN] = flaky
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(asyncio, "sleep", new=mock.AsyncMock()):
+            async def scenario() -> bot.Radar:
+                async with world.client() as client:
+                    radar = bot.Radar(make_cfg(Path(d)), client)
+                    await radar.poll_wire(PRN)
+                    return radar
+            radar = run(scenario())
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(radar.state.sources["PR Newswire"]["ok"])
+
+    def test_wire_timeout_error_is_readable(self) -> None:
+        world = base_world()
+
+        def timeout(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("", request=request)
+
+        world.routes[PRN] = timeout
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(asyncio, "sleep", new=mock.AsyncMock()):
+            async def scenario() -> bot.Radar:
+                async with world.client() as client:
+                    radar = bot.Radar(make_cfg(Path(d)), client)
+                    await radar.poll_wire(PRN)
+                    return radar
+            radar = run(scenario())
+        self.assertEqual(radar.state.sources["PR Newswire"]["error"], "timeout (ReadTimeout)")
+
+    def test_once_fails_on_rejected_token(self) -> None:
+        world = base_world()
+        real = world.telegram
+
+        def reject(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/getUpdates"):
+                return httpx.Response(401, json={"ok": False, "error_code": 401, "description": "Unauthorized"})
+            return real(request)
+
+        world.telegram = reject  # type: ignore[method-assign]
+        with tempfile.TemporaryDirectory() as d:
+            async def scenario() -> int:
+                async with world.client() as client:
+                    return await bot.Radar(make_cfg(Path(d)), client, once=True).run_once()
+            self.assertEqual(run(scenario()), 1)
+
+
 class StateTest(unittest.TestCase):
     def test_seen_is_capped_and_atomic(self) -> None:
         with tempfile.TemporaryDirectory() as d:
