@@ -1,0 +1,36 @@
+# Stock News Radar on GitHub Actions: one --once pass every 5 minutes.
+# Alerts arrive 5+ minutes late here; a server (Railway / Oracle) is the recommended mode.
+#
+# Disabled by default so it never runs next to a server (two states = duplicate alerts).
+# To enable: Settings → Secrets and variables → Actions → Variables → RADAR_MODE = actions
+# and add the secrets TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, SEC_USER_AGENT (+ optional ANTHROPIC_API_KEY).
+name: radar
+on:
+  schedule: [{cron: "*/5 * * * *"}]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency: {group: radar, cancel-in-progress: false}
+jobs:
+  run:
+    if: vars.RADAR_MODE == 'actions'
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12", cache: pip}
+      - run: pip install -r requirements.txt
+      - run: python bot.py --once
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          STATE_FILE: state.json
+      - name: save state
+        run: |
+          git config user.name radar-bot
+          git config user.email radar-bot@users.noreply.github.com
+          git add -f state.json
+          git diff --cached --quiet || (git commit -m "state" && git pull --rebase && git push)

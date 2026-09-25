@@ -1,0 +1,12 @@
+# secrets and runtime state
+.env
+.env.tmp
+state.json
+state.json.tmp
+*.tmp
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
