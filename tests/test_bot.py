@@ -702,6 +702,7 @@ class RobustnessTest(unittest.TestCase):
         self.assertNotIn(bad, hint)
         self.assertIn("לא בפורמט", hint)
         self.assertIn("בוטל", bot.token_hint("123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw"))
+        self.assertIn("רק החלק שאחרי הנקודתיים", bot.token_hint("AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsawX"))
 
     def test_wire_retry_then_success(self) -> None:
         world = base_world()

@@ -315,6 +315,9 @@ def token_hint(token: str) -> str:
     """Describe the token's shape without revealing it."""
     if TOKEN_RE.match(token):
         return "הפורמט תקין, אבל טלגרם לא מכיר את הטוקן — כנראה בוטל (/revoke) או הועתק מבוט אחר."
+    if ":" not in token and 30 <= len(token) <= 40:
+        return (f"נראה שנשמר רק החלק שאחרי הנקודתיים (אורך {len(token)}). "
+                "חסר המספר שבתחילת הטוקן — יש להעתיק את כל הטוקן, כולל 123456789: בהתחלה.")
     return (f"הטוקן לא בפורמט הנכון (אורך {len(token)}, "
             f"{'יש' if ':' in token else 'אין'} נקודתיים). "
             "טוקן תקין נראה כך: 123456789:AAH... — מספר, נקודתיים ואז כ-35 תווים.")
