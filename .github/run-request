@@ -1,3 +1,3 @@
-once 1
+once
 # First word: mode (once / test / diag / demo). Optional second word: MIN_SCORE for this run only.
-# Test run 2/2 with threshold 1 (requested by the user); back to the default 4 afterwards.
+# Threshold test finished; runs use the default MIN_SCORE (4).
