@@ -13,8 +13,8 @@
 #        demo (score the newest REAL items and send the best one + a summary; no state)
 # A push that changes .github/run-request runs the mode written in that file.
 name: radar
+# The 5-minute schedule lives in radar-schedule.yml, which dispatches this workflow.
 on:
-  schedule: [{cron: "2-59/5 * * * *"}]
   workflow_dispatch:
     inputs:
       mode:
@@ -51,7 +51,7 @@ jobs:
           case "$GITHUB_EVENT_NAME" in
             workflow_dispatch) MODE="$INPUT_MODE" ;;
             push) MODE=$(awk 'NF {print $1; exit}' .github/run-request) ;;
-            *) MODE=once ;;
+            *) MODE=once ;;  # schedule (legacy) or anything else
           esac
           case "$MODE" in once|test|diag|demo) ;; *) MODE=once ;; esac
           echo "MODE=$MODE" >> "$GITHUB_ENV"
