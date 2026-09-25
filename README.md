@@ -114,11 +114,24 @@ New Project → Deploy from GitHub repo. ב-Variables להגדיר את הסוד
 ### GitHub Actions (מצב `--once`)
 `python bot.py --once` טוען את `state.json`, מטפל בפקודות טלגרם שממתינות, עובר פעם אחת על כל המקורות, ממתין לסיום הדירוג, שומר ויוצא. בלי הודעת הפעלה ובלי זיהוי אוטומטי של chat id.
 
-ה-workflow ב-`.github/workflows/radar.yml` רץ כל 5 דקות ושומר את `state.json` בקומיט. הוא **כבוי כברירת מחדל**, כדי שלא ירוץ במקביל לשרת (שני קבצי מצב = התראות כפולות). כדי להפעיל:
-1. Settings → Secrets and variables → Actions → Secrets: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `SEC_USER_AGENT`, ואופציונלית `ANTHROPIC_API_KEY`.
-2. באותו מסך, בלשונית Variables: `RADAR_MODE` = `actions`.
+ה-workflow ב-`.github/workflows/radar.yml` רץ כל 5 דקות. את `state.json` הוא שומר בענף נפרד בשם `state`, כקומיט יחיד שמוחלף בכל הרצה, כך שהיסטוריית הקוד נשארת נקייה. הוא **כבוי כברירת מחדל**, כדי שלא ירוץ במקביל לשרת (שני קבצי מצב = התראות כפולות).
 
-סיכון: פיד RSS מחזיק רק עשרות פריטים אחרונים, ובשעות העומס הודעות עלולות לגלוש מהפיד בין הרצה להרצה. פיד EDGAR מחזיק 100 פריטים לכל סוג, וזה מספיק ל-5 דקות.
+**הפעלה:**
+1. **chat id:** פתח את הבוט בטלגרם ולחץ Start. אחר כך פתח בדפדפן את הכתובת `https://api.telegram.org/bot<TOKEN>/getUpdates`, כשבמקום `<TOKEN>` מופיע הטוקן שלך. המספר שמופיע אחרי `"chat":{"id":` הוא ה-chat id.
+2. **סודות:** בריפו ב-GitHub, Settings → Secrets and variables → Actions → **Secrets** → New repository secret:
+   - `TELEGRAM_BOT_TOKEN`
+   - `TELEGRAM_CHAT_ID`
+   - `SEC_USER_AGENT` (שם ואימייל)
+   - `ANTHROPIC_API_KEY` (אופציונלי)
+3. **הפעלת ה-workflow:** באותו מסך, בלשונית **Variables** → New repository variable: `RADAR_MODE` = `actions`.
+4. **בדיקה:** בלשונית Actions → radar → Run workflow → mode = `test`. תוך דקה תגיע לטלגרם התראת דוגמה.
+5. **הרצה ראשונה:** Run workflow → mode = `once`, או לחכות להרצה המתוזמנת. ההרצה הראשונה רק מאתחלת את הפידים ולא שולחת כלום. מההרצה השנייה מגיעות התראות, ו-`/status` בטלגרם יקבל תשובה בהרצה הבאה.
+
+**מגבלות:**
+- GitHub לא מבטיח את התזמון. בפועל הרצות של "כל 5 דקות" מתעכבות לפעמים ל-10–15 דקות.
+- פיד RSS מחזיק רק עשרות פריטים אחרונים, ובשעות העומס הודעות עלולות לגלוש מהפיד בין הרצה להרצה. פיד EDGAR מחזיק 100 פריטים לכל סוג, וזה מספיק ל-5 דקות.
+- בריפו ציבורי GitHub משבית workflows מתוזמנים אחרי 60 יום בלי פעילות בריפו. אם זה קורה, מפעילים מחדש מלשונית Actions.
+- הריפו ציבורי, ולכן הלוגים של ההרצות (כותרות הידיעות) ו-`state.json` (רשימת המעקב) גלויים לכולם. הסודות מוסתרים.
 
 ## בדיקות
 

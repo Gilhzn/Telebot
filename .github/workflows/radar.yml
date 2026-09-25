@@ -1,13 +1,23 @@
 # Stock News Radar on GitHub Actions: one --once pass every 5 minutes.
-# Alerts arrive 5+ minutes late here; a server (Railway / Oracle) is the recommended mode.
+# Alerts arrive 5+ minutes late here; a server (Railway / Oracle) is faster.
 #
-# Disabled by default so it never runs next to a server (two states = duplicate alerts).
-# To enable: Settings → Secrets and variables → Actions → Variables → RADAR_MODE = actions
-# and add the secrets TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, SEC_USER_AGENT (+ optional ANTHROPIC_API_KEY).
+# Setup (README → "GitHub Actions"):
+#   Settings → Secrets and variables → Actions
+#     Secrets:   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, SEC_USER_AGENT (+ optional ANTHROPIC_API_KEY)
+#     Variables: RADAR_MODE = actions   (off by default, so it never runs next to a server)
+#
+# state.json lives on its own branch "state" as a single commit that is replaced on every
+# run, so the code branch history stays clean.
 name: radar
 on:
   schedule: [{cron: "*/5 * * * *"}]
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "once = regular pass, test = send a sample alert"
+        type: choice
+        options: [once, test]
+        default: once
 permissions:
   contents: write
 concurrency: {group: radar, cancel-in-progress: false}
@@ -16,21 +26,45 @@ jobs:
     if: vars.RADAR_MODE == 'actions'
     runs-on: ubuntu-latest
     timeout-minutes: 4
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      STATE_FILE: state.json
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: {python-version: "3.12", cache: pip}
       - run: pip install -r requirements.txt
-      - run: python bot.py --once
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          STATE_FILE: state.json
-      - name: save state
+
+      - name: test
+        if: inputs.mode == 'test'
+        run: python bot.py --test
+
+      - name: load state
+        if: inputs.mode != 'test'
         run: |
+          if git fetch --depth 1 origin state 2>/dev/null; then
+            git show FETCH_HEAD:state.json > state.json && echo "state loaded"
+          else
+            echo "no state branch yet — first run will only initialise the feeds"
+          fi
+
+      - name: run
+        if: inputs.mode != 'test'
+        run: python bot.py --once
+
+      - name: save state
+        if: inputs.mode != 'test' && hashFiles('state.json') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/state" && cp state.json "$RUNNER_TEMP/state/"
+          cd "$RUNNER_TEMP/state"
+          git init -q -b state
           git config user.name radar-bot
           git config user.email radar-bot@users.noreply.github.com
-          git add -f state.json
-          git diff --cached --quiet || (git commit -m "state" && git pull --rebase && git push)
+          git add state.json
+          git commit -q -m "state $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" state
