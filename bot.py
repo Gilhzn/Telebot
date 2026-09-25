@@ -951,6 +951,7 @@ class Radar:
         self.started = time.time()
         self.stats = {"checked": 0, "candidates": 0, "ai_calls": 0, "ai_errors": 0, "alerts": 0}
         self.stop_event = asyncio.Event()
+        self.pending_status = False  # --once: answer /status after polling, with fresh data
 
     # ----- source status -------------------------------------------------
 
@@ -1264,7 +1265,7 @@ class Radar:
         now = time.time()
         lines = ["📊 <b>סטטוס</b>"]
         if self.once:
-            lines.append("⏱ מצב --once (הרצה מתוזמנת)")
+            lines.append("⏱ מצב --once · הנתונים של ההרצה הזו")
         else:
             lines.append(f"⏱ זמן פעילות: {fmt_duration(now - self.started)}")
         lines.append(f"🔎 ידיעות שנבדקו: {self.stats['checked']} · מועמדים: {self.stats['candidates']}"
@@ -1334,7 +1335,10 @@ class Radar:
             wl = self.state.watchlist
             await self.reply("📋 רשימת מעקב: " + (", ".join(wl) if wl else "ריקה"))
         elif cmd == "/status":
-            await self.reply(self.status_text())
+            if self.once:
+                self.pending_status = True
+            else:
+                await self.reply(self.status_text())
         elif cmd == "/test":
             await self.reply(sample_alert())
         else:
@@ -1536,6 +1540,8 @@ class Radar:
             await self.poll_edgar(form)
         await asyncio.gather(*(self.poll_wire(u) for u in self.cfg.wire_feeds))
         await self.drain()
+        if self.pending_status:
+            await self.reply(self.status_text())
         self.state.dirty = True
         self.save_state()
         log.info("Once run done: checked=%d candidates=%d alerts=%d",

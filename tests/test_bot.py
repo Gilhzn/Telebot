@@ -653,6 +653,21 @@ class CommandsTest(unittest.TestCase):
         self.assertEqual(len(self.world.sent), 1)
         self.assertIn("OKLO", self.world.sent[0]["text"])
 
+    def test_once_answers_status_after_polling(self) -> None:
+        self.world.updates = [self.update(20, "/status")]
+
+        async def scenario() -> None:
+            async with self.world.client() as client:
+                await bot.Radar(make_cfg(self.tmp), client, once=True).run_once()
+
+        with mock.patch.object(bot, "SEC_MIN_INTERVAL", 0.0):
+            run(scenario())
+        self.assertEqual(len(self.world.sent), 1)
+        text = self.world.sent[0]["text"]
+        self.assertIn("הנתונים של ההרצה הזו", text)
+        self.assertIn("✅ SEC 8-K — עודכן לפני", text)  # fresh from this run, not the previous one
+        self.assertNotIn("עוד לא נדגם", text)
+
     def test_once_requires_chat_id(self) -> None:
         env = {"TELEGRAM_BOT_TOKEN": "1:A", "SEC_USER_AGENT": "a b@c.d", "TELEGRAM_CHAT_ID": "",
                "ENV_FILE": str(self.tmp / ".env")}
