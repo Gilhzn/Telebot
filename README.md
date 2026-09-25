@@ -129,8 +129,27 @@ New Project → Deploy from GitHub repo. ב-Variables להגדיר את הסוד
    `mode = diag` בודק את החיבור ל-PR Newswire ול-GlobeNewswire משרתי GitHub, בלי לשלוח כלום לטלגרם.
 5. **הרצה ראשונה:** Run workflow → mode = `once`, או לחכות להרצה המתוזמנת. ההרצה הראשונה רק מאתחלת את הפידים ולא שולחת כלום. מההרצה השנייה מגיעות התראות, ו-`/status` בטלגרם יקבל תשובה בהרצה הבאה.
 
+**הפעלה אמינה כל 5 דקות (מומלץ):** המתזמן של GitHub לא אמין. הוא מתעכב לעיתים קרובות ב-10–30 דקות, ולפעמים לא מפעיל כלל workflow חדש. במקום לסמוך עליו, שירות חיצוני חינמי מפעיל את ה-workflow כל 5 דקות:
+1. **טוקן GitHub מוגבל:** https://github.com/settings/personal-access-tokens/new → Fine-grained token.
+   - Repository access: Only select repositories → `Telebot`.
+   - Permissions → Repository permissions → **Actions: Read and write**. זו ההרשאה היחידה שצריך.
+   - Generate token והעתקה.
+2. **cron-job.org:** נרשמים בחינם ב-https://cron-job.org ויוצרים Cronjob חדש:
+   - URL: `https://api.github.com/repos/Gilhzn/Telebot/actions/workflows/radar.yml/dispatches`
+   - Schedule: Every 5 minutes
+   - Advanced → Request method: **POST**
+   - Advanced → Headers:
+     - `Authorization`: `Bearer <הטוקן משלב 1>`
+     - `Accept`: `application/vnd.github+json`
+     - `X-GitHub-Api-Version`: `2022-11-28`
+     - `Content-Type`: `application/json`
+   - Advanced → Request body: `{"ref":"claude/stock-news-radar-bot-05owh7","inputs":{"mode":"once"}}`
+3. **בדיקה:** ב-cron-job.org לוחצים Test run. תשובה `204` פירושה הצלחה, ובלשונית Actions מופיעה הרצה חדשה.
+
+אם הענף ישתנה בעתיד (למשל מיזוג ל-`main`), צריך לעדכן את `ref` בגוף הבקשה. ה-cron של GitHub נשאר כגיבוי. שתי הפעלות אף פעם לא רצות במקביל (הגדרת concurrency), כך שלא נוצרות התראות כפולות.
+
 **מגבלות:**
-- GitHub לא מבטיח את התזמון. בפועל הרצות של "כל 5 דקות" מתעכבות לפעמים ל-10–15 דקות.
+- GitHub לא מבטיח את התזמון של ה-cron הפנימי. לכן מומלצת ההפעלה החיצונית שלמעלה.
 - פיד RSS מחזיק רק עשרות פריטים אחרונים, ובשעות העומס הודעות עלולות לגלוש מהפיד בין הרצה להרצה. פיד EDGAR מחזיק 100 פריטים לכל סוג, וזה מספיק ל-5 דקות.
 - בריפו ציבורי GitHub משבית workflows מתוזמנים אחרי 60 יום בלי פעילות בריפו. אם זה קורה, מפעילים מחדש מלשונית Actions.
 - הריפו ציבורי, ולכן הלוגים של ההרצות (כותרות הידיעות) ו-`state.json` (רשימת המעקב) גלויים לכולם. הסודות מוסתרים.
