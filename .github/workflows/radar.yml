@@ -56,6 +56,14 @@ jobs:
           case "$MODE" in once|test|diag|demo) ;; *) MODE=once ;; esac
           echo "MODE=$MODE" >> "$GITHUB_ENV"
           echo "mode: $MODE ($GITHUB_EVENT_NAME)"
+          # Optional one-off threshold for this run only: second word of .github/run-request, e.g. "once 1".
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            MIN=$(awk 'NF {print $2; exit}' .github/run-request)
+            if [[ "$MIN" =~ ^-?[0-5]$ ]]; then
+              echo "MIN_SCORE=$MIN" >> "$GITHUB_ENV"
+              echo "one-off MIN_SCORE=$MIN for this run"
+            fi
+          fi
 
       - name: test
         if: env.MODE == 'test'

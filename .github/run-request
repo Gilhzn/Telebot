@@ -1,2 +1,3 @@
-once
-# Change the first word (once / test / diag / demo) and push to run that mode on GitHub Actions.
+once 1
+# First word: mode (once / test / diag / demo). Optional second word: MIN_SCORE for this run only.
+# Test run 1/2 with threshold 1 (requested by the user); back to the default 4 afterwards.
