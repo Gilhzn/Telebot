@@ -71,33 +71,7 @@ jobs:
 
       - name: diag
         if: env.MODE == 'diag'
-        run: |
-          # Same identity and protocol (HTTP/1.1) as the bot's httpx client.
-          UA=$(python -c "import bot; print(bot.WIRE_USER_AGENT)")
-          probe() {  # label, url
-            printf '%-22s ' "$1"
-            curl -sS --http1.1 -o /tmp/body -m 30 -A "$UA" \
-              -H "Accept: application/rss+xml, application/xml;q=0.9, text/html;q=0.8, */*;q=0.7" \
-              -H "Accept-Language: en-US,en;q=0.9" \
-              -w 'HTTP %{http_code}  %{time_total}s  %{size_download} bytes  %{redirect_url}\n' "$2" || echo "curl failed"
-            echo "    $(head -c 100 /tmp/body 2>/dev/null | tr '\n' ' ')"
-          }
-          GLOBE="https://www.globenewswire.com/RssFeed/orgclass/1/feedTitle/GlobeNewswire%20-%20News%20about%20Public%20Companies"
-          PRN="https://www.prnewswire.com/rss/news-releases-list.rss"
-          probe "globenewswire" "$GLOBE"
-          probe "prnewswire (all)" "$PRN"
-          # Candidate PR Newswire category feeds: HTTP status + number of <item>s.
-          for path in health-latest-news/health-latest-news-list.rss \
-                      health-latest-news/biotechnology-list.rss \
-                      health-latest-news/pharmaceuticals-list.rss \
-                      financial-services-latest-news/financial-services-latest-news-list.rss \
-                      technology-latest-news/technology-latest-news-list.rss \
-                      energy-latest-news/energy-latest-news-list.rss \
-                      heavy-industry-manufacturing-latest-news/heavy-industry-manufacturing-latest-news-list.rss; do
-            probe "prn $path" "https://www.prnewswire.com/rss/$path"
-            echo "    items: $(grep -o '<item>' /tmp/body 2>/dev/null | wc -l)  first: $(grep -o '<title>[^<]*' /tmp/body 2>/dev/null | sed -n 2p | cut -c8-90)"
-            sleep 1
-          done
+        run: python tools/probe_feeds.py
 
       - name: demo
         if: env.MODE == 'demo'
