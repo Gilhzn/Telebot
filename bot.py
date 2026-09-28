@@ -479,11 +479,25 @@ def _amount_usd(number: str, unit: str | None) -> float:
     return value
 
 
-def rule_score(text: str, company: str = "") -> RuleResult:
+STRONG_CHARS = 400  # strong phrases (4-5 points) must be in the headline or the opening
+PERSONNEL_TITLE_RE = re.compile(
+    r"\b(?:appoints?|appointment|names?|named|welcomes|hires|promotes|elects?)\b.{0,80}?"
+    r"\b(?:chief|CEO|CFO|COO|CTO|president|director|officer|chair(?:man|woman)?|board)\b", I)
+
+
+def rule_score(text: str, company: str = "", strong_text: str | None = None,
+               title: str = "") -> RuleResult:
+    """Rules score. 4-5 point phrases only count inside `strong_text` (headline + opening),
+    and only inside the headline for personnel announcements, where a line like
+    "...following FDA approval of Genio..." is company background, not news."""
     score = 0
     labels: list[str] = []
+    if strong_text is None:
+        strong_text = text
+    if title and PERSONNEL_TITLE_RE.search(title):
+        strong_text = title
     for points, label, pattern in POSITIVE_RULES:
-        if pattern.search(text):
+        if pattern.search(strong_text if points >= 4 else text):
             score += points
             if label not in labels:
                 labels.append(label)
@@ -1328,7 +1342,8 @@ class Radar:
         neg = negative_hit(f"{c.title}\n{body[:NEGATIVE_CHARS]}")
         if neg:
             return -5, neg, neg, None
-        rules = rule_score(f"{c.title}\n{body[:LEAD_CHARS]}", c.company)
+        rules = rule_score(f"{c.title}\n{body[:LEAD_CHARS]}", c.company,
+                           strong_text=f"{c.title}\n{body[:STRONG_CHARS]}", title=c.title)
         catalyst = None
         if rules.score < 4:  # a strong item is the result itself, not an announcement of one
             catalyst = find_catalyst(f"{c.title}\n{body[:LEAD_CHARS]}", us_eastern_now().date())

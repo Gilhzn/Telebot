@@ -252,6 +252,21 @@ class RulesTest(unittest.TestCase):
                 "longer be listed on Nasdaq. Amended and Restated Bylaws will be adopted.")
         self.assertIsNone(bot.negative_hit(text))
 
+    def test_strong_phrases_need_headline_or_opening(self) -> None:
+        title = "Nyxoah Appoints Liam Kelly as Chief Executive Officer"
+        body = ("MONT-SAINT-GUIBERT, Belgium, Sept. 28, 2026 (GLOBE NEWSWIRE) -- Nyxoah SA (Nasdaq: NYXH) "
+                "today announced the appointment of Liam Kelly as CEO. The company commercialises Genio "
+                "in the U.S. following FDA approval in 2025.")
+        res = bot.rule_score(f"{title}\n{body}", "Nyxoah SA", strong_text=f"{title}\n{body[:400]}",
+                             title=title)
+        self.assertEqual(res.score, 0)
+        late = "x" * 500 + " The company recently received FDA approval for another product."
+        res = bot.rule_score(f"Acme reports update\n{late}", strong_text=f"Acme reports update\n{late[:400]}")
+        self.assertEqual(res.score, 0)
+        opening = "Acme today announced FDA approval of its drug."
+        res = bot.rule_score(f"Acme update\n{opening}", strong_text=f"Acme update\n{opening}")
+        self.assertEqual(res.score, 5)
+
     def test_bonuses_only_with_positive_score(self) -> None:
         self.assertEqual(bot.rule_score("Company mentions NVIDIA and $900 million").score, 0)
         res = bot.rule_score("Company announces strategic partnership with NVIDIA")
