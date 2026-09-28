@@ -28,7 +28,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse
 
 import feedparser
 import httpx
@@ -62,7 +62,15 @@ DEFAULT_WIRE_FEEDS = ",".join([
     _PRN + "heavy-industry-manufacturing-latest-news/heavy-industry-manufacturing-latest-news-list.rss",
     "https://www.globenewswire.com/RssFeed/orgclass/1/feedTitle/"
     "GlobeNewswire%20-%20News%20about%20Public%20Companies",
+    *(f"https://www.globenewswire.com/RssFeed/industry/{code}-{quote(name)}/feedTitle/"
+      f"GlobeNewswire%20-%20Industry%20News%20on%20{quote(name)}"
+      for code, name in (("4000", "Health Care"), ("4573", "Biotechnology"), ("4577", "Pharmaceuticals"),
+                         ("9576", "Semiconductors"), ("2717", "Defense"), ("2713", "Aerospace"))),
+    # Business Wire "All News". Its releases rarely carry the ticker in the feed and its site
+    # blocks automated page reads, so tickers come from the company name in the headline.
+    "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeGVtRWA==",
 ])
+NO_PAGE_HOSTS = ("businesswire.com",)
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
@@ -748,6 +756,9 @@ def wire_source_name(url: str) -> str:
             m = re.fullmatch(r"(.+?)(?:-latest-news)?-list\.rss", leaf)
             if needle == "prnewswire" and m and m.group(1) != "news-releases":
                 return f"{name} · {m.group(1)}"
+            industry = re.search(r"/industry/\d+-([^/]+)", parsed.path)
+            if needle == "globenewswire" and industry:
+                return f"{name} · {unquote(industry.group(1))}"
             return name
     return host or url
 
@@ -820,10 +831,23 @@ class Fetcher:
         return resp
 
 
+_NAME_SUFFIXES = {"inc", "incorporated", "corp", "corporation", "co", "company", "ltd", "limited",
+                  "plc", "llc", "lp", "sa", "nv", "ag", "se", "holdings", "holding", "group", "the",
+                  "de", "del", "adr", "ads", "class"}
+GENERIC_NAMES = {"american", "global", "first", "united", "national", "international", "general",
+                 "new", "china", "digital", "capital", "energy", "health", "bank"}
+
+
+def normalize_company(name: str) -> str:
+    words = re.findall(r"[a-z0-9]+", name.lower().replace("&", " and "))
+    return " ".join(w for w in words if w not in _NAME_SUFFIXES)
+
+
 class TickerMap:
     def __init__(self) -> None:
         self.by_ticker: dict[str, tuple[int, str]] = {}
         self.by_cik: dict[int, list[str]] = {}
+        self.by_name: dict[str, str] = {}  # normalized company name -> primary ticker
         self.loaded_at = 0.0
 
     @property
@@ -836,9 +860,12 @@ class TickerMap:
             return
         self.by_ticker[t] = (cik, name)
         self.by_cik.setdefault(cik, []).append(t)
+        key = normalize_company(name)
+        if len(key) >= 4 and key not in GENERIC_NAMES:
+            self.by_name.setdefault(key, t)
 
     def load(self, data: Any) -> None:
-        self.by_ticker, self.by_cik = {}, {}
+        self.by_ticker, self.by_cik, self.by_name = {}, {}, {}
         if isinstance(data, dict) and "fields" in data:  # company_tickers_exchange.json
             f = {name: i for i, name in enumerate(data["fields"])}
             for row in data["data"]:
@@ -856,6 +883,16 @@ class TickerMap:
 
     def tickers_for_cik(self, cik: int) -> list[str]:
         return self.by_cik.get(cik, [])
+
+    def match_title(self, title: str) -> str | None:
+        """Ticker of a listed company whose full name starts the headline, e.g.
+        "Kirby Corporation Announces ..." -> KEX. Longest match wins; exact names only."""
+        words = re.findall(r"[\w&'.-]+", title)[:8]
+        for n in range(len(words), 0, -1):
+            key = normalize_company(" ".join(words[:n]))
+            if key in self.by_name:
+                return self.by_name[key]
+        return None
 
 
 class State:
@@ -997,6 +1034,7 @@ class Candidate:
     form: str = ""
     items: list[str] = field(default_factory=list)
     summary: str = ""
+    text: str | None = None     # fetched text, cached between steps
 
     @property
     def dedup_key(self) -> str:
@@ -1249,9 +1287,11 @@ class Radar:
             log.info("%s initialized: %d existing items marked as seen", name, len(items))
 
     def wire_candidate(self, it: WireItem, source_name: str) -> Candidate | None:
-        if not it.tickers:
-            return None  # no US exchange ticker in the release
-        ticker = it.tickers[0]
+        # Ticker from the feed text, else from a listed company's name opening the headline
+        # (Business Wire rarely puts the ticker in its feed).
+        ticker = it.tickers[0] if it.tickers else self.tickers.match_title(it.title)
+        if ticker is None:
+            return None  # no US exchange ticker: private or non-US company
         watch = ticker in self.state.watchlist
         if not watch and not self.cfg.marketwide:
             return None
@@ -1281,6 +1321,13 @@ class Radar:
                 t.cancel()
 
     async def fetch_text(self, c: Candidate) -> str:
+        if c.text is None:
+            c.text = await self._fetch_text(c)
+        return c.text
+
+    async def _fetch_text(self, c: Candidate) -> str:
+        if c.source == "wire" and urlparse(c.link).netloc.lower().endswith(NO_PAGE_HOSTS):
+            return c.summary
         if c.source == "sec":
             index = await self.fetcher.get(c.link)
             assert index is not None

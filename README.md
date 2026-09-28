@@ -8,7 +8,7 @@
 | מקור | תדירות |
 |---|---|
 | SEC EDGAR, פיד חי של 8-K ו-6-K (כולל ההודעה לעיתונות EX-99.x) | כל 2 שניות |
-| PR Newswire, GlobeNewswire (RSS) | כל 10 שניות |
+| PR Newswire, GlobeNewswire, Business Wire (16 פידי RSS) | כל 10 שניות |
 | מיפוי טיקרים של ה-SEC | פעם ביום |
 
 רק מניות שנסחרות בבורסות בארה"ב (NASDAQ, NYSE, NYSE American, CBOE). ההתראות בעברית, לצ'אט פרטי אחד.
@@ -93,7 +93,7 @@ python bot.py               # הרצה רציפה
 | `EDGAR_FORMS` | `8-K,6-K` | סוגי דיווחים |
 | `EDGAR_POLL_SECONDS` | `2` | תדירות דגימת EDGAR |
 | `WIRE_POLL_SECONDS` | `10` | תדירות דגימת הוואיירים |
-| `WIRE_FEEDS` | PR Newswire (הפיד הכללי ועוד 7 פידים לפי תחום: health, biotechnology, pharmaceuticals, financial-services, technology, energy, heavy-industry-manufacturing), GlobeNewswire | כתובות RSS מופרדות בפסיקים. כל פיד של PR Newswire מחזיק רק 20 פריטים, והפידים לפי תחום שומרים יותר היסטוריה בין דגימה לדגימה |
+| `WIRE_FEEDS` | 16 פידים: PR Newswire (כללי + 7 תחומים), GlobeNewswire (חברות ציבוריות + Health Care, Biotechnology, Pharmaceuticals, Semiconductors, Defense, Aerospace), Business Wire | כתובות RSS מופרדות בפסיקים. כל פיד מחזיק רק כ-20 פריטים, ופידים לפי תחום שומרים יותר היסטוריה בין דגימה לדגימה. ב-Business Wire הטיקר כמעט לא מופיע בפיד, ולכן הבוט מזהה אותו לפי שם החברה בתחילת הכותרת (התאמה מדויקת לשם ברשימת ה-SEC) |
 | `WIRE_USER_AGENT` | `StockNewsRadar/1.0 (...)` | הזיהוי מול אתרי הוואיירים. אתרים חוסמים זיהוי מזויף של דפדפן |
 | `DEDUP_HOURS` | `6` | חלון מניעת כפילות לטיקר |
 | `MAX_ALERTS_PER_CYCLE` | `15` | תקרת מועמדים למחזור לכל מקור |

@@ -862,6 +862,47 @@ class RobustnessTest(unittest.TestCase):
             run(scenario())
         self.assertEqual(len(world.sent), 1)
 
+    def test_ticker_from_company_name_in_headline(self) -> None:
+        tm = bot.TickerMap()
+        tm.load({"fields": ["cik", "name", "ticker", "exchange"], "data": [
+            [1, "Kirby Corp", "KEX", "NYSE"], [2, "Apple Inc.", "AAPL", "Nasdaq"],
+            [3, "Apple Hospitality REIT, Inc.", "APLE", "NYSE"], [4, "Global Industries Inc", "GLBL", "NYSE"],
+            [5, "Pink Co", "PINK", "OTC"]]})
+        self.assertEqual(tm.match_title("Kirby Corporation Announces Third Quarter Date"), "KEX")
+        self.assertEqual(tm.match_title("Apple Hospitality REIT Declares Dividend"), "APLE")
+        self.assertEqual(tm.match_title("Apple Inc. Unveils New iPhone"), "AAPL")
+        self.assertIsNone(tm.match_title("Global Payments Reports Results"))
+        self.assertIsNone(tm.match_title("Pink Co Announces Deal"))  # OTC is not in the map
+
+    def test_business_wire_item_without_ticker_uses_company_name(self) -> None:
+        bw = "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeGVtRWA=="
+        world = base_world()
+        world.set(bw, rss_feed([rss_item("bw-old", "Old", "x", "https://www.businesswire.com/news/home/old")]))
+        calls: list[str] = []
+        real = world.handler
+
+        def spy(request: httpx.Request) -> httpx.Response:
+            calls.append(str(request.url))
+            return real(request)
+
+        world.handler = spy  # type: ignore[method-assign]
+        with tempfile.TemporaryDirectory() as d:
+            async def scenario() -> None:
+                async with world.client() as client:
+                    radar = bot.Radar(make_cfg(Path(d), wire_feeds=[bw]), client)
+                    await radar.refresh_tickers()
+                    await radar.poll_wire(bw)
+                    world.set(bw, rss_feed([rss_item(
+                        "bw-1", "Oklo Inc. Awarded $450 Million Contract by U.S. Department of Defense",
+                        "No ticker in this summary", "https://www.businesswire.com/news/home/oklo")]))
+                    await radar.poll_wire(bw)
+                    await radar.drain()
+            run(scenario())
+        self.assertEqual(len(world.sent), 1)
+        self.assertIn("<b>OKLO</b> | Oklo Inc.", world.sent[0]["text"])
+        self.assertIn("📰 Business Wire", world.sent[0]["text"])
+        self.assertFalse(any("businesswire.com/news/home/oklo" in u for u in calls))  # page not fetched
+
     def test_wire_timeout_error_is_readable(self) -> None:
         world = base_world()
 
