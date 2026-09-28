@@ -796,6 +796,26 @@ class RobustnessTest(unittest.TestCase):
         err = httpx.HTTPStatusError("x", request=req, response=resp)
         self.assertEqual(bot.describe_error(err), "HTTP 301 → https://x.test/moved")
 
+    def test_feed_overflow_is_detected(self) -> None:
+        world = base_world()
+        with tempfile.TemporaryDirectory() as d:
+            async def scenario() -> bot.Radar:
+                async with world.client() as client:
+                    radar = bot.Radar(make_cfg(Path(d)), client)
+                    await radar.poll_wire(PRN)            # first run: initialise
+                    world.set(PRN, rss_feed([rss_item("n1", "a", "b", "https://x.test/1"),
+                                             rss_item("old-1", "Old news", "x", "https://x.test/o")]))
+                    await radar.poll_wire(PRN)            # overlap with the last poll: fine
+                    world.set(PRN, rss_feed([rss_item("n2", "a", "b", "https://x.test/2"),
+                                             rss_item("n3", "a", "b", "https://x.test/3")]))
+                    await radar.poll_wire(PRN)            # nothing known left: gap
+                    return radar
+            radar = run(scenario())
+        entry = radar.state.sources["PR Newswire"]
+        self.assertEqual(entry["overflows"], 1)
+        self.assertTrue(entry["ok"])
+        self.assertIn("ייתכן שפוספסו ידיעות 1 פעמים", radar.status_text())
+
     def test_wire_timeout_error_is_readable(self) -> None:
         world = base_world()
 

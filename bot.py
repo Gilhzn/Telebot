@@ -1049,11 +1049,24 @@ class Radar:
     # ----- source status -------------------------------------------------
 
     def _source_ok(self, name: str) -> None:
-        self.state.sources[name] = {"ok": True, "last_ok": time.time(), "error": ""}
+        prev = self.state.sources.get(name, {})
+        self.state.sources[name] = {**prev, "ok": True, "last_ok": time.time(), "error": ""}
 
     def _source_error(self, name: str, error: str) -> None:
         prev = self.state.sources.get(name, {})
-        self.state.sources[name] = {"ok": False, "last_ok": prev.get("last_ok"), "error": error[:200]}
+        self.state.sources[name] = {**prev, "ok": False, "error": error[:200]}
+
+    def _check_overflow(self, name: str, keys: list[str], first: bool) -> None:
+        """Every item in the feed is new → older items scrolled out of the feed before we
+        read them, i.e. news may have been missed. Counted per source for /status."""
+        if first or not keys or any(self.state.is_seen(k) for k in keys):
+            return
+        entry = self.state.sources.setdefault(name, {})
+        entry["overflows"] = int(entry.get("overflows", 0)) + 1
+        entry["last_overflow"] = time.time()
+        self.state.dirty = True
+        log.warning("%s: all %d feed items are new — items may have been missed since the last poll",
+                    name, len(keys))
 
     # ----- tickers -------------------------------------------------------
 
@@ -1094,6 +1107,7 @@ class Radar:
         filings = parse_edgar_feed(resp.content)
         init_key = f"edgar:{form}"
         first = init_key not in self.state.initialized
+        self._check_overflow(name, [f"sec:{f.accession}" for f in filings], first)
         dispatched = 0
         for f in reversed(filings):  # oldest first
             key = f"sec:{f.accession}"
@@ -1174,6 +1188,7 @@ class Radar:
         self._source_ok(name)
         init_key = f"wire:{url}"
         first = init_key not in self.state.initialized
+        self._check_overflow(name, [f"wire:{it.key}" for it in items], first)
         dispatched = 0
         for it in reversed(items):
             key = f"wire:{it.key}"
@@ -1451,9 +1466,13 @@ class Radar:
                 continue
             last = f"עודכן לפני {fmt_duration(now - s['last_ok'])}" if s.get("last_ok") else "לא עודכן"
             if s.get("ok"):
-                lines.append(f"✅ {esc(name)} — {last}")
+                line = f"✅ {esc(name)} — {last}"
             else:
-                lines.append(f"❌ {esc(name)} — {esc(s.get('error', ''))} ({last})")
+                line = f"❌ {esc(name)} — {esc(s.get('error', ''))} ({last})"
+            if s.get("overflows"):
+                line += (f"\n   ⚠️ ייתכן שפוספסו ידיעות {s['overflows']} פעמים "
+                         f"(אחרון לפני {fmt_duration(now - s['last_overflow'])})")
+            lines.append(line)
         blocked = self.fetcher.sec_blocked_until - now
         if blocked > 0:
             lines.append(f"⛔ SEC חסום, חידוש בעוד {fmt_duration(blocked)}")
