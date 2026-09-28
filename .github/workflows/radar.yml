@@ -84,10 +84,19 @@ jobs:
           }
           GLOBE="https://www.globenewswire.com/RssFeed/orgclass/1/feedTitle/GlobeNewswire%20-%20News%20about%20Public%20Companies"
           PRN="https://www.prnewswire.com/rss/news-releases-list.rss"
-          for i in 1 2 3; do
-            probe "globenewswire #$i" "$GLOBE"
-            probe "prnewswire #$i" "$PRN"
-            sleep 2
+          probe "globenewswire" "$GLOBE"
+          probe "prnewswire (all)" "$PRN"
+          # Candidate PR Newswire category feeds: HTTP status + number of <item>s.
+          for path in health-latest-news/health-latest-news-list.rss \
+                      health-latest-news/biotechnology-list.rss \
+                      health-latest-news/pharmaceuticals-list.rss \
+                      financial-services-latest-news/financial-services-latest-news-list.rss \
+                      technology-latest-news/technology-latest-news-list.rss \
+                      energy-latest-news/energy-latest-news-list.rss \
+                      heavy-industry-manufacturing-latest-news/heavy-industry-manufacturing-latest-news-list.rss; do
+            probe "prn $path" "https://www.prnewswire.com/rss/$path"
+            echo "    items: $(grep -o '<item>' /tmp/body 2>/dev/null | wc -l)  first: $(grep -o '<title>[^<]*' /tmp/body 2>/dev/null | sed -n 2p | cut -c8-90)"
+            sleep 1
           done
 
       - name: demo

@@ -1,3 +1,3 @@
-once
+diag
 # First word: mode (once / test / diag / demo). Optional second word: MIN_SCORE for this run only.
 # Threshold test finished; runs use the default MIN_SCORE (4).
