@@ -93,7 +93,7 @@ python bot.py               # הרצה רציפה
 | `EDGAR_FORMS` | `8-K,6-K` | סוגי דיווחים |
 | `EDGAR_POLL_SECONDS` | `2` | תדירות דגימת EDGAR |
 | `WIRE_POLL_SECONDS` | `10` | תדירות דגימת הוואיירים |
-| `WIRE_FEEDS` | PR Newswire, GlobeNewswire | כתובות RSS מופרדות בפסיקים |
+| `WIRE_FEEDS` | PR Newswire (הפיד הכללי ועוד 7 פידים לפי תחום: health, biotechnology, pharmaceuticals, financial-services, technology, energy, heavy-industry-manufacturing), GlobeNewswire | כתובות RSS מופרדות בפסיקים. כל פיד של PR Newswire מחזיק רק 20 פריטים, והפידים לפי תחום שומרים יותר היסטוריה בין דגימה לדגימה |
 | `WIRE_USER_AGENT` | `StockNewsRadar/1.0 (...)` | הזיהוי מול אתרי הוואיירים. אתרים חוסמים זיהוי מזויף של דפדפן |
 | `DEDUP_HOURS` | `6` | חלון מניעת כפילות לטיקר |
 | `MAX_ALERTS_PER_CYCLE` | `15` | תקרת מועמדים למחזור לכל מקור |

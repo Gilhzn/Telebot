@@ -47,11 +47,22 @@ EDGAR_FEED_URL = (
 # The exchange variant lets us keep only exchange-listed companies (no OTC).
 TICKERS_EXCHANGE_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
 TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
-DEFAULT_WIRE_FEEDS = (
-    "https://www.prnewswire.com/rss/news-releases-list.rss,"
+# The PR Newswire "all news" feed holds only 20 items, which scroll out within minutes on a
+# busy morning (that is how a KOD topline release was missed). Category feeds hold 20 items
+# each for a narrower slice, so together they keep far more history between polls.
+_PRN = "https://www.prnewswire.com/rss/"
+DEFAULT_WIRE_FEEDS = ",".join([
+    _PRN + "news-releases-list.rss",
+    _PRN + "health-latest-news/health-latest-news-list.rss",
+    _PRN + "health-latest-news/biotechnology-list.rss",
+    _PRN + "health-latest-news/pharmaceuticals-list.rss",
+    _PRN + "financial-services-latest-news/financial-services-latest-news-list.rss",
+    _PRN + "technology-latest-news/technology-latest-news-list.rss",
+    _PRN + "energy-latest-news/energy-latest-news-list.rss",
+    _PRN + "heavy-industry-manufacturing-latest-news/heavy-industry-manufacturing-latest-news-list.rss",
     "https://www.globenewswire.com/RssFeed/orgclass/1/feedTitle/"
-    "GlobeNewswire%20-%20News%20about%20Public%20Companies"
-)
+    "GlobeNewswire%20-%20News%20about%20Public%20Companies",
+])
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
@@ -713,10 +724,16 @@ def parse_wire_feed(content: bytes | str) -> list[WireItem]:
 
 
 def wire_source_name(url: str) -> str:
-    host = urlparse(url).netloc.lower()
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
     for needle, name in (("prnewswire", "PR Newswire"), ("globenewswire", "GlobeNewswire"),
                          ("businesswire", "Business Wire"), ("accessnewswire", "ACCESS Newswire")):
         if needle in host:
+            # Category feeds, e.g. ".../health-latest-news/biotechnology-list.rss" -> "biotechnology".
+            leaf = parsed.path.rsplit("/", 1)[-1]
+            m = re.fullmatch(r"(.+?)(?:-latest-news)?-list\.rss", leaf)
+            if needle == "prnewswire" and m and m.group(1) != "news-releases":
+                return f"{name} · {m.group(1)}"
             return name
     return host or url
 
@@ -1044,7 +1061,9 @@ class Radar:
         self.started = time.time()
         self.stats = {"checked": 0, "candidates": 0, "ai_calls": 0, "ai_errors": 0, "alerts": 0}
         self.stop_event = asyncio.Event()
-        self.pending_status = False  # --once: answer /status after polling, with fresh data
+        self.pending_status = False
+        # --once handles ~5 minutes of news per pass, so it gets a larger per-source cap.
+        self.max_per_cycle = cfg.max_per_cycle * (4 if once else 1)  # --once: answer /status after polling, with fresh data
 
     # ----- source status -------------------------------------------------
 
@@ -1093,7 +1112,11 @@ class Radar:
         name = f"SEC {form}"
         url = EDGAR_FEED_URL.format(form=quote(form))
         try:
-            resp = await self.fetcher.get(url, conditional=True)
+            try:
+                resp = await self.fetcher.get(url, conditional=True)
+            except httpx.TransportError:  # SEC's live feed often times out; one quick retry
+                await asyncio.sleep(1)
+                resp = await self.fetcher.get(url, conditional=True)
         except SecBlocked:
             self._source_error(name, "חסימת SEC — ממתין 10 דקות")
             return
@@ -1120,7 +1143,7 @@ class Radar:
             cand = self.edgar_candidate(f)
             if cand is None:
                 continue
-            if dispatched >= self.cfg.max_per_cycle:
+            if dispatched >= self.max_per_cycle:
                 log.warning("%s: over MAX_ALERTS_PER_CYCLE, skipping %s", name, f.accession)
                 continue
             dispatched += 1
@@ -1201,7 +1224,7 @@ class Radar:
             cand = self.wire_candidate(it, name)
             if cand is None:
                 continue
-            if dispatched >= self.cfg.max_per_cycle:
+            if dispatched >= self.max_per_cycle:
                 log.warning("%s: over MAX_ALERTS_PER_CYCLE, skipping %s", name, it.title)
                 continue
             dispatched += 1

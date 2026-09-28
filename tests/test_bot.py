@@ -816,6 +816,37 @@ class RobustnessTest(unittest.TestCase):
         self.assertTrue(entry["ok"])
         self.assertIn("ייתכן שפוספסו ידיעות 1 פעמים", radar.status_text())
 
+    def test_prn_category_feed_names(self) -> None:
+        self.assertEqual(bot.wire_source_name(PRN), "PR Newswire")
+        self.assertEqual(bot.wire_source_name(
+            "https://www.prnewswire.com/rss/health-latest-news/biotechnology-list.rss"),
+            "PR Newswire · biotechnology")
+        self.assertEqual(bot.wire_source_name(
+            "https://www.prnewswire.com/rss/health-latest-news/health-latest-news-list.rss"),
+            "PR Newswire · health")
+
+    def test_same_release_in_two_feeds_is_processed_once(self) -> None:
+        bio = "https://www.prnewswire.com/rss/health-latest-news/biotechnology-list.rss"
+        world = base_world()
+        world.set(bio, rss_feed([rss_item("old-bio", "Old", "x", "https://x.test/ob")]))
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(bot, "SEC_MIN_INTERVAL", 0.0):
+            async def scenario() -> None:
+                async with world.client() as client:
+                    radar = bot.Radar(make_cfg(Path(d), wire_feeds=[PRN, bio]), client)
+                    await radar.refresh_tickers()
+                    for u in (PRN, bio):
+                        await radar.poll_wire(u)
+                    item = rss_item("https://www.prnewswire.com/oklo.html",
+                                    "Oklo Awarded $450 Million Contract by U.S. Department of Defense",
+                                    "Oklo Inc. (NYSE: OKLO) today announced", "https://www.prnewswire.com/oklo.html")
+                    world.set(PRN, rss_feed([item]))
+                    world.set(bio, rss_feed([item]))
+                    world.set("https://www.prnewswire.com/oklo.html", CONTRACT_PR)
+                    await asyncio.gather(radar.poll_wire(PRN), radar.poll_wire(bio))
+                    await radar.drain()
+            run(scenario())
+        self.assertEqual(len(world.sent), 1)
+
     def test_wire_timeout_error_is_readable(self) -> None:
         world = base_world()
 
