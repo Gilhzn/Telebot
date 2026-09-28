@@ -86,6 +86,7 @@ WIRE_HEADERS = {
 WIRE_ATTEMPTS = 3                # retries on timeout / redirect / 5xx
 TOKEN_RE = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
+FEED_TIMEOUT = 10.0              # seconds for a live feed poll (a stuck poll delays alerts)
 SEC_BLOCK_SECONDS = 600          # wait 10 minutes after 403/429 from SEC
 SEC_MIN_INTERVAL = 0.15          # <= ~7 requests/second, well under SEC's 10/s
 TICKER_REFRESH_SECONDS = 24 * 3600
@@ -799,8 +800,8 @@ class Fetcher:
     def is_sec(url: str) -> bool:
         return urlparse(url).netloc.lower().endswith("sec.gov")
 
-    async def get(self, url: str, conditional: bool = False,
-                  follow_redirects: bool = True) -> httpx.Response | None:
+    async def get(self, url: str, conditional: bool = False, follow_redirects: bool = True,
+                  timeout: float | None = None) -> httpx.Response | None:
         """Returns the response, or None when a conditional request got 304."""
         sec = self.is_sec(url)
         headers = {"User-Agent": self.sec_user_agent} if sec else {"User-Agent": self.wire_user_agent, **WIRE_HEADERS}
@@ -818,7 +819,8 @@ class Fetcher:
                 if wait > 0:
                     await asyncio.sleep(wait)
                 self._sec_last = time.monotonic()
-        resp = await self.client.get(url, headers=headers, follow_redirects=follow_redirects)
+        kwargs: dict[str, Any] = {"timeout": timeout} if timeout else {}
+        resp = await self.client.get(url, headers=headers, follow_redirects=follow_redirects, **kwargs)
         if resp.status_code == 304:
             return None
         if sec and resp.status_code in (403, 429):
@@ -1164,11 +1166,12 @@ class Radar:
         name = f"SEC {form}"
         url = EDGAR_FEED_URL.format(form=quote(form))
         try:
+            # SEC's live feed answers in under a second or hangs: give up quickly, retry once.
             try:
-                resp = await self.fetcher.get(url, conditional=True)
-            except httpx.TransportError:  # SEC's live feed often times out; one quick retry
+                resp = await self.fetcher.get(url, conditional=True, timeout=FEED_TIMEOUT)
+            except httpx.TransportError:
                 await asyncio.sleep(1)
-                resp = await self.fetcher.get(url, conditional=True)
+                resp = await self.fetcher.get(url, conditional=True, timeout=FEED_TIMEOUT)
         except SecBlocked:
             self._source_error(name, "חסימת SEC — ממתין 10 דקות")
             return
@@ -1234,7 +1237,8 @@ class Radar:
         intermittently 301s to a URL that 404s, while retrying the feed URL works."""
         for attempt in range(1, WIRE_ATTEMPTS + 1):
             try:
-                return await self.fetcher.get(url, conditional=conditional, follow_redirects=False)
+                return await self.fetcher.get(url, conditional=conditional, follow_redirects=False,
+                                              timeout=FEED_TIMEOUT)
             except Exception as exc:  # noqa: BLE001
                 status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else 0
                 retryable = isinstance(exc, httpx.TransportError) or 300 <= status < 400 or status >= 500
@@ -1816,9 +1820,9 @@ class Radar:
             log.warning("Processing pending Telegram commands failed: %s", exc)
         except Exception as exc:  # noqa: BLE001
             log.warning("Processing pending Telegram commands failed: %s", exc)
-        for form in self.cfg.edgar_forms:
-            await self.poll_edgar(form)
-        await asyncio.gather(*(self.poll_wire(u) for u in self.cfg.wire_feeds))
+        # All sources at once: a slow SEC feed must not hold back the press-release feeds.
+        await asyncio.gather(*(self.poll_edgar(f) for f in self.cfg.edgar_forms),
+                             *(self.poll_wire(u) for u in self.cfg.wire_feeds))
         await self.drain()
         await self.check_catalyst_reminders()
         if self.pending_status:
