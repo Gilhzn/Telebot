@@ -852,6 +852,108 @@ class DemoTest(unittest.TestCase):
         self.assertIn("TBIO", summary)                    # conference, +0
 
 
+KOD_TEASER = ("Kodiak Sciences to Present Topline Results on September 28, 2026 from DAYBREAK Pivotal "
+              "Phase 3 Study of Zenkuda and KSI-501 in Patients with Wet Age-Related Macular Degeneration")
+
+
+class CatalystTest(unittest.TestCase):
+    TODAY = __import__("datetime").date(2026, 9, 23)
+
+    def test_detects_kodiak_style_teaser(self) -> None:
+        cat = bot.find_catalyst(KOD_TEASER, self.TODAY)
+        self.assertIsNotNone(cat)
+        self.assertEqual((cat.label, cat.date.isoformat()), ("תוצאות ניסוי קליני", "2026-09-28"))
+
+    def test_detects_other_catalysts(self) -> None:
+        cases = {
+            "Acme (NASDAQ: ACME) will host a conference call on October 5 at 8:00 a.m. ET to discuss "
+            "topline data from its Phase 3 ALPHA trial.": "2026-10-05",
+            "FDA accepts NDA; PDUFA target action date set for March 15, 2027": "2027-03-15",
+            "FDA Advisory Committee meeting scheduled for November 12 to review the BLA": "2026-11-12",
+            "Acme Inc. to Host Conference Call Today at 8:00 a.m. ET to Discuss Topline Phase 3 Results":
+                "2026-09-23",
+        }
+        for text, expected in cases.items():
+            cat = bot.find_catalyst(text, self.TODAY)
+            self.assertIsNotNone(cat, text)
+            self.assertEqual(cat.date.isoformat(), expected, text)
+
+    def test_ignores_non_catalysts(self) -> None:
+        for text in (
+            "Acme to report second quarter financial results on October 30, 2026",      # earnings date
+            "Acme expects to report topline data from the Phase 3 trial in 2H 2027",    # no concrete date
+            "Acme will present topline results from Phase 2 study on September 1, 2026",  # already past
+            "SAN DIEGO, Sept. 21, 2026 -- Acme announced a new CFO.",                  # dateline only
+        ):
+            self.assertIsNone(bot.find_catalyst(text, self.TODAY), text)
+
+    def run_teaser(self, world: "World", tmp: Path) -> bot.Radar:
+        world.set(PRN, rss_feed([rss_item(
+            "kod-1", KOD_TEASER, "Kodiak Sciences Inc. (NASDAQ: KOD) today announced",
+            "https://www.prnewswire.com/kod.html")]))
+        world.set("https://www.prnewswire.com/kod.html",
+                  f"<html><div class='release-body'><p>{KOD_TEASER}.</p></div></html>")
+        eastern = __import__("datetime").datetime(2026, 9, 23, 9, 0)
+
+        async def scenario() -> bot.Radar:
+            async with world.client() as client:
+                radar = bot.Radar(make_cfg(tmp), client)
+                radar.state.initialized.add(f"wire:{PRN}")  # not a first run
+                await radar.poll_wire(PRN)
+                await radar.drain()
+                await radar.poll_wire(PRN)  # same item again: no second heads-up
+                await radar.drain()
+                return radar
+
+        with mock.patch.object(bot, "us_eastern_now", return_value=eastern):
+            return run(scenario())
+
+    def test_teaser_sends_heads_up_and_watches_ticker(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            world = base_world()
+            radar = self.run_teaser(world, Path(d))
+        self.assertEqual(len(world.sent), 1)
+        msg = world.sent[0]["text"]
+        self.assertIn("📅 <b>קטליזטור צפוי</b>", msg)
+        self.assertIn("<b>KOD</b>", msg)
+        self.assertIn("28 בספטמבר 2026 (בעוד 5 ימים)", msg)
+        self.assertIn("➕ נוספה לרשימת המעקב", msg)
+        self.assertIn("KOD", radar.state.watchlist)
+        self.assertIn("KOD:2026-09-28", radar.state.catalysts)
+        self.assertIn("KOD", radar.catalysts_text())
+
+    def test_reminder_on_the_day_once(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            world = base_world()
+            radar = self.run_teaser(world, Path(d))
+            world.sent.clear()
+            dtm = __import__("datetime")
+
+            async def remind(at: object) -> None:
+                with mock.patch.object(bot, "us_eastern_now", return_value=at):
+                    await radar.check_catalyst_reminders()
+
+            async def scenario() -> None:
+                async with world.client() as client:
+                    radar.tg.client = client
+                    await remind(dtm.datetime(2026, 9, 27, 12, 0))  # day before: nothing
+                    await remind(dtm.datetime(2026, 9, 28, 3, 0))   # before pre-market: nothing
+                    await remind(dtm.datetime(2026, 9, 28, 4, 5))   # reminder
+                    await remind(dtm.datetime(2026, 9, 28, 8, 0))   # only once
+
+            run(scenario())
+        self.assertEqual(len(world.sent), 1)
+        self.assertIn("⏰ <b>היום: קטליזטור צפוי</b>", world.sent[0]["text"])
+        self.assertIn("KOD", world.sent[0]["text"])
+
+    def test_catalysts_survive_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            radar = self.run_teaser(base_world(), Path(d))
+            radar.state.save()
+            st = bot.State.load(Path(d) / "state.json", [])
+        self.assertIn("KOD:2026-09-28", st.catalysts)
+
+
 class StateTest(unittest.TestCase):
     def test_seen_is_capped_and_atomic(self) -> None:
         with tempfile.TemporaryDirectory() as d:

@@ -29,6 +29,8 @@
 - **דירוג בכללים** (ברירת מחדל): כל ביטוי חיובי מוסיף נקודות (למשל `to be acquired by`, `FDA approval` = 5, `per share in cash`, `raises guidance` = 4, `awarded` = 3, לקוח ממשלתי = 2), בונוס +2 על חברת ענק ו-+1 על סכום של 100 מיליון דולר ומעלה. מקסימום 5.
 - **דירוג עם Claude** (כש-`ANTHROPIC_API_KEY` מוגדר): רק ידיעות עם ציון כללים 1 ומעלה (או מניות במעקב) נשלחות ל-`claude-haiku-4-5-20251001`, עד 5 במקביל. אם הקריאה נכשלת, הבוט משתמש בציון הכללים.
 
+- **קטליזטורים צפויים**: כשחברה מודיעה מראש על תאריך, למשל "Kodiak Sciences to Present Topline Results on September 28", הבוט שולח הודעת 📅 עם התאריך ומוסיף את המניה לרשימת המעקב. ביום עצמו, מ-04:00 שעון ניו יורק (פתיחת ה-pre-market), הוא שולח תזכורת ⏰. הבוט מזהה שלושה סוגים: תוצאות ניסוי קליני (topline / pivotal / Phase 2-3), תאריך PDUFA של ה-FDA, וועדה מייעצת של ה-FDA. הודעות על מועד דוחות כספיים לא נחשבות קטליזטור. `CATALYST_ALERTS=false` מכבה את התכונה.
+
 ### דוגמת התראה
 
 ```
@@ -50,6 +52,7 @@ Oklo Awarded $450 Million Contract by U.S. Department of Defense
 | `/add NVDA OKLO` | הוספה לרשימת מעקב (נבדקות תמיד ועוקפות את הסינון הראשוני) |
 | `/remove NVDA` | הסרה מהרשימה |
 | `/list` | הצגת הרשימה |
+| `/catalysts` | קטליזטורים צפויים ותאריכיהם |
 | `/status` | זמן פעילות, ידיעות שנבדקו, קריאות AI, ומצב כל מקור (✅/❌) עם זמן העדכון האחרון |
 | `/test` | התראת דוגמה |
 
@@ -86,6 +89,7 @@ python bot.py               # הרצה רציפה
 | `MARKETWIDE` | `true` | סריקת כל השוק. `false` = רק רשימת המעקב |
 | `WATCHLIST` | ריק | רשימה התחלתית מופרדת בפסיקים (נטענת רק כשאין עדיין state) |
 | `CANDIDATE_ITEMS` | `1.01,2.01,2.02,7.01,8.01` | Items ב-8-K שנבדקים |
+| `CATALYST_ALERTS` | `true` | הודעה מוקדמת ותזכורת ביום של קטליזטור מתוכנן |
 | `EDGAR_FORMS` | `8-K,6-K` | סוגי דיווחים |
 | `EDGAR_POLL_SECONDS` | `2` | תדירות דגימת EDGAR |
 | `WIRE_POLL_SECONDS` | `10` | תדירות דגימת הוואיירים |
@@ -106,7 +110,12 @@ python bot.py               # הרצה רציפה
 **המלצה: שרת.** זו הדרך היחידה לעמוד במטרה של "לפני כולם".
 
 ### Railway
-New Project → Deploy from GitHub repo. ב-Variables להגדיר את הסודות ו-`STATE_FILE=/data/state.json`, ולהוסיף Volume בנתיב `/data`. פקודת ההרצה מגיעה מ-`Procfile` (`python bot.py`).
+1. https://railway.com → Login with GitHub → **New Project** → **Deploy from GitHub repo** → `Gilhzn/Telebot`.
+2. בשירות שנוצר, בלשונית **Variables**: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `SEC_USER_AGENT`, `STATE_FILE=/data/state.json`, `PYTHONUNBUFFERED=1` (ואופציונלית `ANTHROPIC_API_KEY`).
+3. **Volume**: קליק ימני על השירות (או Ctrl+K) → Add Volume → Mount path `/data`. כך המצב נשמר בין הפעלות.
+4. **Settings → Source**: לוודא שהענף הוא ענף ברירת המחדל של הריפו.
+5. אחרי הפריסה תגיע לטלגרם הודעת "🟢 פעיל". פקודת ההרצה מגיעה מ-`railway.json` (`python bot.py`, הפעלה מחדש אוטומטית).
+6. **לכבות את GitHub Actions** כדי שלא יהיו התראות כפולות: להשבית את ה-job ב-cron-job.org, ולמחוק את המשתנה `RADAR_MODE` ב-GitHub (Settings → Secrets and variables → Actions → Variables).
 
 ### Oracle Cloud (או כל שרת Ubuntu)
 למלא את המשתנים בראש `oracle-cloud-init.sh` ולהדביק אותו כ-cloud-init ביצירת המכונה (Ubuntu 24.04), או להריץ `sudo bash oracle-cloud-init.sh` על מכונה קיימת.

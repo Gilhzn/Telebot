@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import calendar
+import datetime as dt
 import html
 import json
 import logging
@@ -269,6 +270,7 @@ class Config:
     marketwide: bool = True
     watchlist: list[str] = field(default_factory=list)
     candidate_items: set[str] = field(default_factory=lambda: {"1.01", "2.01", "2.02", "7.01", "8.01"})
+    catalyst_alerts: bool = True
     edgar_forms: list[str] = field(default_factory=lambda: ["8-K", "6-K"])
     edgar_poll: float = 2.0
     wire_poll: float = 10.0
@@ -292,6 +294,7 @@ class Config:
             marketwide=_env_bool("MARKETWIDE", True),
             watchlist=[normalize_ticker(t) for t in _split(_env("WATCHLIST"))],
             candidate_items=set(_split(_env("CANDIDATE_ITEMS", "1.01,2.01,2.02,7.01,8.01"))),
+            catalyst_alerts=_env_bool("CATALYST_ALERTS", True),
             edgar_forms=[f.upper() for f in _split(_env("EDGAR_FORMS", "8-K,6-K"))],
             edgar_poll=max(1.0, _env_float("EDGAR_POLL_SECONDS", 2.0)),
             wire_poll=max(2.0, _env_float("WIRE_POLL_SECONDS", 10.0)),
@@ -525,6 +528,91 @@ def parse_claude_json(text: str) -> dict[str, Any] | None:
 
 
 # ---------------------------------------------------------------------------
+# Catalyst pre-alerts: "results will be published on <date>"
+# ---------------------------------------------------------------------------
+
+# (Hebrew label, pattern). Scheduled binary events that move a stock the moment they
+# are published, so the user should know the date in advance.
+CATALYST_RULES: list[tuple[str, re.Pattern[str]]] = [
+    ("תוצאות ניסוי קליני", re.compile(
+        r"\b(?:to|will)\s+(?:present|announce|report|release|share|unveil|"
+        r"host\b[^.\n]{0,80}?\bto discuss)\b[^.\n]{0,120}?"
+        r"\b(?:topline|top-line|pivotal|phase\s*(?:3|iii|2b|2|ii)\b|primary endpoint)", I)),
+    ("החלטת FDA (PDUFA)", re.compile(r"\bPDUFA\b[^.\n]{0,80}?\bdate\b", I)),
+    ("ועדה מייעצת של ה-FDA", re.compile(
+        r"\badvisory committee\b[^.\n]{0,80}?\b(?:meeting|scheduled|convene)", I)),
+]
+_MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+HEBREW_MONTHS = ["ינואר", "פברואר", "מרץ", "אפריל", "מאי", "יוני", "יולי", "אוגוסט",
+                 "ספטמבר", "אוקטובר", "נובמבר", "דצמבר"]
+CATALYST_DATE_RE = re.compile(
+    r"\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|June?|July?|Aug(?:ust)?|"
+    r"Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+(\d{1,2})(?:st|nd|rd|th)?"
+    r"(?:,?\s+(20\d\d))?\b", I)
+RELATIVE_DAY_RE = re.compile(r"\b(today|tomorrow)\b", I)
+
+
+@dataclass
+class Catalyst:
+    label: str
+    date: dt.date
+
+
+def us_eastern_now() -> dt.datetime:
+    try:
+        from zoneinfo import ZoneInfo
+        return dt.datetime.now(ZoneInfo("America/New_York"))
+    except Exception:  # noqa: BLE001  (no tz database: assume EDT)
+        return dt.datetime.now(dt.timezone(dt.timedelta(hours=-4)))
+
+
+def _catalyst_date(window: str, today: dt.date) -> dt.date | None:
+    """First date in the text that follows the catalyst phrase (never the dateline before it)."""
+    for m in CATALYST_DATE_RE.finditer(window):
+        month = _MONTHS[m.group(1)[:3].lower()]
+        year = int(m.group(3)) if m.group(3) else today.year
+        try:
+            day = dt.date(year, month, int(m.group(2)))
+        except ValueError:
+            continue
+        if not m.group(3) and day < today - dt.timedelta(days=30):
+            try:
+                day = day.replace(year=year + 1)  # "January 5" written in December
+            except ValueError:
+                continue
+        return day
+    rel = RELATIVE_DAY_RE.search(window)
+    if rel:
+        return today if rel.group(1).lower() == "today" else today + dt.timedelta(days=1)
+    return None
+
+
+def find_catalyst(text: str, today: dt.date) -> Catalyst | None:
+    """A scheduled catalyst with a concrete upcoming date, e.g.
+    'Kodiak Sciences to Present Topline Results on September 28, 2026 from ... Phase 3 ...'."""
+    # Abbreviations with periods ("8:00 a.m.", "U.S.", "Inc.") would end the phrase early.
+    text = re.sub(r"\b([ap])\.m\.", r"\1m", text, flags=I)
+    text = re.sub(r"\b(U)\.(S)\.", r"\1\2", text)
+    text = re.sub(r"\b(Inc|Corp|Ltd|Co|No)\.", r"\1", text)
+    for label, pattern in CATALYST_RULES:
+        for m in pattern.finditer(text):
+            day = _catalyst_date(text[m.start(): m.end() + 250], today)
+            if day is not None and day >= today:
+                return Catalyst(label, day)
+    return None
+
+
+def hebrew_date(day: dt.date) -> str:
+    return f"{day.day} ב{HEBREW_MONTHS[day.month - 1]} {day.year}"
+
+
+def days_until_he(day: dt.date, today: dt.date) -> str:
+    n = (day - today).days
+    return {0: "היום", 1: "מחר"}.get(n, f"בעוד {n} ימים")
+
+
+# ---------------------------------------------------------------------------
 # Parsing sources
 # ---------------------------------------------------------------------------
 
@@ -750,6 +838,7 @@ class State:
         self.last_alert: dict[str, float] = {}
         self.tg_offset = 0
         self.sources: dict[str, dict[str, Any]] = {}
+        self.catalysts: dict[str, dict[str, Any]] = {}  # "TICKER:YYYY-MM-DD" -> details
         self.dirty = False
 
     @classmethod
@@ -771,6 +860,7 @@ class State:
         st.last_alert = {k: float(v) for k, v in data.get("last_alert", {}).items()}
         st.tg_offset = int(data.get("tg_offset", 0))
         st.sources = data.get("sources", {})
+        st.catalysts = data.get("catalysts", {})
         return st
 
     def is_seen(self, key: str) -> bool:
@@ -787,12 +877,15 @@ class State:
     def save(self) -> None:
         cutoff = time.time() - 7 * 86400
         self.last_alert = {k: v for k, v in self.last_alert.items() if v >= cutoff}
+        stale = (dt.date.today() - dt.timedelta(days=7)).isoformat()
+        self.catalysts = {k: v for k, v in self.catalysts.items() if v.get("date", "") >= stale}
         data = {
             "watchlist": self.watchlist,
             "initialized": sorted(self.initialized),
             "last_alert": self.last_alert,
             "tg_offset": self.tg_offset,
             "sources": self.sources,
+            "catalysts": self.catalysts,
             "seen": list(self.seen),
         }
         if self.path.parent and not self.path.parent.exists():
@@ -1185,8 +1278,9 @@ class Radar:
                 log.warning("Claude scoring failed for %s, falling back to rules: %s", c.ticker, exc)
                 return None
 
-    async def evaluate(self, c: Candidate) -> tuple[int, str, str | None]:
-        """Fetch the text and score it. Returns (score, reason_he, rejected_label)."""
+    async def evaluate(self, c: Candidate) -> tuple[int, str, str | None, Catalyst | None]:
+        """Fetch the text and score it.
+        Returns (score, reason_he, rejected_label, upcoming catalyst announced in the item)."""
         try:
             text = await self.fetch_text(c)
         except Exception as exc:  # noqa: BLE001
@@ -1195,8 +1289,11 @@ class Radar:
         body = strip_boilerplate(text)
         neg = negative_hit(f"{c.title}\n{body[:NEGATIVE_CHARS]}")
         if neg:
-            return -5, neg, neg
+            return -5, neg, neg, None
         rules = rule_score(f"{c.title}\n{body[:LEAD_CHARS]}", c.company)
+        catalyst = None
+        if rules.score < 4:  # a strong item is the result itself, not an announcement of one
+            catalyst = find_catalyst(f"{c.title}\n{body[:LEAD_CHARS]}", us_eastern_now().date())
         score, reason = rules.score, rules.reason_he
         if self.cfg.anthropic_key and (rules.score >= 1 or c.watch):
             head = f"{c.title}\n{body}" if c.title else body
@@ -1206,14 +1303,16 @@ class Radar:
                 reason = ai["reason_he"] or reason
                 if not c.ticker and ai["ticker"]:
                     c.ticker = normalize_ticker(ai["ticker"])
-        return score, reason, None
+        return score, reason, None, catalyst
 
     async def process(self, c: Candidate) -> None:
         self.stats["candidates"] += 1
         score: int | None = None
         reason = ""
         if self.cfg.positive_only or not c.watch:
-            score, reason, rejected = await self.evaluate(c)
+            score, reason, rejected, catalyst = await self.evaluate(c)
+            if catalyst and self.cfg.catalyst_alerts:
+                await self.notify_catalyst(c, catalyst)
             if rejected:
                 log.info("Rejected %s (%s): %s", c.ticker, rejected, c.title or c.items)
                 return
@@ -1240,6 +1339,72 @@ class Radar:
                 del self.state.last_alert[key]
             log.error("Sending alert for %s failed: %s", key, exc)
 
+    # ----- catalysts -------------------------------------------------------
+
+    async def notify_catalyst(self, c: Candidate, cat: Catalyst) -> None:
+        """Heads-up for a scheduled catalyst; the ticker joins the watchlist."""
+        if not c.ticker:
+            return
+        key = f"{c.ticker}:{cat.date.isoformat()}"
+        if key in self.state.catalysts:
+            return
+        added = c.ticker not in self.state.watchlist
+        if added:
+            self.state.watchlist.append(c.ticker)
+        self.state.catalysts[key] = {
+            "ticker": c.ticker, "company": c.company, "date": cat.date.isoformat(),
+            "label": cat.label, "title": c.title or ", ".join(f"Item {i}" for i in c.items),
+            "link": c.link, "source": c.source_label, "notified": time.time(), "reminded": False,
+        }
+        self.state.dirty = True
+        today = us_eastern_now().date()
+        lines = [
+            "📅 <b>קטליזטור צפוי</b>",
+            f"<b>{esc(c.ticker)}</b>" + (f" | {esc(c.company)}" if c.company else ""),
+            f"🗓 {esc(cat.label)} · {hebrew_date(cat.date)} ({days_until_he(cat.date, today)})",
+        ]
+        if c.title:
+            lines.append(esc(c.title))
+        lines.append("➕ נוספה לרשימת המעקב" if added else "👁 כבר ברשימת המעקב")
+        lines.append(f"📰 {esc(c.source_label)}")
+        lines.append(f'<a href="{html.escape(c.link, quote=True)}">למקור המלא</a>')
+        log.info("CATALYST %s %s %s", c.ticker, cat.date, cat.label)
+        await self.reply("\n".join(lines))
+
+    async def check_catalyst_reminders(self) -> None:
+        """On the catalyst day (from 04:00 New York, when pre-market opens) send one reminder."""
+        now = us_eastern_now()
+        if now.hour < 4:
+            return
+        today = now.date().isoformat()
+        for entry in self.state.catalysts.values():
+            if entry.get("date") != today or entry.get("reminded"):
+                continue
+            entry["reminded"] = True
+            self.state.dirty = True
+            lines = [
+                "⏰ <b>היום: קטליזטור צפוי</b>",
+                f"<b>{esc(entry['ticker'])}</b>" + (f" | {esc(entry['company'])}" if entry.get("company") else ""),
+                f"🗓 {esc(entry['label'])}",
+                esc(entry.get("title", "")),
+                "המסחר המוקדם (pre-market) בניו יורק נפתח ב-04:00, והמסחר הרגיל ב-09:30 שעון ניו יורק.",
+                f'<a href="{html.escape(entry.get("link", ""), quote=True)}">ההודעה המקורית</a>',
+            ]
+            await self.reply("\n".join(line for line in lines if line))
+
+    def catalysts_text(self) -> str:
+        today = us_eastern_now().date()
+        upcoming = sorted((e for e in self.state.catalysts.values() if e.get("date", "") >= today.isoformat()),
+                          key=lambda e: e["date"])
+        if not upcoming:
+            return "📅 אין כרגע קטליזטורים צפויים."
+        lines = ["📅 <b>קטליזטורים צפויים</b>"]
+        for e in upcoming:
+            day = dt.date.fromisoformat(e["date"])
+            lines.append(f"• {hebrew_date(day)} ({days_until_he(day, today)}) · <b>{esc(e['ticker'])}</b> · "
+                         f"{esc(e['label'])}")
+        return "\n".join(lines)
+
     # ----- Telegram commands ----------------------------------------------
 
     def help_text(self) -> str:
@@ -1253,6 +1418,7 @@ class Radar:
             "/add NVDA OKLO — הוספה לרשימת המעקב\n"
             "/remove NVDA — הסרה מהרשימה\n"
             "/list — הצגת הרשימה\n"
+            "/catalysts — קטליזטורים צפויים (תוצאות ניסויים, החלטות FDA)\n"
             "/status — מצב המקורות והמונים\n"
             "/test — התראת דוגמה\n"
             "/help — ההודעה הזו\n\n"
@@ -1331,6 +1497,8 @@ class Radar:
             await self.reply(self.cmd_add(args))
         elif cmd == "/remove":
             await self.reply(self.cmd_remove(args))
+        elif cmd in ("/catalysts", "/upcoming"):
+            await self.reply(self.catalysts_text())
         elif cmd == "/list":
             wl = self.state.watchlist
             await self.reply("📋 רשימת מעקב: " + (", ".join(wl) if wl else "ריקה"))
@@ -1430,6 +1598,14 @@ class Radar:
                 log.warning("getUpdates failed: %s", exc)
                 await self._sleep(5)
 
+    async def catalyst_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                await self.check_catalyst_reminders()
+            except Exception:  # noqa: BLE001
+                log.exception("Catalyst reminders failed")
+            await self._sleep(60)
+
     async def ticker_refresh_loop(self) -> None:
         while not self.stop_event.is_set():
             fresh = self.tickers.loaded and time.time() - self.tickers.loaded_at < TICKER_REFRESH_SECONDS
@@ -1458,7 +1634,7 @@ class Radar:
         else:
             log.warning("TELEGRAM_CHAT_ID is empty — open the bot in Telegram and press Start")
         loops = [self.edgar_loop(), self.wire_loop(), self.command_loop(),
-                 self.ticker_refresh_loop(), self.save_loop()]
+                 self.ticker_refresh_loop(), self.save_loop(), self.catalyst_loop()]
         tasks = [asyncio.create_task(c) for c in loops]
         try:
             await self.stop_event.wait()
@@ -1499,7 +1675,7 @@ class Radar:
 
         results = []
         for c in cands:
-            score, reason, rejected = await self.evaluate(c)
+            score, reason, rejected, _ = await self.evaluate(c)
             results.append((c, score, reason, rejected))
             log.info("demo: %-6s %+d %s %s", c.ticker, score, f"[{rejected}]" if rejected else "",
                      c.title or c.items)
@@ -1540,6 +1716,7 @@ class Radar:
             await self.poll_edgar(form)
         await asyncio.gather(*(self.poll_wire(u) for u in self.cfg.wire_feeds))
         await self.drain()
+        await self.check_catalyst_reminders()
         if self.pending_status:
             await self.reply(self.status_text())
         self.state.dirty = True
