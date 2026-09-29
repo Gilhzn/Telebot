@@ -1174,6 +1174,10 @@ class State:
         st.sources = data.get("sources", {})
         st.catalysts = data.get("catalysts", {})
         st.alert_log = data.get("alert_log", [])
+        if "alert_log" not in data:  # first run with the report: seed it from the last week's alerts
+            st.alert_log = sorted(({"t": ts, "ticker": k, "score": None, "pump": "unknown", "src": "", "title": ""}
+                                   for k, ts in st.last_alert.items() if re.fullmatch(r"[A-Z][A-Z0-9\-]{0,9}", k)),
+                                  key=lambda e: e["t"])
         st.perf_day = data.get("perf_day", "")
         return st
 
@@ -1807,8 +1811,14 @@ class Radar:
                 continue
             lines.append(f"• {head}: כניסה ${r['entry']:.2f} אחרי {fmt_duration(r['entry_delay_s'])} · "
                          f"5 דק' {_pct(r['r_5m'])} · 30 דק' {_pct(r['r_30m'])} · סגירה {_pct(r['r_close'])}")
-        lines += ["", perf_summary_text(self.state.alert_log), "ℹ️ מדידה על נתוני עבר, לא ייעוץ השקעות."]
-        await self.reply("\n".join(lines))
+        chunk: list[str] = []
+        for line in lines:  # Telegram caps a message at 4096 characters
+            if chunk and sum(len(x) + 1 for x in chunk) + len(line) > 3500:
+                await self.reply("\n".join(chunk))
+                chunk = []
+            chunk.append(line)
+        await self.reply("\n".join(chunk))
+        await self.reply(perf_summary_text(self.state.alert_log) + "\nℹ️ מדידה על נתוני עבר, לא ייעוץ השקעות.")
 
     async def measure_alerts(self) -> list[dict[str, Any]]:
         """Fetch 1-minute bars (Yahoo keeps them 30 days) for alerts whose trading day is over."""

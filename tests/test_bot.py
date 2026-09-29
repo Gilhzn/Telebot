@@ -1215,7 +1215,8 @@ class PerformanceTest(unittest.TestCase):
                 with mock.patch.object(bot, "us_eastern_now", return_value=after):
                     await radar.check_performance_report()
                     await radar.check_performance_report()   # once a day
-                self.assertEqual(len(w.sent), 1, [m["text"] for m in w.sent])
+                self.assertEqual(len(w.sent), 2, [m["text"] for m in w.sent])   # trades + running total
+                self.assertIn("מצטבר", w.sent[1]["text"])
                 text = w.sent[0]["text"]
                 self.assertIn("דוח ביצועים יומי", text)
                 self.assertIn("<b>OKLO</b> (+5)", text)
@@ -1227,6 +1228,38 @@ class PerformanceTest(unittest.TestCase):
                 self.assertIn("מצטבר", bot.perf_summary_text(radar.state.alert_log))
                 radar.state.save()
                 self.assertEqual(bot.State.load(cfg.state_file, []).alert_log[0]["r"]["entry_delay_s"], 180)
+
+        run(scenario())
+
+    def test_alert_log_is_seeded_from_last_alerts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            path.write_text(json.dumps({"watchlist": [], "last_alert": {"NVTS": 100.0, "KOD": 50.0}}))
+            st = bot.State.load(path, [])
+            self.assertEqual([e["ticker"] for e in st.alert_log], ["KOD", "NVTS"])
+            st.save()
+            self.assertEqual(len(bot.State.load(path, []).alert_log), 2)   # seeded only once
+
+    def test_long_report_is_split(self) -> None:
+        async def scenario() -> None:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = base_world()
+            async with w.client() as client:
+                radar = bot.Radar(make_cfg(Path(tmp.name)), client)
+                fresh = [{"t": 0, "ticker": f"T{i}", "score": 4, "pump": "none", "r": {
+                    "entry": 1.0, "entry_delay_s": 180, "tradable": True, "r_5m": 0.01, "r_30m": 0.02,
+                    "r_close": 0.03, "r_60m": 0.0, "tp2_sl2": 0.02, "session": "regular", "pre_move": 0.0}}
+                         for i in range(60)]
+                radar.state.alert_log = fresh
+                dtm = __import__("datetime")
+                with mock.patch.object(radar, "measure_alerts", return_value=fresh), \
+                        mock.patch.object(bot, "us_eastern_now",
+                                          return_value=dtm.datetime(2026, 9, 28, 20, 15, tzinfo=bot.eastern_tz())):
+                    await radar.check_performance_report()
+            self.assertGreater(len(w.sent), 2)
+            self.assertTrue(all(len(m["text"]) < 4096 for m in w.sent))
+            self.assertIn("60 עסקאות", w.sent[-1]["text"])
 
         run(scenario())
 
