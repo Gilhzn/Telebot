@@ -8,7 +8,8 @@ alert to a single private Telegram chat when the score passes MIN_SCORE.
 
 Usage:
     python bot.py            # run forever (server mode)
-    python bot.py --once     # one pass over all sources, then exit (GitHub Actions)
+    python bot.py --run-for 3600  # poll continuously for an hour, then exit (GitHub Actions)
+    python bot.py --once     # one pass over all sources, then exit
     python bot.py --test     # verify token, detect/save chat id, send a sample alert
 """
 from __future__ import annotations
@@ -92,6 +93,7 @@ SEC_MIN_INTERVAL = 0.15          # <= ~7 requests/second, well under SEC's 10/s
 TICKER_REFRESH_SECONDS = 24 * 3600
 MAX_SEEN = 30_000
 AI_CONCURRENCY = 5
+CATEGORY_FEED_EVERY = 6          # continuous mode: category wire feeds every 6th wire poll
 AI_TEXT_CHARS = 6_000
 LEAD_CHARS = 2_500               # rules score the headline + lead only
 NEGATIVE_CHARS = 4_000           # negative filter window
@@ -1782,9 +1784,16 @@ class Radar:
             await self._sleep(max(0.0, self.cfg.edgar_poll - (time.monotonic() - started)))
 
     async def wire_loop(self) -> None:
+        # Category feeds only back up the main feeds when these overflow between polls, which
+        # cannot happen at this pace; polling them every few cycles keeps the request rate low.
+        main = [u for u in self.cfg.wire_feeds if " · " not in wire_source_name(u)]
+        extra = [u for u in self.cfg.wire_feeds if u not in main]
+        cycle = 0
         while not self.stop_event.is_set():
             started = time.monotonic()
-            await asyncio.gather(*(self.poll_wire(u) for u in self.cfg.wire_feeds))
+            feeds = main + (extra if cycle % CATEGORY_FEED_EVERY == 0 else [])
+            await asyncio.gather(*(self.poll_wire(u) for u in feeds))
+            cycle += 1
             await self._sleep(max(0.0, self.cfg.wire_poll - (time.monotonic() - started)))
 
     async def command_loop(self) -> None:
@@ -1830,11 +1839,16 @@ class Radar:
             except OSError as exc:
                 log.error("Saving state failed: %s", exc)
 
-    async def run(self) -> None:
+    async def run(self, duration: float | None = None) -> None:
+        """Continuous polling. With a duration (GitHub Actions) it stops by itself after that many
+        seconds and stays silent on start, since the next run takes over right away."""
         await self.refresh_tickers()
         self.state.dirty = True
         self.save_state()
-        if self.chat_id:
+        if duration:
+            asyncio.get_running_loop().call_later(duration, self.stop_event.set)
+            log.info("Continuous run for %d minutes", duration // 60)
+        elif self.chat_id:
             await self.reply("🟢 <b>Stock News Radar פעיל</b>\n" + self.help_text())
         else:
             log.warning("TELEGRAM_CHAT_ID is empty — open the bot in Telegram and press Start")
@@ -2053,7 +2067,7 @@ async def _main_async(args: argparse.Namespace, cfg: Config) -> int:
                 loop.add_signal_handler(sig, radar.stop_event.set)
             except (NotImplementedError, RuntimeError):
                 pass
-        await radar.run()
+        await radar.run(duration=args.run_for)
         return 0
 
 
@@ -2064,6 +2078,8 @@ def main(argv: list[str] | None = None) -> int:
     group.add_argument("--once", action="store_true", help="single pass over all sources, then exit")
     group.add_argument("--demo", action="store_true",
                        help="score the newest real items and send the best one + a summary (no state)")
+    group.add_argument("--run-for", type=float, metavar="SECONDS",
+                       help="poll continuously for SECONDS, then exit (GitHub Actions)")
     args = parser.parse_args(argv)
 
     load_dotenv(Path(_env("ENV_FILE", ".env")))
@@ -2080,7 +2096,7 @@ def main(argv: list[str] | None = None) -> int:
         missing.append("TELEGRAM_BOT_TOKEN")
     if not args.test and not cfg.sec_user_agent:
         missing.append("SEC_USER_AGENT")
-    if (args.once or args.demo) and not cfg.chat_id:
+    if (args.once or args.demo or args.run_for) and not cfg.chat_id:
         missing.append("TELEGRAM_CHAT_ID (חובה במצב --once / --demo)")
     if missing:
         print("❌ חסרים משתני סביבה: " + ", ".join(missing))

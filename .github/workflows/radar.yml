@@ -1,5 +1,8 @@
-# Stock News Radar on GitHub Actions: one --once pass every 5 minutes.
-# Alerts arrive 5+ minutes late here; a server (Railway / Oracle) is faster.
+# Stock News Radar on GitHub Actions.
+# Each "once" run polls continuously for RADAR_LOOP_MINUTES (default 60): SEC every 2s, the
+# main wire feeds every 10s. The external trigger (cron-job.org) keeps one run queued, so the
+# next run starts as soon as this one ends. RADAR_LOOP_MINUTES = 0 restores the single-pass
+# mode (python bot.py --once).
 #
 # Setup (README → "GitHub Actions"):
 #   Settings → Secrets and variables → Actions
@@ -31,13 +34,14 @@ jobs:
   run:
     if: vars.RADAR_MODE == 'actions'
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 90
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       STATE_FILE: state.json
+      LOOP_MINUTES: ${{ vars.RADAR_LOOP_MINUTES || '60' }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -88,18 +92,23 @@ jobs:
 
       - name: run
         if: env.MODE == 'once'
-        run: python bot.py --once
-
-      - name: save state
-        if: env.MODE == 'once' && hashFiles('state.json') != ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p "$RUNNER_TEMP/state" && cp state.json "$RUNNER_TEMP/state/"
-          cd "$RUNNER_TEMP/state"
-          git init -q -b state
-          git config user.name radar-bot
-          git config user.email radar-bot@users.noreply.github.com
-          git add state.json
-          git commit -q -m "state $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" state
+          if ! [[ "$LOOP_MINUTES" =~ ^[0-9]+$ ]] || [ "$LOOP_MINUTES" -eq 0 ]; then
+            exec python bot.py --once
+          fi
+          [ "$LOOP_MINUTES" -gt 80 ] && LOOP_MINUTES=80   # stay inside timeout-minutes
+          # Push state every 5 minutes, so a lost runner costs at most 5 minutes of state.
+          ( while sleep 300; do bash tools/push_state.sh || echo "state sync failed"; done ) &
+          sync_pid=$!
+          rc=0
+          python bot.py --run-for $((LOOP_MINUTES * 60)) || rc=$?
+          kill "$sync_pid" 2>/dev/null || true
+          exit $rc
+
+      - name: save state
+        if: always() && env.MODE == 'once' && hashFiles('state.json') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/push_state.sh

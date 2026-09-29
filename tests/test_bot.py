@@ -1132,6 +1132,47 @@ class PumpRiskTest(unittest.TestCase):
         run(scenario())
 
 
+class ContinuousRunTest(unittest.TestCase):
+    def test_run_for_stops_by_itself_and_alerts_quietly(self) -> None:
+        cat_feed = "https://www.prnewswire.com/rss/health-latest-news/biotechnology-list.rss"
+
+        async def scenario() -> None:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = base_world()
+            w.set(cat_feed, rss_feed([rss_item("cat-1", "Old", "x", "https://www.prnewswire.com/c1.html")]))
+            cfg = make_cfg(Path(tmp.name), wire_feeds=[PRN, cat_feed], wire_poll=0.05, edgar_poll=0.05)
+            with mock.patch.object(bot, "SEC_MIN_INTERVAL", 0.0):
+                async with w.client() as client:
+                    radar = bot.Radar(cfg, client)
+
+                    async def news_arrives() -> None:
+                        await asyncio.sleep(0.3)
+                        w.set(PRN, rss_feed([
+                            rss_item("prn-2", "Oklo Awarded $450 Million Contract by U.S. Department of Defense",
+                                     "Oklo Inc. (NYSE: OKLO) today announced",
+                                     "https://www.prnewswire.com/oklo.html"),
+                            rss_item("old-1", "Old news", "Oklo Inc. (NYSE: OKLO) old",
+                                     "https://www.prnewswire.com/old-1.html"),
+                        ]))
+                        w.set("https://www.prnewswire.com/oklo.html", CONTRACT_PR)
+
+                    started = time.monotonic()
+                    await asyncio.gather(radar.run(duration=1.0), news_arrives())
+                    self.assertLess(time.monotonic() - started, 5)
+            texts = [m["text"] for m in w.sent]
+            self.assertFalse(any("פעיל" in t for t in texts), texts)  # no start-up message
+            self.assertEqual(len(texts), 1, texts)
+            self.assertIn("OKLO", texts[0])
+            self.assertIn("OKLO", bot.State.load(cfg.state_file, []).last_alert)
+            polls = [r for r in w.requests if str(r.url) == PRN]
+            cat_polls = [r for r in w.requests if str(r.url) == cat_feed]
+            self.assertGreater(len(polls), len(cat_polls) * 2)  # category feeds polled less often
+            self.assertGreaterEqual(len(cat_polls), 1)
+
+        run(scenario())
+
+
 class StateTest(unittest.TestCase):
     def test_seen_is_capped_and_atomic(self) -> None:
         with tempfile.TemporaryDirectory() as d:
