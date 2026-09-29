@@ -132,6 +132,8 @@ class World:
             assert self.claude is not None
             return self.claude(payload)
         route = self.routes.get(url)
+        if route is None:  # keys ending in "*" match by prefix
+            route = next((v for k, v in self.routes.items() if k.endswith("*") and url.startswith(k[:-1])), None)
         if route is None:
             return httpx.Response(404, text="not found")
         if callable(route):
@@ -1171,6 +1173,65 @@ class ContinuousRunTest(unittest.TestCase):
             self.assertGreaterEqual(len(cat_polls), 1)
 
         run(scenario())
+
+
+def yahoo_chart(start: float, prices: list[float]) -> dict[str, Any]:
+    ts = [int(start + 60 * i) for i in range(len(prices))]
+    opens = [prices[0]] + prices[:-1]
+    return {"chart": {"result": [{"timestamp": ts, "indicators": {"quote": [{
+        "open": opens, "close": prices, "high": [max(o, c) for o, c in zip(opens, prices)],
+        "low": [min(o, c) for o, c in zip(opens, prices)], "volume": [1000] * len(prices)}]}}]}}
+
+
+class PerformanceTest(unittest.TestCase):
+    def test_alert_is_logged_and_daily_report_measures_it(self) -> None:
+        dtm = __import__("datetime")
+        tz = bot.eastern_tz()
+        alert_ts = dtm.datetime(2026, 9, 28, 10, 0, tzinfo=tz).timestamp()
+        bars_from = alert_ts - 600
+        # flat until 10:05, then +0.5% per minute
+        prices = [10.0] * 10 + [10.0 * (1 + 0.005 * i) for i in range(1, 360)]
+
+        async def scenario() -> None:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = base_world()
+            w.set("https://query1.finance.yahoo.com/v8/finance/chart/OKLO?*", yahoo_chart(bars_from, prices))
+            cfg = make_cfg(Path(tmp.name), positive_only=False, pump_check=False)
+            async with w.client() as client:
+                radar = bot.Radar(cfg, client)
+                c = bot.Candidate(**{**bot.SAMPLE_CANDIDATE.__dict__, "watch": True})
+                await radar.process(c)
+                self.assertEqual(len(radar.state.alert_log), 1)
+                self.assertEqual(radar.state.alert_log[0]["ticker"], "OKLO")
+                radar.state.alert_log[0]["t"] = alert_ts   # pretend it went out on Monday 10:00
+                radar.state.alert_log[0]["score"] = 5
+                w.sent.clear()
+                before = dtm.datetime(2026, 9, 28, 19, 0, tzinfo=tz)
+                with mock.patch.object(bot, "us_eastern_now", return_value=before):
+                    await radar.check_performance_report()
+                self.assertEqual(w.sent, [])                 # not before 20:10
+                after = dtm.datetime(2026, 9, 28, 20, 15, tzinfo=tz)
+                with mock.patch.object(bot, "us_eastern_now", return_value=after):
+                    await radar.check_performance_report()
+                    await radar.check_performance_report()   # once a day
+                self.assertEqual(len(w.sent), 1, [m["text"] for m in w.sent])
+                text = w.sent[0]["text"]
+                self.assertIn("דוח ביצועים יומי", text)
+                self.assertIn("<b>OKLO</b> (+5)", text)
+                self.assertIn("אחרי 3 דק", text)
+                r = radar.state.alert_log[0]["r"]
+                self.assertEqual(r["entry_delay_s"], 180)
+                self.assertGreater(r["r_5m"], 0.02)
+                self.assertTrue(r["tradable"])
+                self.assertIn("מצטבר", bot.perf_summary_text(radar.state.alert_log))
+                radar.state.save()
+                self.assertEqual(bot.State.load(cfg.state_file, []).alert_log[0]["r"]["entry_delay_s"], 180)
+
+        run(scenario())
+
+    def test_perf_command_without_data(self) -> None:
+        self.assertIn("עדיין אין", bot.perf_summary_text([]))
 
 
 class StateTest(unittest.TestCase):

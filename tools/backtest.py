@@ -41,12 +41,10 @@ OUT = Path("backtest-out/main")
 SIGNALS = OUT / "signals"
 TRADES = OUT / "trades.jsonl"
 
-ENTRY_DELAY = 180            # seconds after the signal
-MAX_ENTRY_GAP = 15 * 60      # no trade within 15 minutes of the target -> "no liquidity"
-POSITION_USD = 2_000
-SLIPPAGE = 0.005             # per side, used for the "net" figures
-HORIZONS = [2, 5, 15, 30, 60, 120]          # minutes after entry
-TP_SL = [(0.02, 0.02), (0.05, 0.03), (0.10, 0.05), (0.20, 0.10)]
+POSITION_USD = bot.PERF_POSITION_USD
+SLIPPAGE = bot.PERF_COST / 2         # per side, used for the "net" figures
+HORIZONS = bot.TRADE_HORIZONS
+TP_SL = bot.TRADE_TP_SL
 EFTS_URL = ("https://efts.sec.gov/LATEST/search-index?forms={forms}&dateRange=custom"
             "&startdt={day}&enddt={day}&from={offset}")
 ARCHIVE = "https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nd}/{acc}-index.htm"
@@ -239,7 +237,7 @@ def load_signals(min_score: int = 4, dedup_hours: float = 6.0) -> list[dict[str,
 # prices
 # ---------------------------------------------------------------------------
 
-Bar = tuple[float, float, float, float, float, float]   # ts, open, high, low, close, volume
+Bar = bot.Bar
 
 
 async def alpaca_bars(http: Http, symbol: str, start: float, end: float) -> list[Bar]:
@@ -279,112 +277,21 @@ async def yahoo_bars(http: Http, symbol: str, start: float, end: float) -> list[
     t = start
     while t < end:
         t2 = min(end, t + 7 * 86400)
-        url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?period1={int(t)}"
-               f"&period2={int(t2)}&interval={interval}m&includePrePost=true")
+        url = bot.YAHOO_CHART_URL.format(symbol=symbol, p1=int(t), p2=int(t2), interval=interval)
         r = await http.get(url, headers={"User-Agent": "Mozilla/5.0"}, sec=False)
         if r.status_code == 200:
-            res = (r.json().get("chart", {}).get("result") or [None])[0] or {}
-            q = (res.get("indicators", {}).get("quote") or [{}])[0]
-            for i, ts in enumerate(res.get("timestamp") or []):
-                o, h, lo, c, v = (q.get(k, [None])[i] for k in ("open", "high", "low", "close", "volume"))
-                if None not in (o, h, lo, c):
-                    bars.append((float(ts), o, h, lo, c, v or 0))
+            bars += bot.parse_yahoo_chart(r.json())
         t = t2
     return sorted(set(bars))
 
 
 # ---------------------------------------------------------------------------
-# trade simulation
+# trade simulation: shared with the bot's daily performance report
 # ---------------------------------------------------------------------------
 
-
-def session_of(ts: float) -> str:
-    t = dt.datetime.fromtimestamp(ts, ET)
-    if t.weekday() >= 5:
-        return "closed"
-    minutes = t.hour * 60 + t.minute
-    if 4 * 60 <= minutes < 9 * 60 + 30:
-        return "pre"
-    if 9 * 60 + 30 <= minutes < 16 * 60:
-        return "regular"
-    if 16 * 60 <= minutes < 20 * 60:
-        return "after"
-    return "closed"
-
-
-def _close_at(bars: list[Bar], t: float, start_i: int) -> float:
-    """Close of the last bar that started before t (bars from start_i on)."""
-    px = bars[start_i][4]
-    for b in bars[start_i:]:
-        if b[0] >= t:
-            break
-        px = b[4]
-    return px
-
-
-def simulate(bars: list[Bar], signal_ts: float) -> dict[str, Any] | None:
-    """Buy at the open of the first 1-minute bar starting at or after signal + 3:00."""
-    if not bars:
-        return None
-    target = signal_ts + ENTRY_DELAY
-    idx = next((i for i, b in enumerate(bars) if b[0] >= target - 1e-6), None)
-    if idx is None:
-        return None
-    eb = bars[idx]
-    entry, entry_ts = eb[1], eb[0]
-    if entry <= 0:
-        return None
-    gap = entry_ts - target
-    before = [b for b in bars[:idx] if b[0] <= signal_ts]
-    ref = before[-1][4] if before and signal_ts - before[-1][0] < 3 * 86400 else None
-    out: dict[str, Any] = {
-        "entry": entry, "entry_ts": entry_ts, "entry_delay_s": round(entry_ts - signal_ts),
-        "entry_gap_s": round(gap), "session": session_of(signal_ts), "entry_session": session_of(entry_ts),
-        "tradable": gap <= MAX_ENTRY_GAP,
-        "ref": ref, "pre_move": (entry / ref - 1) if ref else None,
-        "dollar_vol_5m": sum(b[4] * b[5] for b in bars[idx:idx + 5]),
-    }
-    for h in HORIZONS:
-        out[f"r_{h}m"] = _close_at(bars, entry_ts + h * 60, idx) / entry - 1
-
-    entry_day = dt.datetime.fromtimestamp(entry_ts, ET).date()
-    day_bars = [b for b in bars[idx:] if dt.datetime.fromtimestamp(b[0], ET).date() == entry_day]
-    reg_close = [b for b in day_bars if session_of(b[0]) == "regular"]
-    out["r_close"] = ((reg_close[-1][4] if reg_close and reg_close[-1][0] >= entry_ts else day_bars[-1][4])
-                      / entry - 1)
-    later = [b for b in bars[idx:] if dt.datetime.fromtimestamp(b[0], ET).date() > entry_day]
-    if later:
-        d2 = dt.datetime.fromtimestamp(later[0][0], ET).date()
-        nxt = [b for b in later if dt.datetime.fromtimestamp(b[0], ET).date() == d2
-               and session_of(b[0]) == "regular"]
-        out["r_next_close"] = (nxt[-1][4] if nxt else later[-1][4]) / entry - 1
-    else:
-        out["r_next_close"] = None
-    hour = [b for b in bars[idx:] if b[0] < entry_ts + 3600]
-    out["max_up_60m"] = max(b[2] for b in hour) / entry - 1
-    out["max_down_60m"] = min(b[3] for b in hour) / entry - 1
-    out["max_up_day"] = max(b[2] for b in day_bars) / entry - 1
-    for tp, sl in TP_SL:
-        out[f"tp{int(tp * 100)}_sl{int(sl * 100)}"] = tp_sl(day_bars, entry, entry_ts, tp, sl)
-    return out
-
-
-def tp_sl(day_bars: list[Bar], entry: float, entry_ts: float, tp: float, sl: float) -> float:
-    """Take profit / stop loss within the entry day; exit at the day's last bar otherwise.
-    If a bar touches both levels, the stop counts (the conservative assumption)."""
-    for b in day_bars:
-        if b[0] == entry_ts:
-            # inside the entry minute only moves after the open count; use its close
-            if b[4] <= entry * (1 - sl):
-                return -sl
-            if b[4] >= entry * (1 + tp):
-                return tp
-            continue
-        if b[3] <= entry * (1 - sl):
-            return -sl
-        if b[2] >= entry * (1 + tp):
-            return tp
-    return day_bars[-1][4] / entry - 1 if day_bars else 0.0
+session_of = bot.session_of
+tp_sl = bot.tp_sl
+simulate = bot.simulate_trade
 
 
 async def pump_level(http: Http, cik: int, when: dt.date, lead: str,

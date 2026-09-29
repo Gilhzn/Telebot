@@ -93,6 +93,8 @@ SEC_MIN_INTERVAL = 0.15          # <= ~7 requests/second, well under SEC's 10/s
 TICKER_REFRESH_SECONDS = 24 * 3600
 MAX_SEEN = 30_000
 AI_CONCURRENCY = 5
+ALERT_LOG_MAX = 5_000
+PERF_REPORT_AT = (20, 10)        # New York time: daily performance report after the evening session
 CATEGORY_FEED_EVERY = 6          # continuous mode: category wire feeds every 6th wire poll
 AI_TEXT_CHARS = 6_000
 LEAD_CHARS = 2_500               # rules score the headline + lead only
@@ -725,6 +727,166 @@ def assess_pump_risk(text: str, submissions: dict[str, Any] | None, today: dt.da
 
 
 # ---------------------------------------------------------------------------
+# Trade outcome: "what if I had bought 3 minutes after the alert?"
+# Used by the daily performance report and by tools/backtest.py.
+# ---------------------------------------------------------------------------
+
+Bar = tuple[float, float, float, float, float, float]   # start ts, open, high, low, close, volume
+ENTRY_DELAY = 180                 # buy 3 minutes after the alert
+MAX_ENTRY_GAP = 15 * 60           # no trade within 15 minutes of that -> market closed / no liquidity
+TRADE_HORIZONS = [2, 5, 15, 30, 60, 120]                          # minutes after the entry
+TRADE_TP_SL = [(0.02, 0.02), (0.05, 0.03), (0.10, 0.05), (0.20, 0.10)]
+PERF_POSITION_USD = 2_000
+PERF_COST = 0.01                  # round trip: spread + slippage, 0.5% per side
+YAHOO_CHART_URL = ("https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?period1={p1}&period2={p2}"
+                   "&interval={interval}m&includePrePost=true")
+
+
+def eastern_tz() -> dt.tzinfo:
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo("America/New_York")
+    except Exception:  # noqa: BLE001
+        return dt.timezone(dt.timedelta(hours=-4))
+
+
+def session_of(ts: float) -> str:
+    t = dt.datetime.fromtimestamp(ts, eastern_tz())
+    if t.weekday() >= 5:
+        return "closed"
+    minutes = t.hour * 60 + t.minute
+    if 4 * 60 <= minutes < 9 * 60 + 30:
+        return "pre"
+    if 9 * 60 + 30 <= minutes < 16 * 60:
+        return "regular"
+    if 16 * 60 <= minutes < 20 * 60:
+        return "after"
+    return "closed"
+
+
+def _close_at(bars: list[Bar], t: float, start_i: int) -> float:
+    """Close of the last bar that started before t (bars from start_i on)."""
+    px = bars[start_i][4]
+    for b in bars[start_i:]:
+        if b[0] >= t:
+            break
+        px = b[4]
+    return px
+
+
+def tp_sl(day_bars: list[Bar], entry: float, entry_ts: float, tp: float, sl: float) -> float:
+    """Take profit / stop loss within the entry day; exit at the day's last bar otherwise.
+    If a bar touches both levels, the stop counts (the conservative assumption)."""
+    for b in day_bars:
+        if b[0] == entry_ts:  # inside the entry minute only its close is known to be after the buy
+            if b[4] <= entry * (1 - sl):
+                return -sl
+            if b[4] >= entry * (1 + tp):
+                return tp
+            continue
+        if b[3] <= entry * (1 - sl):
+            return -sl
+        if b[2] >= entry * (1 + tp):
+            return tp
+    return day_bars[-1][4] / entry - 1 if day_bars else 0.0
+
+
+def simulate_trade(bars: list[Bar], signal_ts: float) -> dict[str, Any] | None:
+    """Buy at the open of the first bar starting at or after signal + 3:00 and measure the outcome."""
+    if not bars:
+        return None
+    tz = eastern_tz()
+    target = signal_ts + ENTRY_DELAY
+    idx = next((i for i, b in enumerate(bars) if b[0] >= target - 1e-6), None)
+    if idx is None:
+        return None
+    entry_ts, entry = bars[idx][0], bars[idx][1]
+    if entry <= 0:
+        return None
+    gap = entry_ts - target
+    before = [b for b in bars[:idx] if b[0] <= signal_ts]
+    ref = before[-1][4] if before and signal_ts - before[-1][0] < 3 * 86400 else None
+    out: dict[str, Any] = {
+        "entry": entry, "entry_ts": entry_ts, "entry_delay_s": round(entry_ts - signal_ts),
+        "entry_gap_s": round(gap), "session": session_of(signal_ts), "entry_session": session_of(entry_ts),
+        "tradable": gap <= MAX_ENTRY_GAP, "ref": ref, "pre_move": (entry / ref - 1) if ref else None,
+        "dollar_vol_5m": sum(b[4] * b[5] for b in bars[idx:idx + 5]),
+    }
+    for h in TRADE_HORIZONS:
+        out[f"r_{h}m"] = _close_at(bars, entry_ts + h * 60, idx) / entry - 1
+    day = lambda b: dt.datetime.fromtimestamp(b[0], tz).date()  # noqa: E731
+    entry_day = day(bars[idx])
+    day_bars = [b for b in bars[idx:] if day(b) == entry_day]
+    regular = [b for b in day_bars if session_of(b[0]) == "regular"]
+    out["r_close"] = (regular[-1][4] if regular else day_bars[-1][4]) / entry - 1
+    later = [b for b in bars[idx:] if day(b) > entry_day]
+    if later:
+        nxt = [b for b in later if day(b) == day(later[0]) and session_of(b[0]) == "regular"]
+        out["r_next_close"] = (nxt[-1][4] if nxt else later[-1][4]) / entry - 1
+    else:
+        out["r_next_close"] = None
+    hour = [b for b in bars[idx:] if b[0] < entry_ts + 3600]
+    out["max_up_60m"] = max(b[2] for b in hour) / entry - 1
+    out["max_down_60m"] = min(b[3] for b in hour) / entry - 1
+    out["max_up_day"] = max(b[2] for b in day_bars) / entry - 1
+    for tp, sl in TRADE_TP_SL:
+        out[f"tp{int(tp * 100)}_sl{int(sl * 100)}"] = tp_sl(day_bars, entry, entry_ts, tp, sl)
+    return out
+
+
+def parse_yahoo_chart(data: dict[str, Any]) -> list[Bar]:
+    res = ((data.get("chart") or {}).get("result") or [None])[0] or {}
+    q = ((res.get("indicators") or {}).get("quote") or [{}])[0]
+    bars = []
+    for i, ts in enumerate(res.get("timestamp") or []):
+        vals = [(q.get(k) or [None] * (i + 1))[i] for k in ("open", "high", "low", "close", "volume")]
+        if None not in vals[:4]:
+            bars.append((float(ts), vals[0], vals[1], vals[2], vals[3], vals[4] or 0))
+    return sorted(set(bars))
+
+
+PERF_COLUMNS = [("r_5m", "5 דק'"), ("r_30m", "30 דק'"), ("r_60m", "שעה"), ("r_close", "סגירה"),
+                ("tp2_sl2", "יעד +2% / סטופ -2%")]
+PUMP_HE = {"high": "🔴 סיכון גבוה", "medium": "🟠 סיכון בינוני", "none": "ללא אזהרה"}
+
+
+def _pct(x: float) -> str:
+    return f"{x * 100:+.1f}%"
+
+
+def _usd(x: float) -> str:
+    return f"{'-' if x < 0 else '+'}${abs(x):,.0f}"
+
+
+def perf_line(values: list[float]) -> str:
+    n = len(values)
+    wins = sum(1 for v in values if v > 0)
+    gross = sum(values) * PERF_POSITION_USD
+    net = sum(v - PERF_COST for v in values) * PERF_POSITION_USD
+    return (f"{n} עסקאות · הצלחה {wins * 100 // n}% · ממוצע {_pct(sum(values) / n)} · "
+            f"ברוטו {_usd(gross)} · נטו {_usd(net)}")
+
+
+def perf_summary_text(log_entries: list[dict[str, Any]]) -> str:
+    done = [e for e in log_entries if isinstance(e.get("r"), dict) and e["r"].get("tradable")]
+    if not done:
+        return "📊 עדיין אין התראות שנמדדו. הדוח נבנה מההתראות שהבוט שולח מעכשיו."
+    first = dt.datetime.fromtimestamp(min(e["t"] for e in done), eastern_tz()).strftime("%d.%m.%y")
+    lines = [f"📊 <b>מצטבר מאז {first}</b>: קנייה 3 דקות אחרי כל התראה, "
+             f"${PERF_POSITION_USD:,} לעסקה (נטו = אחרי {PERF_COST * 100:.0f}% עלויות מרווח והחלקה)"]
+    for key, label in PERF_COLUMNS:
+        vals = [e["r"][key] for e in done if e["r"].get(key) is not None]
+        if vals:
+            lines.append(f"• <b>{label}</b>: {perf_line(vals)}")
+    lines.append("<b>לפי אזהרת פמפום</b> (עד הסגירה):")
+    for level, label in PUMP_HE.items():
+        vals = [e["r"]["r_close"] for e in done if e.get("pump", "none") == level]
+        if vals:
+            lines.append(f"• {label}: {perf_line(vals)}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Parsing sources
 # ---------------------------------------------------------------------------
 
@@ -987,6 +1149,8 @@ class State:
         self.tg_offset = 0
         self.sources: dict[str, dict[str, Any]] = {}
         self.catalysts: dict[str, dict[str, Any]] = {}  # "TICKER:YYYY-MM-DD" -> details
+        self.alert_log: list[dict[str, Any]] = []       # every alert sent, for the performance report
+        self.perf_day = ""                               # last day the performance report went out
         self.dirty = False
 
     @classmethod
@@ -1009,6 +1173,8 @@ class State:
         st.tg_offset = int(data.get("tg_offset", 0))
         st.sources = data.get("sources", {})
         st.catalysts = data.get("catalysts", {})
+        st.alert_log = data.get("alert_log", [])
+        st.perf_day = data.get("perf_day", "")
         return st
 
     def is_seen(self, key: str) -> bool:
@@ -1034,6 +1200,8 @@ class State:
             "tg_offset": self.tg_offset,
             "sources": self.sources,
             "catalysts": self.catalysts,
+            "alert_log": self.alert_log[-ALERT_LOG_MAX:],
+            "perf_day": self.perf_day,
             "seen": list(self.seen),
         }
         if self.path.parent and not self.path.parent.exists():
@@ -1521,6 +1689,10 @@ class Radar:
             await self.tg.send(self.chat_id, format_alert(c, score, reason, now, risk))
             self.stats["alerts"] += 1
             log.info("ALERT %s score=%s %s", key, score, c.title or c.items)
+            self.state.alert_log.append({
+                "t": now, "ticker": c.ticker, "score": score, "pump": (risk.level if risk else "") or "none",
+                "src": c.source_label, "title": (c.title or ", ".join(c.items) or c.form)[:100],
+            })
         except Exception as exc:  # noqa: BLE001
             if self.state.last_alert.get(key) == now:
                 del self.state.last_alert[key]
@@ -1608,6 +1780,70 @@ class Radar:
                          f"{esc(e['label'])}")
         return "\n".join(lines)
 
+    # ----- performance report ----------------------------------------------
+
+    async def check_performance_report(self) -> None:
+        """Once per trading day, after the evening session (20:10 New York): measure every alert
+        not measured yet as if it had been bought 3 minutes after it went out, and report."""
+        now = us_eastern_now()
+        today = now.date().isoformat()
+        if now.weekday() >= 5 or (now.hour, now.minute) < PERF_REPORT_AT or self.state.perf_day == today:
+            return
+        self.state.perf_day = today
+        self.state.dirty = True
+        fresh = await self.measure_alerts()
+        if not fresh:
+            return
+        lines = ["📈 <b>דוח ביצועים יומי</b>: מה היה קורה אם היית קונה 3 דקות אחרי כל התראה"]
+        for e in fresh:
+            r = e["r"]
+            head = f"<b>{esc(e['ticker'])}</b>"
+            if e.get("score") is not None:
+                head += f" (+{e['score']})"
+            if e.get("pump", "none") in ("high", "medium"):
+                head += " " + PUMP_HE[e["pump"]][:1]
+            if not r.get("tradable"):
+                lines.append(f"• {head}: השוק היה סגור. קנייה בפתיחה ב-${r['entry']:.2f}, סגירה {_pct(r['r_close'])}")
+                continue
+            lines.append(f"• {head}: כניסה ${r['entry']:.2f} אחרי {fmt_duration(r['entry_delay_s'])} · "
+                         f"5 דק' {_pct(r['r_5m'])} · 30 דק' {_pct(r['r_30m'])} · סגירה {_pct(r['r_close'])}")
+        lines += ["", perf_summary_text(self.state.alert_log), "ℹ️ מדידה על נתוני עבר, לא ייעוץ השקעות."]
+        await self.reply("\n".join(lines))
+
+    async def measure_alerts(self) -> list[dict[str, Any]]:
+        """Fetch 1-minute bars (Yahoo keeps them 30 days) for alerts whose trading day is over."""
+        now = time.time()
+        today = us_eastern_now().date()
+        fresh = []
+        for e in self.state.alert_log:
+            if "r" in e or e.get("skip") or now - e["t"] < ENTRY_DELAY + 300:
+                continue
+            if now - e["t"] > 28 * 86400:
+                e["skip"] = "ישן מדי לנתוני דקה"
+                continue
+            url = YAHOO_CHART_URL.format(symbol=e["ticker"], p1=int(e["t"] - 7200),
+                                         p2=int(min(now, e["t"] + 4 * 86400)), interval=1)
+            try:
+                resp = await self.client.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+                resp.raise_for_status()
+                sim = simulate_trade(parse_yahoo_chart(resp.json()), e["t"])
+            except Exception as exc:  # noqa: BLE001
+                log.info("Performance: prices for %s unavailable: %s", e["ticker"], describe_error(exc))
+                sim = None
+            if sim is None:
+                if now - e["t"] > 3 * 86400:
+                    e["skip"] = "אין נתוני מחיר"
+                continue
+            if dt.datetime.fromtimestamp(sim["entry_ts"], eastern_tz()).date() >= today \
+                    and (us_eastern_now().hour, us_eastern_now().minute) < PERF_REPORT_AT:
+                continue  # the entry day is not over yet
+            e["r"] = {k: sim[k] for k in ("entry", "entry_delay_s", "tradable", "session", "pre_move",
+                                          "r_5m", "r_30m", "r_60m", "r_close", "tp2_sl2")}
+            fresh.append(e)
+        if fresh:
+            self.state.dirty = True
+        return fresh
+
     # ----- Telegram commands ----------------------------------------------
 
     def help_text(self) -> str:
@@ -1622,6 +1858,7 @@ class Radar:
             "/remove NVDA — הסרה מהרשימה\n"
             "/list — הצגת הרשימה\n"
             "/catalysts — קטליזטורים צפויים (תוצאות ניסויים, החלטות FDA)\n"
+            "/perf — מה היה קורה אם היית קונה 3 דקות אחרי כל התראה\n"
             "/status — מצב המקורות והמונים\n"
             "/test — התראת דוגמה\n"
             "/help — ההודעה הזו\n\n"
@@ -1706,6 +1943,8 @@ class Radar:
             await self.reply(self.cmd_remove(args))
         elif cmd in ("/catalysts", "/upcoming"):
             await self.reply(self.catalysts_text())
+        elif cmd in ("/perf", "/performance"):
+            await self.reply(perf_summary_text(self.state.alert_log))
         elif cmd == "/list":
             wl = self.state.watchlist
             await self.reply("📋 רשימת מעקב: " + (", ".join(wl) if wl else "ריקה"))
@@ -1816,8 +2055,9 @@ class Radar:
         while not self.stop_event.is_set():
             try:
                 await self.check_catalyst_reminders()
+                await self.check_performance_report()
             except Exception:  # noqa: BLE001
-                log.exception("Catalyst reminders failed")
+                log.exception("Catalyst reminders / performance report failed")
             await self._sleep(60)
 
     async def ticker_refresh_loop(self) -> None:
@@ -1936,6 +2176,7 @@ class Radar:
                              *(self.poll_wire(u) for u in self.cfg.wire_feeds))
         await self.drain()
         await self.check_catalyst_reminders()
+        await self.check_performance_report()
         if self.pending_status:
             await self.reply(self.status_text())
         self.state.dirty = True
