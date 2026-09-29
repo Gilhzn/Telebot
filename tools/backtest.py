@@ -191,14 +191,16 @@ async def collect(http: Http, start: dt.date, end: dt.date, tickers: bot.TickerM
     cfg_items = bot.Config.from_env().candidate_items
     for day in trading_days(start, end):
         path = SIGNALS / f"{day.isoformat()}.jsonl"
-        if path.exists():
+        if path.exists() and path.stat().st_size > 0:
             continue
         try:
             filings = await efts_filings(http, day)
         except Exception as exc:  # noqa: BLE001
             log(f"{day}: EFTS failed: {bot.describe_error(exc)}")
             continue
-        cands = [f for f in filings.values() if f["ciks"] and f["exhibits"] and (
+        # Same filter as the bot's EDGAR path; the document (EX-99.x, else the 8-K itself) is
+        # picked from the filing index, because search hits do not list every exhibit.
+        cands = [f for f in filings.values() if f["ciks"] and (
             f["form"] == "6-K" or set(f["items"]) & cfg_items)]
         results = await asyncio.gather(*(score_filing(http, f, tickers) for f in cands), return_exceptions=True)
         rows = [r for r in results if isinstance(r, dict) and r.get("ticker")]
@@ -207,8 +209,13 @@ async def collect(http: Http, start: dt.date, end: dt.date, tickers: bot.TickerM
         tmp.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8")
         tmp.replace(path)
         strong = sum(1 for r in rows if r["score"] >= 4 and not r["rejected"])
-        log(f"{day}: {len(filings)} filings, {len(cands)} with a press release, {len(rows)} scored, "
-            f"{strong} alerts (score 4+), {errors} errors")
+        exhibits = sum(1 for r in rows if r["exhibit"])
+        log(f"{day}: {len(filings)} filings, {len(cands)} candidates, {len(rows)} scored "
+            f"({exhibits} press releases), {strong} alerts (score 4+), {errors} errors")
+        for r in results:
+            if isinstance(r, Exception):
+                log(f"  error: {bot.describe_error(r)}")
+                break
 
 
 def load_signals(min_score: int = 4, dedup_hours: float = 6.0) -> list[dict[str, Any]]:
