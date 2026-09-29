@@ -267,13 +267,20 @@ async def alpaca_bars(http: Http, symbol: str, start: float, end: float) -> list
             return bars
 
 
+def yahoo_interval(start: float, now: float | None = None) -> int:
+    """Yahoo keeps 1-minute bars for 30 days and 2-minute bars for 60 days."""
+    age = (now or time.time()) - start
+    return 1 if age < 29 * 86400 else 2
+
+
 async def yahoo_bars(http: Http, symbol: str, start: float, end: float) -> list[Bar]:
     bars: list[Bar] = []
+    interval = yahoo_interval(start)
     t = start
     while t < end:
         t2 = min(end, t + 7 * 86400)
         url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?period1={int(t)}"
-               f"&period2={int(t2)}&interval=1m&includePrePost=true")
+               f"&period2={int(t2)}&interval={interval}m&includePrePost=true")
         r = await http.get(url, headers={"User-Agent": "Mozilla/5.0"}, sec=False)
         if r.status_code == 200:
             res = (r.json().get("chart", {}).get("result") or [None])[0] or {}
@@ -397,8 +404,8 @@ async def pump_level(http: Http, cik: int, when: dt.date, lead: str,
 async def trades(http: Http, prices: Http, provider: str, max_trades: int, seed: int = 7) -> None:
     signals = load_signals()
     now = time.time()
-    if provider == "yahoo":
-        signals = [s for s in signals if now - s["ts"] < 28 * 86400]
+    if provider == "yahoo":  # 1-minute bars back 29 days, 2-minute bars back 59 days
+        signals = [s for s in signals if now - s["ts"] < 57 * 86400]
     done = {}
     if TRADES.exists():
         done = {json.loads(ln)["adsh"]: 1 for ln in TRADES.read_text(encoding="utf-8").splitlines() if ln.strip()}
@@ -421,6 +428,7 @@ async def trades(http: Http, prices: Http, provider: str, max_trades: int, seed:
             sim = simulate(bars, s["ts"])
             if sim is None:
                 return {**s, "error": "no bars"}
+            sim["bar_min"] = 1 if provider == "alpaca" else yahoo_interval(start)
             day = dt.datetime.fromtimestamp(s["ts"], ET).date()
             try:
                 sim["pump"] = await pump_level(http, s["cik"], day, s["lead"], subs_cache)
@@ -499,7 +507,7 @@ def report() -> dict[str, Any]:
     horizons += [("סגירת היום", [r["r_close"] for r in live]),
                  ("סגירה ביום המסחר הבא", [r["r_next_close"] for r in live])]
     lines += table("החזקה קבועה אחרי הכניסה (כל העסקאות הזמינות)", horizons)
-    lines += table("יעד רווח / סטופ (יציאה בסוף היום אם לא הושג)",
+    lines += table("יעד רווח / סטופ באותו יום (יציאה בסוף היום אם לא הושג)",
                    [(f"+{int(tp * 100)}% / -{int(sl * 100)}%", [r[f"tp{int(tp * 100)}_sl{int(sl * 100)}"] for r in live])
                     for tp, sl in TP_SL])
     lines += table("איתותים כשהשוק סגור לגמרי (20:00–04:00 / סוף שבוע): קנייה בפתיחת הסשן הבא",
@@ -521,10 +529,15 @@ def report() -> dict[str, Any]:
                     else "עלתה 3–10% לפני הכניסה" if r["pre_move"] >= 0.03 else "פחות מ-3% לפני הכניסה")
     lines += table("החזקה 30 דקות, לפי כמה המניה כבר זזה עד הכניסה",
                    [(k, [r[key] for r in live if pm(r) == k]) for k in by(pm)])
+    pump_he = {"high": "🔴 סיכון גבוה", "medium": "🟠 סיכון בינוני", "none": "ללא אזהרה", "unknown": "לא ידוע"}
+    pumps = [k for k in ("high", "medium", "none", "unknown") if any(r.get("pump", "unknown") == k for r in live)]
     lines += table("החזקה 30 דקות, לפי אזהרת פמפום (מחושבת לפי הדיווחים שהיו עד אותו יום)",
-                   [(k, [r[key] for r in live if r.get("pump") == k]) for k in by(lambda r: r.get("pump", "unknown"))])
+                   [(pump_he[k], [r[key] for r in live if r.get("pump", "unknown") == k]) for k in pumps])
     lines += table("סגירת היום, לפי אזהרת פמפום",
-                   [(k, [r["r_close"] for r in live if r.get("pump") == k]) for k in by(lambda r: r.get("pump", "unknown"))])
+                   [(pump_he[k], [r["r_close"] for r in live if r.get("pump", "unknown") == k]) for k in pumps])
+    lines += table("החזקה 30 דקות, לפי רזולוציית הנתונים (נרות 2 דקות: כניסה בין 3:00 ל-4:59)",
+                   [(f"נרות של {k} דק'", [r[key] for r in live if r.get("bar_min", 1) == k])
+                    for k in by(lambda r: r.get("bar_min", 1))])
     lines += table("החזקה 30 דקות, 8-K מול 6-K", [(k, [r[key] for r in live if r["form"] == k])
                                                   for k in by(lambda r: r["form"])])
     up = [r["max_up_60m"] for r in live]
@@ -538,7 +551,8 @@ def report() -> dict[str, Any]:
                   "|---|---|---|---|---|---|---|"]
         for r in group:
             lines.append(f"| {r['ticker']} | {r['accepted'][:16].replace('T', ' ')} | {r['score']} | "
-                         f"${r['entry']:.2f} | {pct(r['r_30m'])} | {pct(r['r_close'])} | {r.get('pump')} |")
+                         f"${r['entry']:.2f} | {pct(r['r_30m'])} | {pct(r['r_close'])} | "
+                         f"{pump_he.get(r.get('pump', 'unknown'), '')} |")
     text = "\n".join(lines) + "\n"
     (OUT / "report.md").write_text(text, encoding="utf-8")
     print(text)
