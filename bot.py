@@ -696,13 +696,16 @@ def assess_pump_risk(text: str, submissions: dict[str, Any] | None, today: dt.da
         return out
 
     year, half = within(365), within(182)
-    shelf = [f for f in year if f[0] in DILUTION_FORMS]
+    # Large accelerated filers (public float of $700M+) file shelves and 424B notes for routine
+    # debt financing; their offerings do not sink the stock, so only distress signals count.
+    large = "large accelerated" in str((submissions or {}).get("category", "")).lower()
+    shelf = [] if large else [f for f in year if f[0] in DILUTION_FORMS]
     if shelf:
         points += 2
         last = max(shelf, key=lambda f: f[1])
         reasons.append(f"מדף הנפקה / הנפקות ב-12 החודשים האחרונים ({last[0]}, {last[1]:%d.%m.%y}) — "
                        "החברה יכולה למכור מניות לתוך העלייה")
-    if sum(1 for f in half if f[0].startswith("424B")) >= 2:
+    if not large and sum(1 for f in half if f[0].startswith("424B")) >= 2:
         points += 1
         reasons.append("כמה תשקיפי מכירה (424B) בחצי השנה האחרונה")
     delist = [f for f in year if f[0].startswith("8-K") and "3.01" in f[2]]

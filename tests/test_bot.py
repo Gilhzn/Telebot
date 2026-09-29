@@ -1085,6 +1085,18 @@ class PumpRiskTest(unittest.TestCase):
         self.assertIn("3.01", text)
         self.assertIn("MOU", text)
 
+    def test_large_company_debt_shelf_is_not_a_pump_sign(self) -> None:
+        rows = [("424B2", "2026-08-01", ""), ("424B2", "2026-07-01", ""), ("S-3ASR", "2026-02-01", "")]
+        subs = {**self.submissions(rows), "category": "Large accelerated filer"}
+        risk = bot.assess_pump_risk("L3Harris Receives Contract Valued at up to $6 Billion", subs, self.TODAY)
+        self.assertEqual(risk.level, "")
+        small = {**self.submissions(rows), "category": "Non-accelerated filer<br>Smaller reporting company"}
+        self.assertIn(bot.assess_pump_risk("x", small, self.TODAY).level, ("medium", "high"))
+        # distress still counts for a large filer
+        distress = {**self.submissions(rows + [("8-K", "2026-05-02", "3.01"), ("NT 10-Q", "2026-05-15", "")]),
+                    "category": "Large accelerated filer"}
+        self.assertEqual(bot.assess_pump_risk("x", distress, self.TODAY).level, "medium")
+
     def test_clean_company_has_no_warning(self) -> None:
         subs = self.submissions([("10-Q", "2026-08-10", ""), ("8-K", "2026-07-01", "2.02,9.01"),
                                  ("424B5", "2024-01-01", "")])  # old offering: out of the window

@@ -303,7 +303,8 @@ async def pump_level(http: Http, cik: int, when: dt.date, lead: str,
     if subs:  # only filings made before the signal (point in time)
         rec = subs.get("filings", {}).get("recent", {})
         keep = [i for i, d in enumerate(rec.get("filingDate", [])) if d < when.isoformat()]
-        subs = {"filings": {"recent": {k: [v[i] for i in keep] for k, v in rec.items()
+        subs = {"category": subs.get("category", ""),
+                "filings": {"recent": {k: [v[i] for i in keep] for k, v in rec.items()
                                        if isinstance(v, list) and len(v) == len(rec.get("form", []))}}}
     return bot.assess_pump_risk(lead, subs, when).level or "none"
 
