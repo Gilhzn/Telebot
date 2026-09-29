@@ -1147,6 +1147,19 @@ class PumpRiskTest(unittest.TestCase):
 
 
 class ContinuousRunTest(unittest.TestCase):
+    def test_timed_runs_end_at_a_quiet_minute(self) -> None:
+        dtm = __import__("datetime")
+        tz = bot.eastern_tz()
+        for start_min in (0, 7, 14, 29, 31, 50):
+            start = dtm.datetime(2026, 9, 29, 7, start_min, 30, tzinfo=tz).timestamp()
+            d = bot.quiet_stop(start, 3600)
+            end = dtm.datetime.fromtimestamp(start + d, tz)
+            self.assertIn(end.minute, (14, 44), (start_min, end))
+            self.assertEqual(end.second, 0)
+            self.assertTrue(1800 <= d <= 3600, d)
+        self.assertEqual(bot.quiet_stop(0, 60), 60)   # short runs are left alone
+
+
     def test_run_for_stops_by_itself_and_alerts_quietly(self) -> None:
         cat_feed = "https://www.prnewswire.com/rss/health-latest-news/biotechnology-list.rss"
 

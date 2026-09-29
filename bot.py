@@ -745,6 +745,18 @@ YAHOO_CHART_URL = ("https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?p
                    "&interval={interval}m&includePrePost=true")
 
 
+def quiet_stop(start: float, duration: float) -> float:
+    """Shorten a timed run so it ends at a quiet minute (xx:14 or xx:44 New York): companies
+    release news on the hour and half hour, and the next run needs about a minute to take over."""
+    if duration < 40 * 60:
+        return duration
+    end = start + duration
+    t = dt.datetime.fromtimestamp(end, eastern_tz()).replace(second=0, microsecond=0)
+    back = (t.minute - 14) % 30
+    candidate = t.timestamp() - back * 60
+    return candidate - start if candidate - start >= duration / 2 else duration
+
+
 def eastern_tz() -> dt.tzinfo:
     try:
         from zoneinfo import ZoneInfo
@@ -2099,6 +2111,7 @@ class Radar:
         self.state.dirty = True
         self.save_state()
         if duration:
+            duration = quiet_stop(time.time(), duration)
             asyncio.get_running_loop().call_later(duration, self.stop_event.set)
             log.info("Continuous run for %d minutes", duration // 60)
         elif self.chat_id:
