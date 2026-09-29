@@ -470,6 +470,50 @@ def report() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+async def live(prices: Http, state_path: Path) -> None:
+    """The bot's real alerts (state.json alert_log), bought 3 minutes after each was sent."""
+    alerts = json.loads(state_path.read_text(encoding="utf-8")).get("alert_log", [])
+    now = time.time()
+    rows = []
+    for e in alerts:
+        if now - e["t"] > 28 * 86400 or now - e["t"] < 15 * 60:
+            continue
+        url = bot.YAHOO_CHART_URL.format(symbol=e["ticker"], p1=int(e["t"] - 7200),
+                                         p2=int(min(now - 60, e["t"] + 4 * 86400)), interval=1)
+        r = await prices.get(url, headers={"User-Agent": "Mozilla/5.0"}, sec=False)
+        sim = bot.simulate_trade(bot.parse_yahoo_chart(r.json()), e["t"]) if r.status_code == 200 else None
+        if sim is None:
+            log(f"{e['ticker']}: no prices")
+            continue
+        rows.append({**e, **sim})
+    live_rows = [r for r in rows if r["tradable"]]
+    closed = [r for r in rows if not r["tradable"]]
+    tz = bot.eastern_tz()
+    lines = ["# מבחן על ההתראות האמיתיות של הבוט: קנייה 3 דקות אחרי כל התראה", "",
+             f"- התראות שנמדדו: {len(rows)} (ניתן לקנות תוך 15 דקות: {len(live_rows)}; שוק סגור: {len(closed)})",
+             f"- נטו = אחרי {SLIPPAGE * 200:.0f}% עלויות לעסקה", ""]
+    horizons = [(f"{h} דקות", [r[f"r_{h}m"] for r in live_rows]) for h in HORIZONS]
+    horizons += [("סגירת היום", [r["r_close"] for r in live_rows]),
+                 ("סגירה ביום המסחר הבא", [r["r_next_close"] for r in live_rows])]
+    lines += table("החזקה קבועה", horizons)
+    lines += table("יעד / סטופ באותו יום", [(f"+{int(tp * 100)}% / -{int(sl * 100)}%",
+                                             [r[f"tp{int(tp * 100)}_sl{int(sl * 100)}"] for r in live_rows])
+                                            for tp, sl in TP_SL])
+    lines += table("שוק סגור בזמן ההתראה: קנייה בפתיחת הסשן הבא",
+                   [("5 דקות", [r["r_5m"] for r in closed]), ("סגירת היום", [r["r_close"] for r in closed])])
+    lines += ["\n### כל ההתראות\n", "| טיקר | נשלחה (ניו יורק) | כניסה | אחרי | 5 דק' | 30 דק' | שעה | סגירה | יום הבא |",
+              "|---|---|---|---|---|---|---|---|---|"]
+    for r in sorted(rows, key=lambda r: r["t"]):
+        when = dt.datetime.fromtimestamp(r["t"], tz).strftime("%d.%m %H:%M")
+        delay = f"{r['entry_delay_s'] // 60}:{r['entry_delay_s'] % 60:02d}" if r["tradable"] else "שוק סגור"
+        lines.append(f"| {r['ticker']} | {when} | ${r['entry']:.2f} | {delay} | {pct(r['r_5m'])} | {pct(r['r_30m'])} | "
+                     f"{pct(r['r_60m'])} | {pct(r['r_close'])} | {pct(r['r_next_close'])} |")
+    text = "\n".join(lines) + "\n"
+    (OUT / "live.md").write_text(text, encoding="utf-8")
+    (OUT / "live.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8")
+    print(text)
+
+
 async def amain(args: argparse.Namespace) -> int:
     ua = os.environ.get("SEC_USER_AGENT", "").strip()
     if not ua and args.mode in ("collect", "all"):
@@ -488,12 +532,14 @@ async def amain(args: argparse.Namespace) -> int:
             await trades(http, Http(client, "", rate=3.0), provider, args.max)
         if args.mode in ("report", "trades", "all"):
             report()
+        if args.mode == "live":
+            await live(Http(client, "", rate=3.0), Path(args.start or "state.json"))
     return 0
 
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("mode", choices=["collect", "trades", "report", "all"])
+    p.add_argument("mode", choices=["collect", "trades", "report", "all", "live"])
     p.add_argument("start", nargs="?")
     p.add_argument("end", nargs="?")
     p.add_argument("--provider", choices=["alpaca", "yahoo"])

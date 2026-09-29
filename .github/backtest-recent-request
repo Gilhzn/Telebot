@@ -1,1 +1,1 @@
-all 2026-08-04 2026-09-25 --provider yahoo --out backtest-out/pilot
+live state.json --out backtest-out/live
