@@ -291,6 +291,7 @@ class Config:
     watchlist: list[str] = field(default_factory=list)
     candidate_items: set[str] = field(default_factory=lambda: {"1.01", "2.01", "2.02", "7.01", "8.01"})
     catalyst_alerts: bool = True
+    pump_check: bool = True
     edgar_forms: list[str] = field(default_factory=lambda: ["8-K", "6-K"])
     edgar_poll: float = 2.0
     wire_poll: float = 10.0
@@ -315,6 +316,7 @@ class Config:
             watchlist=[normalize_ticker(t) for t in _split(_env("WATCHLIST"))],
             candidate_items=set(_split(_env("CANDIDATE_ITEMS", "1.01,2.01,2.02,7.01,8.01"))),
             catalyst_alerts=_env_bool("CATALYST_ALERTS", True),
+            pump_check=_env_bool("PUMP_CHECK", True),
             edgar_forms=[f.upper() for f in _split(_env("EDGAR_FORMS", "8-K,6-K"))],
             edgar_poll=max(1.0, _env_float("EDGAR_POLL_SECONDS", 2.0)),
             wire_poll=max(2.0, _env_float("WIRE_POLL_SECONDS", 10.0)),
@@ -644,6 +646,80 @@ def hebrew_date(day: dt.date) -> str:
 def days_until_he(day: dt.date, today: dt.date) -> str:
     n = (day - today).days
     return {0: "היום", 1: "מחר"}.get(n, f"בעוד {n} ימים")
+
+
+# ---------------------------------------------------------------------------
+# Pump risk: positive news that may spike and then crash
+# ---------------------------------------------------------------------------
+
+SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik:010d}.json"
+DILUTION_FORMS = {"S-1", "S-1/A", "F-1", "F-1/A", "S-3", "S-3/A", "F-3", "F-3/A", "S-3ASR", "F-3ASR",
+                  "424B1", "424B2", "424B3", "424B4", "424B5", "424B7"}
+PUMP_TEXT_RULES: list[tuple[int, str, re.Pattern[str]]] = [
+    (2, "הסכם לא מחייב (MOU / LOI)", re.compile(
+        r"\b(?:non-?binding|memorandum of understanding|MOU|letter of intent|LOI|term sheet|"
+        r"framework agreement|strategic cooperation agreement)\b", I)),
+    (1, "סכום כותרת של \"עד\" (up to)", re.compile(r"\bup to (?:US)?\$\s?\d", I)),
+    (1, "גל אופנתי (קריפטו / טרז'רי)", re.compile(
+        r"\b(?:bitcoin|ethereum|solana|crypto(?:currency)?|digital asset treasury|treasury (?:strategy|reserve)|"
+        r"token(?:ization)?|memecoin)\b", I)),
+]
+
+
+@dataclass
+class PumpRisk:
+    level: str            # "high" / "medium" / ""
+    reasons: list[str]
+
+
+def assess_pump_risk(text: str, submissions: dict[str, Any] | None, today: dt.date) -> PumpRisk:
+    """Heuristic crash risk for a positive item: dilution capacity and exchange trouble in the
+    company's recent SEC filings, plus pump-style wording in the news itself."""
+    points, reasons = 0, []
+    recent = ((submissions or {}).get("filings") or {}).get("recent") or {}
+    forms, dates = recent.get("form") or [], recent.get("filingDate") or []
+    items = recent.get("items") or [""] * len(forms)
+
+    def within(days: int) -> list[tuple[str, dt.date, str]]:
+        out = []
+        for form, date_s, its in zip(forms, dates, items):
+            try:
+                d = dt.date.fromisoformat(date_s)
+            except (TypeError, ValueError):
+                continue
+            if (today - d).days <= days:
+                out.append((form, d, its or ""))
+        return out
+
+    year, half = within(365), within(182)
+    shelf = [f for f in year if f[0] in DILUTION_FORMS]
+    if shelf:
+        points += 2
+        last = max(shelf, key=lambda f: f[1])
+        reasons.append(f"מדף הנפקה / הנפקות ב-12 החודשים האחרונים ({last[0]}, {last[1]:%d.%m.%y}) — "
+                       "החברה יכולה למכור מניות לתוך העלייה")
+    if sum(1 for f in half if f[0].startswith("424B")) >= 2:
+        points += 1
+        reasons.append("כמה תשקיפי מכירה (424B) בחצי השנה האחרונה")
+    delist = [f for f in year if f[0].startswith("8-K") and "3.01" in f[2]]
+    if delist:
+        points += 2
+        reasons.append(f"אזהרת מחיקה מהבורסה (8-K Item 3.01, {max(d for _, d, _ in delist):%d.%m.%y})")
+    if any(f[0].startswith("8-K") and "3.02" in f[2] for f in year):
+        points += 1
+        reasons.append("מכירת מניות פרטית (8-K Item 3.02)")
+    if any(f[0].startswith("8-K") and "3.03" in f[2] and "5.03" in f[2] for f in year):
+        points += 1
+        reasons.append("סימן לאיחוד מניות (reverse split) בשנה האחרונה")
+    if any(f[0] in ("NT 10-K", "NT 10-Q", "NT 20-F") for f in year):
+        points += 1
+        reasons.append("איחור בהגשת דוחות כספיים (NT)")
+    for pts, label, pattern in PUMP_TEXT_RULES:
+        if pattern.search(text):
+            points += pts
+            reasons.append(label)
+    level = "high" if points >= 4 else "medium" if points >= 2 else ""
+    return PumpRisk(level, reasons if level else [])
 
 
 # ---------------------------------------------------------------------------
@@ -1057,7 +1133,8 @@ def score_tag(score: int | None) -> str:
     return f"🔻 שלילי ({score})"
 
 
-def format_alert(c: Candidate, score: int | None, reason: str, now: float | None = None) -> str:
+def format_alert(c: Candidate, score: int | None, reason: str, now: float | None = None,
+                 risk: PumpRisk | None = None) -> str:
     now = time.time() if now is None else now
     lines = [score_tag(score)]
     head = f"<b>{esc(c.ticker or '—')}</b>"
@@ -1073,6 +1150,9 @@ def format_alert(c: Candidate, score: int | None, reason: str, now: float | None
         lines.append(esc(c.title))
     if reason:
         lines.append(f"💡 {esc(reason)}")
+    if risk and risk.level:
+        tag = "🔴 סיכון פמפום גבוה" if risk.level == "high" else "🟠 סיכון פמפום בינוני"
+        lines.append(f"⚠️ {tag}: " + "; ".join(esc(r) for r in risk.reasons))
     source_line = f"📰 {esc(c.source_label)}"
     if c.published_ts is not None:
         age = now - c.published_ts
@@ -1434,14 +1514,31 @@ class Radar:
             return
         self.state.last_alert[key] = now
         self.state.dirty = True
+        risk = await self.pump_risk(c) if self.cfg.pump_check and score is not None else None
         try:
-            await self.tg.send(self.chat_id, format_alert(c, score, reason, now))
+            await self.tg.send(self.chat_id, format_alert(c, score, reason, now, risk))
             self.stats["alerts"] += 1
             log.info("ALERT %s score=%s %s", key, score, c.title or c.items)
         except Exception as exc:  # noqa: BLE001
             if self.state.last_alert.get(key) == now:
                 del self.state.last_alert[key]
             log.error("Sending alert for %s failed: %s", key, exc)
+
+    async def pump_risk(self, c: Candidate) -> PumpRisk | None:
+        """Crash-risk warning for an alert. Never delays an alert by more than a few seconds."""
+        text = f"{c.title}\n{strip_boilerplate(c.text or c.summary)[:LEAD_CHARS]}"
+        found = self.tickers.lookup(c.ticker) if c.ticker else None
+        submissions = None
+        if found:
+            try:
+                resp = await self.fetcher.get(SEC_SUBMISSIONS_URL.format(cik=found[0]), timeout=4.0)
+                submissions = resp.json() if resp is not None else None
+            except Exception as exc:  # noqa: BLE001
+                log.info("SEC submissions for %s unavailable: %s", c.ticker, describe_error(exc))
+        risk = assess_pump_risk(text, submissions, us_eastern_now().date())
+        if risk.level:
+            log.info("Pump risk %s for %s: %s", risk.level, c.ticker, "; ".join(risk.reasons))
+        return risk
 
     # ----- catalysts -------------------------------------------------------
 

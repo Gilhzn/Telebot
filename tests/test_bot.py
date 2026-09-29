@@ -1027,7 +1027,9 @@ class CatalystTest(unittest.TestCase):
         self.assertIn("➕ נוספה לרשימת המעקב", msg)
         self.assertIn("KOD", radar.state.watchlist)
         self.assertIn("KOD:2026-09-28", radar.state.catalysts)
-        self.assertIn("KOD", radar.catalysts_text())
+        with mock.patch.object(bot, "us_eastern_now",
+                               return_value=__import__("datetime").datetime(2026, 9, 23, 9, 0)):
+            self.assertIn("KOD", radar.catalysts_text())
 
     def test_reminder_on_the_day_once(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -1059,6 +1061,75 @@ class CatalystTest(unittest.TestCase):
             radar.state.save()
             st = bot.State.load(Path(d) / "state.json", [])
         self.assertIn("KOD:2026-09-28", st.catalysts)
+
+
+class PumpRiskTest(unittest.TestCase):
+    TODAY = __import__("datetime").date(2026, 9, 29)
+
+    @staticmethod
+    def submissions(rows: list[tuple[str, str, str]]) -> dict[str, Any]:
+        return {"filings": {"recent": {"form": [r[0] for r in rows], "filingDate": [r[1] for r in rows],
+                                       "items": [r[2] for r in rows]}}}
+
+    def test_dilution_and_delisting_history_is_high_risk(self) -> None:
+        subs = self.submissions([
+            ("424B5", "2026-08-01", ""), ("424B5", "2026-06-15", ""), ("S-3", "2026-01-10", ""),
+            ("8-K", "2026-05-02", "3.01,9.01"), ("10-Q", "2026-08-10", ""),
+        ])
+        risk = bot.assess_pump_risk("Company signs non-binding MOU with partner", subs, self.TODAY)
+        self.assertEqual(risk.level, "high")
+        text = " ".join(risk.reasons)
+        self.assertIn("424B5", text)
+        self.assertIn("3.01", text)
+        self.assertIn("MOU", text)
+
+    def test_clean_company_has_no_warning(self) -> None:
+        subs = self.submissions([("10-Q", "2026-08-10", ""), ("8-K", "2026-07-01", "2.02,9.01"),
+                                 ("424B5", "2024-01-01", "")])  # old offering: out of the window
+        risk = bot.assess_pump_risk("Company awarded $450 million government contract", subs, self.TODAY)
+        self.assertEqual((risk.level, risk.reasons), ("", []))
+
+    def test_text_alone_can_raise_medium(self) -> None:
+        risk = bot.assess_pump_risk("Signs letter of intent for bitcoin treasury strategy", None, self.TODAY)
+        self.assertEqual(risk.level, "medium")
+
+    def test_alert_carries_pump_warning(self) -> None:
+        async def scenario() -> None:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = base_world()
+            w.set("https://data.sec.gov/submissions/CIK0001849056.json", self.submissions([
+                ("424B5", "2026-09-01", ""), ("8-K", "2026-04-01", "3.01"),
+            ]))
+            with mock.patch.object(bot, "SEC_MIN_INTERVAL", 0.0), \
+                    mock.patch.object(bot, "us_eastern_now",
+                                      return_value=__import__("datetime").datetime(2026, 9, 29, 9, 0)):
+                async with w.client() as client:
+                    radar = bot.Radar(make_cfg(Path(tmp.name)), client)
+                    await radar.refresh_tickers()
+                    c = bot.Candidate(**{**bot.SAMPLE_CANDIDATE.__dict__, "published_ts": time.time()})
+                    risk = await radar.pump_risk(c)
+            self.assertEqual(risk.level, "high")
+            msg = bot.format_alert(c, 5, "חוזה", risk=risk)
+            self.assertIn("🔴 סיכון פמפום גבוה", msg)
+            self.assertIn("424B5", msg)
+
+        run(scenario())
+
+    def test_sec_failure_never_blocks_alert(self) -> None:
+        async def scenario() -> None:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = base_world()  # no submissions route -> 404
+            async with w.client() as client:
+                radar = bot.Radar(make_cfg(Path(tmp.name)), client)
+                await radar.refresh_tickers()
+                c = bot.Candidate(**{**bot.SAMPLE_CANDIDATE.__dict__})
+                risk = await radar.pump_risk(c)
+            self.assertEqual(risk.level, "")
+            self.assertNotIn("פמפום", bot.format_alert(c, 5, "x", risk=risk))
+
+        run(scenario())
 
 
 class StateTest(unittest.TestCase):
