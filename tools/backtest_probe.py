@@ -5,6 +5,7 @@ Saves raw responses to backtest-out/probe/ so they can be inspected offline."""
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -34,6 +35,25 @@ PROBES = [
 ]
 
 
+MARKERS = {"prn": "/news-releases/", "globe": "/news-release/2026/", "edgar_efts": "_source",
+           "edgar_daily": "8-K", "yahoo": "timestamp"}
+
+
+def show_structure(name: str, body: str) -> None:
+    """Print a short window of the page around the first news item (no raw pages are stored:
+    third-party pages can embed API keys that GitHub push protection rejects)."""
+    marker = next((m for k, m in MARKERS.items() if name.startswith(k)), None)
+    if not marker:
+        return
+    count = body.count(marker)
+    i = body.find(marker, body.find(marker) + 1 if name.startswith("prn") else 0)
+    window = re.sub(r"\s+", " ", body[max(0, i - 700):i + 900]) if i >= 0 else ""
+    print(f"--- {name}: {count} x {marker!r}\n{window}\n---", flush=True)
+    for m in re.finditer(r"(\d{1,2}:\d{2}\s?(?:ET|AM|PM)[^<]{0,20})", body[:200000]):
+        print(f"    time sample: {m.group(1)}")
+        break
+
+
 def main() -> int:
     OUT.mkdir(parents=True, exist_ok=True)
     report = []
@@ -44,8 +64,8 @@ def main() -> int:
             try:
                 r = client.get(url, headers=headers)
                 body = r.text
-                (OUT / f"{name}.html").write_text(body, encoding="utf-8")
                 line = f"{name}: {r.status_code} {len(body)} bytes final={r.url}"
+                show_structure(name, body)
             except Exception as exc:  # noqa: BLE001
                 line = f"{name}: ERROR {bot.describe_error(exc)}"
             print(line, flush=True)
@@ -60,7 +80,7 @@ def main() -> int:
                  "&end=2026-03-10T16:00:00Z&limit=50&include_content=true"),
             ]:
                 r = client.get(url, headers=h)
-                (OUT / f"{name}.json").write_text(r.text, encoding="utf-8")
+                print(r.text[:1500], flush=True)
                 line = f"{name}: {r.status_code} {len(r.text)} bytes"
                 print(line, flush=True)
                 report.append(line)
