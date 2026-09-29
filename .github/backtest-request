@@ -1,2 +1,1 @@
-all 2026-08-31 2026-09-25 --provider yahoo --out backtest-out/pilot
-# retry after candidate-filter fix
+collect 2025-09-29 2026-03-27 --out backtest-out/main
