@@ -68,6 +68,10 @@ def main() -> None:
                 with_ticker = sum(1 for it in items if it.tickers)
                 first = items[0].title[:80] if items else ""
                 print(f"{r.status_code} items={len(items)} with_ticker={with_ticker} {url}\n     first: {first}")
+                for it in items[:5]:
+                    print(f"       {it.tickers} {it.title[:70]} | {it.summary[:120]!r}")
+                if r.status_code == 200 and not items:
+                    print("     body:", re.sub(r"\\s+", " ", r.text[:300]))
             except Exception as exc:  # noqa: BLE001
                 print(f"ERR {url}: {bot.describe_error(exc)}")
             time.sleep(1)
