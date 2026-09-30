@@ -24,6 +24,10 @@ INDEX_PAGES = [
     "https://www.accessnewswire.com/newsroom/rss",
     "https://www.accessnewswire.com/rss-feeds",
     "https://www.newsfilecorp.com/rss",
+    "https://www.newsfilecorp.com/newswire/",
+    "https://www.newsfilecorp.com/",
+    "https://www.accessnewswire.com/newsroom",
+    "https://www.accessnewswire.com/",
 ]
 FEEDS = [
     "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeGVtRWA==",
