@@ -46,6 +46,7 @@ jobs:
           case "$MODE" in
             probe) python tools/backtest_probe.py ;;
             feeds) python tools/probe_feeds.py "$@" ;;
+            guru) python tools/guru_probe.py ;;
             *) python tools/backtest.py "$MODE" "$@" ;;
           esac
       - name: save results
