@@ -1,2 +1,1 @@
-guru
-# dry run after the thousands-unit fix
+guru --send 1067983

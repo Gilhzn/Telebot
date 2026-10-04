@@ -19,6 +19,8 @@ jobs:
     timeout-minutes: 300
     env:
       SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       ALPACA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY_ID }}
       ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
       INPUT_ARGS: ${{ inputs.args }}
@@ -46,7 +48,7 @@ jobs:
           case "$MODE" in
             probe) python tools/backtest_probe.py ;;
             feeds) python tools/probe_feeds.py "$@" ;;
-            guru) python tools/guru_probe.py ;;
+            guru) python tools/guru_probe.py "$@" ;;
             *) python tools/backtest.py "$MODE" "$@" ;;
           esac
       - name: save results
