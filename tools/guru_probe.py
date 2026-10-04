@@ -15,6 +15,7 @@ async def main() -> None:
     cfg = bot.Config.from_env()
     cfg.state_file = Path("guru-probe-state.json")
     cfg.chat_id = "dry-run"
+    cfg.guru_alerts = True
     async with bot.make_client() as client:
         radar = bot.Radar(cfg, client)
         await radar.refresh_tickers()

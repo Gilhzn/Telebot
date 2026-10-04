@@ -26,6 +26,7 @@ import re
 import signal
 import sys
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -296,6 +297,8 @@ class Config:
     candidate_items: set[str] = field(default_factory=lambda: {"1.01", "2.01", "2.02", "7.01", "8.01"})
     catalyst_alerts: bool = True
     pump_check: bool = True
+    guru_alerts: bool = False
+    gurus: list[tuple[int, str, str]] = field(default_factory=lambda: list(DEFAULT_GURUS))
     edgar_forms: list[str] = field(default_factory=lambda: ["8-K", "6-K"])
     edgar_poll: float = 2.0
     wire_poll: float = 10.0
@@ -321,6 +324,8 @@ class Config:
             candidate_items=set(_split(_env("CANDIDATE_ITEMS", "1.01,2.01,2.02,7.01,8.01"))),
             catalyst_alerts=_env_bool("CATALYST_ALERTS", True),
             pump_check=_env_bool("PUMP_CHECK", True),
+            guru_alerts=_env_bool("GURU_ALERTS", False),
+            gurus=parse_gurus(_env("GURUS")) or list(DEFAULT_GURUS),
             edgar_forms=[f.upper() for f in _split(_env("EDGAR_FORMS", "8-K,6-K"))],
             edgar_poll=max(1.0, _env_float("EDGAR_POLL_SECONDS", 2.0)),
             wire_poll=max(2.0, _env_float("WIRE_POLL_SECONDS", 10.0)),
@@ -727,6 +732,169 @@ def assess_pump_risk(text: str, submissions: dict[str, Any] | None, today: dt.da
             reasons.append(label)
     level = "high" if points >= 4 else "medium" if points >= 2 else ""
     return PumpRisk(level, reasons if level else [])
+
+
+# ---------------------------------------------------------------------------
+# Guru portfolios: quarterly 13F filings of well-known investors (the data GuruFocus shows)
+# ---------------------------------------------------------------------------
+
+DEFAULT_GURUS: list[tuple[int, str, str]] = [
+    (1067983, "Warren Buffett", "Berkshire Hathaway"),
+    (1336528, "Bill Ackman", "Pershing Square"),
+    (1649339, "Michael Burry", "Scion Asset Management"),
+    (1061768, "Seth Klarman", "Baupost Group"),
+    (1656456, "David Tepper", "Appaloosa"),
+    (1536411, "Stanley Druckenmiller", "Duquesne Family Office"),
+    (1709323, "Li Lu", "Himalaya Capital"),
+    (1166559, "Bill Gates", "Gates Foundation Trust"),
+    (949509, "Howard Marks", "Oaktree Capital"),
+    (1350694, "Ray Dalio", "Bridgewater Associates"),
+]
+GURU_PAGE_URL = "https://www.gurufocus.com/guru/top-holdings"
+GURU_CHECK_SECONDS = 1800
+GURU_MIN_CHANGE = 0.10        # share count change that counts as "added" / "reduced"
+GURU_LIST_MAX = 8             # lines per category in a message
+SEC_FILING_INDEX_JSON = "https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nd}/index.json"
+SEC_FILING_INDEX_HTML = "https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nd}/{acc}-index.htm"
+OPENFIGI_URL = "https://api.openfigi.com/v3/mapping"
+
+
+def parse_gurus(raw: str) -> list[tuple[int, str, str]]:
+    """GURUS="1067983:Warren Buffett:Berkshire Hathaway,1336528:Bill Ackman" """
+    out = []
+    for part in _split(raw):
+        bits = [b.strip() for b in part.split(":")]
+        if bits and bits[0].isdigit():
+            out.append((int(bits[0]), bits[1] if len(bits) > 1 else bits[0], bits[2] if len(bits) > 2 else ""))
+    return out
+
+
+@dataclass
+class Holding:
+    cusip: str
+    name: str
+    value: float      # US dollars
+    shares: float
+    put_call: str = ""
+
+    @property
+    def key(self) -> str:
+        return f"{self.cusip}:{self.put_call}" if self.put_call else self.cusip
+
+
+def parse_13f_table(xml_text: str) -> dict[str, Holding]:
+    """Information table of a 13F-HR filing -> holdings by CUSIP (+ put/call), lines merged."""
+    root = ET.fromstring(xml_text.encode("utf-8") if isinstance(xml_text, str) else xml_text)
+    out: dict[str, Holding] = {}
+    for row in root.iter():
+        if not row.tag.endswith("infoTable"):
+            continue
+        f = {el.tag.rsplit("}", 1)[-1]: (el.text or "").strip() for el in row.iter()}
+        try:
+            h = Holding(f.get("cusip", "").upper(), f.get("nameOfIssuer", ""), float(f.get("value") or 0),
+                        float(f.get("sshPrnamt") or 0), f.get("putCall", "").title())
+        except ValueError:
+            continue
+        if not h.cusip:
+            continue
+        if h.key in out:
+            out[h.key].value += h.value
+            out[h.key].shares += h.shares
+        else:
+            out[h.key] = h
+    return out
+
+
+def diff_13f(prev: dict[str, Holding], cur: dict[str, Holding]) -> dict[str, list[tuple[Holding | None, Holding | None, float]]]:
+    """new / added / reduced / sold, each (previous, current, share change), biggest moves first."""
+    new = [(None, h, 1.0) for k, h in cur.items() if k not in prev]
+    sold = [(h, None, -1.0) for k, h in prev.items() if k not in cur]
+    added, reduced = [], []
+    for k, h in cur.items():
+        p = prev.get(k)
+        if p is None or p.shares <= 0:
+            continue
+        change = h.shares / p.shares - 1
+        if change >= GURU_MIN_CHANGE:
+            added.append((p, h, change))
+        elif change <= -GURU_MIN_CHANGE:
+            reduced.append((p, h, change))
+
+    def moved(t: tuple[Holding | None, Holding | None, float]) -> float:
+        p, h, _ = t
+        if h is None:
+            return p.value if p else 0.0
+        price = h.value / h.shares if h.shares else 0.0
+        return abs(h.shares - (p.shares if p else 0.0)) * price
+
+    return {k: sorted(v, key=moved, reverse=True)
+            for k, v in (("new", new), ("added", added), ("reduced", reduced), ("sold", sold))}
+
+
+def _money(x: float) -> str:
+    for unit, div in (("B", 1e9), ("M", 1e6), ("K", 1e3)):
+        if abs(x) >= div:
+            return f"${x / div:,.1f}{unit}"
+    return f"${x:,.0f}"
+
+
+def quarter_label(report_date: str) -> str:
+    try:
+        d = dt.date.fromisoformat(report_date)
+    except ValueError:
+        return report_date
+    return f"Q{(d.month - 1) // 3 + 1} {d.year}"
+
+
+def format_guru_changes(guru: tuple[int, str, str], filing: dict[str, str], cur: dict[str, Holding],
+                        changes: dict[str, list[tuple[Holding | None, Holding | None, float]]],
+                        tickers: dict[str, str], first_report: bool) -> str:
+    cik, name, fund = guru
+    total = sum(h.value for h in cur.values())
+
+    def label(h: Holding) -> str:
+        t = tickers.get(h.cusip, "")
+        opt = f" ({h.put_call})" if h.put_call else ""
+        return (f"<b>{esc(t)}</b> {esc(h.name.title())}" if t else f"<b>{esc(h.name.title())}</b>") + opt
+
+    filed = filing.get("filingDate", "")
+    lines = [
+        "🧭 <b>שינויים בתיק של משקיע-על</b>",
+        f"<b>{esc(name)}</b>" + (f" · {esc(fund)}" if fund else ""),
+        f"{quarter_label(filing.get('reportDate', ''))} · דווח ל-SEC ב-{esc(filed)} · "
+        f"תיק {_money(total)} ב-{len(cur)} החזקות",
+    ]
+    if first_report:
+        lines.append("ℹ️ זה הדיווח האחרון שכבר פורסם. מעכשיו תקבל הודעה על כל דיווח רבעוני חדש.")
+    sections = [("new", "🟢 <b>קנו (פוזיציה חדשה)</b>"), ("added", "⬆️ <b>הגדילו</b>"),
+                ("reduced", "⬇️ <b>הקטינו</b>"), ("sold", "🔴 <b>מכרו הכול</b>")]
+    any_change = False
+    for key, title in sections:
+        rows = changes[key]
+        if not rows:
+            continue
+        any_change = True
+        lines.append(title)
+        for p, h, change in rows[:GURU_LIST_MAX]:
+            if key == "new":
+                share = f" · {h.value / total * 100:.1f}% מהתיק" if total else ""
+                lines.append(f"• {label(h)} · {_money(h.value)}{share}")
+            elif key == "sold":
+                lines.append(f"• {label(p)} · היה {_money(p.value)}")
+            else:
+                lines.append(f"• {label(h)} · {change * 100:+.0f}% מניות · עכשיו {_money(h.value)}")
+        if len(rows) > GURU_LIST_MAX:
+            lines.append(f"  ועוד {len(rows) - GURU_LIST_MAX}")
+    if not any_change:
+        lines.append("ללא שינויים מהותיים מהרבעון הקודם.")
+    acc = filing.get("accessionNumber", "")
+    sec_link = SEC_FILING_INDEX_HTML.format(cik=cik, acc_nd=acc.replace("-", ""), acc=acc)
+    lines += [
+        f'📰 מקור: <a href="{html.escape(GURU_PAGE_URL, quote=True)}">GuruFocus</a> · '
+        f'הנתונים עצמם מהדיווח הרבעוני (13F) ל-SEC: <a href="{html.escape(sec_link, quote=True)}">הדיווח</a>',
+        "ℹ️ דיווח 13F מתפרסם עד 45 יום אחרי סוף הרבעון, כך שהעסקאות עצמן נעשו קודם.",
+    ]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -1164,6 +1332,9 @@ class State:
         self.tg_offset = 0
         self.sources: dict[str, dict[str, Any]] = {}
         self.catalysts: dict[str, dict[str, Any]] = {}  # "TICKER:YYYY-MM-DD" -> details
+        self.gurus: dict[str, str] = {}                  # CIK -> accession of the last 13F reported
+        self.guru_checked = 0.0
+        self.cusip_tickers: dict[str, str] = {}          # CUSIP -> ticker ("" = none found)
         self.alert_log: list[dict[str, Any]] = []       # every alert sent, for the performance report
         self.perf_day = ""                               # last day the performance report went out
         self.dirty = False
@@ -1188,6 +1359,9 @@ class State:
         st.tg_offset = int(data.get("tg_offset", 0))
         st.sources = data.get("sources", {})
         st.catalysts = data.get("catalysts", {})
+        st.gurus = data.get("gurus", {})
+        st.guru_checked = float(data.get("guru_checked", 0.0))
+        st.cusip_tickers = data.get("cusip_tickers", {})
         st.alert_log = data.get("alert_log", [])
         if "alert_log" not in data:  # first run with the report: seed it from the last week's alerts
             st.alert_log = sorted(({"t": ts, "ticker": k, "score": None, "pump": "unknown", "src": "", "title": ""}
@@ -1219,6 +1393,9 @@ class State:
             "tg_offset": self.tg_offset,
             "sources": self.sources,
             "catalysts": self.catalysts,
+            "gurus": self.gurus,
+            "guru_checked": self.guru_checked,
+            "cusip_tickers": self.cusip_tickers,
             "alert_log": self.alert_log[-ALERT_LOG_MAX:],
             "perf_day": self.perf_day,
             "seen": list(self.seen),
@@ -1799,6 +1976,94 @@ class Radar:
                          f"{esc(e['label'])}")
         return "\n".join(lines)
 
+    # ----- guru portfolios (13F) -------------------------------------------
+
+    async def check_gurus(self) -> None:
+        """Every 30 minutes: has one of the tracked investors filed a new quarterly 13F?"""
+        if not self.cfg.guru_alerts or not self.chat_id:
+            return
+        now = time.time()
+        if now - self.state.guru_checked < GURU_CHECK_SECONDS:
+            return
+        self.state.guru_checked = now
+        self.state.dirty = True
+        for guru in self.cfg.gurus:
+            try:
+                await self.check_guru(guru)
+            except SecBlocked:
+                return
+            except Exception as exc:  # noqa: BLE001
+                log.warning("13F check for %s failed: %s", guru[1], describe_error(exc))
+
+    async def check_guru(self, guru: tuple[int, str, str]) -> None:
+        cik = guru[0]
+        resp = await self.fetcher.get(SEC_SUBMISSIONS_URL.format(cik=cik))
+        assert resp is not None
+        rec = resp.json().get("filings", {}).get("recent", {})
+        filings = [{k: rec[k][i] for k in ("accessionNumber", "filingDate", "reportDate")}
+                   for i, form in enumerate(rec.get("form", [])) if form == "13F-HR"]
+        if not filings:
+            return
+        latest = filings[0]
+        known = self.state.gurus.get(str(cik))
+        if known == latest["accessionNumber"]:
+            return
+        prev = next((f for f in filings[1:] if f["reportDate"] < latest["reportDate"]), None)
+        cur = await self.load_13f(cik, latest["accessionNumber"])
+        before = await self.load_13f(cik, prev["accessionNumber"]) if prev else {}
+        changes = diff_13f(before, cur)
+        cusips = {h.cusip for rows in changes.values() for p, h, _ in rows[:GURU_LIST_MAX] for h in (p, h) if h}
+        tickers = await self.cusip_tickers(cusips, cur, before)
+        await self.reply(format_guru_changes(guru, latest, cur, changes, tickers, first_report=known is None))
+        self.state.gurus[str(cik)] = latest["accessionNumber"]
+        self.state.dirty = True
+        log.info("13F %s %s: %s", guru[1], latest["reportDate"], {k: len(v) for k, v in changes.items()})
+
+    async def load_13f(self, cik: int, acc: str) -> dict[str, Holding]:
+        resp = await self.fetcher.get(SEC_FILING_INDEX_JSON.format(cik=cik, acc_nd=acc.replace("-", "")))
+        assert resp is not None
+        items = resp.json().get("directory", {}).get("item", [])
+        xmls = [i["name"] for i in items if i.get("name", "").lower().endswith(".xml")
+                and i["name"].lower() != "primary_doc.xml"]
+        if not xmls:
+            return {}
+        name = next((x for x in xmls if "info" in x.lower()), xmls[0])
+        doc = await self.fetcher.get(f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc.replace('-', '')}/{name}")
+        assert doc is not None
+        return parse_13f_table(doc.text)
+
+    async def cusip_tickers(self, cusips: set[str], *tables: dict[str, Holding]) -> dict[str, str]:
+        """CUSIP -> ticker: cached, else OpenFIGI (free, 10 per request), else a company-name match."""
+        todo = sorted(c for c in cusips if c not in self.state.cusip_tickers)
+        for i in range(0, len(todo), 10):
+            batch = todo[i:i + 10]
+            try:
+                resp = await self.client.post(OPENFIGI_URL, timeout=15, json=[
+                    {"idType": "ID_CUSIP", "idValue": c, "exchCode": "US"} for c in batch])
+                resp.raise_for_status()
+                for c, res in zip(batch, resp.json()):
+                    data = res.get("data") or []
+                    self.state.cusip_tickers[c] = normalize_ticker(data[0]["ticker"]) if data else ""
+            except Exception as exc:  # noqa: BLE001
+                log.info("OpenFIGI lookup failed: %s", describe_error(exc))
+                break
+        names = {h.cusip: h.name for t in tables for h in t.values()}
+        out = {}
+        for c in cusips:
+            t = self.state.cusip_tickers.get(c) or self.tickers.by_name.get(normalize_company(names.get(c, "")), "")
+            if t:
+                out[c] = t
+        self.state.dirty = True
+        return out
+
+    def gurus_text(self) -> str:
+        lines = ["🧭 <b>משקיעי-על במעקב</b> (דיווחי 13F רבעוניים ל-SEC)"]
+        for cik, name, fund in self.cfg.gurus:
+            seen = "✅" if str(cik) in self.state.gurus else "⏳"
+            lines.append(f"{seen} {esc(name)}" + (f" · {esc(fund)}" if fund else ""))
+        lines.append(f'מקור: <a href="{html.escape(GURU_PAGE_URL, quote=True)}">GuruFocus</a> · נבדק כל 30 דקות')
+        return "\n".join(lines)
+
     # ----- performance report ----------------------------------------------
 
     async def check_performance_report(self) -> None:
@@ -1884,6 +2149,7 @@ class Radar:
             "/list — הצגת הרשימה\n"
             "/catalysts — קטליזטורים צפויים (תוצאות ניסויים, החלטות FDA)\n"
             "/perf — מה היה קורה אם היית קונה 3 דקות אחרי כל התראה\n"
+            "/gurus — משקיעי-העל שבמעקב (קניות ומכירות מדיווחי 13F)\n"
             "/status — מצב המקורות והמונים\n"
             "/test — התראת דוגמה\n"
             "/help — ההודעה הזו\n\n"
@@ -1968,6 +2234,8 @@ class Radar:
             await self.reply(self.cmd_remove(args))
         elif cmd in ("/catalysts", "/upcoming"):
             await self.reply(self.catalysts_text())
+        elif cmd in ("/gurus", "/guru"):
+            await self.reply(self.gurus_text())
         elif cmd in ("/perf", "/performance"):
             await self.reply(perf_summary_text(self.state.alert_log))
         elif cmd == "/list":
@@ -2081,6 +2349,7 @@ class Radar:
             try:
                 await self.check_catalyst_reminders()
                 await self.check_performance_report()
+                await self.check_gurus()
             except Exception:  # noqa: BLE001
                 log.exception("Catalyst reminders / performance report failed")
             await self._sleep(60)
@@ -2203,6 +2472,7 @@ class Radar:
         await self.drain()
         await self.check_catalyst_reminders()
         await self.check_performance_report()
+        await self.check_gurus()
         if self.pending_status:
             await self.reply(self.status_text())
         self.state.dirty = True

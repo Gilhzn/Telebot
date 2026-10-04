@@ -1292,6 +1292,95 @@ class PerformanceTest(unittest.TestCase):
         self.assertIn("עדיין אין", bot.perf_summary_text([]))
 
 
+INFO_NS = "http://www.sec.gov/edgar/document/thirteenf/informationtable"
+
+
+def info_table(rows: list[tuple[str, str, int, int, str]]) -> str:
+    """rows: (issuer, cusip, value $, shares, putCall)"""
+    body = "".join(
+        f"<infoTable><nameOfIssuer>{n}</nameOfIssuer><titleOfClass>COM</titleOfClass><cusip>{c}</cusip>"
+        f"<value>{v}</value><shrsOrPrnAmt><sshPrnamt>{sh}</sshPrnamt><sshPrnamtType>SH</sshPrnamtType>"
+        f"</shrsOrPrnAmt>{f'<putCall>{pc}</putCall>' if pc else ''}<investmentDiscretion>SOLE</investmentDiscretion>"
+        f"</infoTable>" for n, c, v, sh, pc in rows)
+    return f'<?xml version="1.0" encoding="UTF-8"?><informationTable xmlns="{INFO_NS}">{body}</informationTable>'
+
+
+Q1 = [("APPLE INC", "037833100", 60_000_000_000, 300_000_000, ""),
+      ("BANK AMER CORP", "060505104", 30_000_000_000, 700_000_000, ""),
+      ("KRAFT HEINZ CO", "500754106", 10_000_000_000, 325_000_000, ""),
+      ("CHEVRON CORP NEW", "166764100", 5_000_000_000, 30_000_000, "")]
+Q2 = [("APPLE INC", "037833100", 50_000_000_000, 250_000_000, ""),           # -17%
+      ("BANK AMER CORP", "060505104", 20_000_000_000, 400_000_000, ""),      # with the next line: -40%
+      ("BANK AMER CORP", "060505104", 1_000_000_000, 20_000_000, ""),        # second line, merged
+      ("KRAFT HEINZ CO", "500754106", 10_500_000_000, 325_000_000, ""),     # unchanged
+      ("CONSTELLATION BRANDS INC", "21036P108", 1_200_000_000, 5_600_000, ""),  # new
+      ("ALPHABET INC", "02079K305", 900_000_000, 5_000_000, "Call")]         # new option
+# Chevron sold out
+
+
+class GuruTest(unittest.TestCase):
+    def test_parse_and_diff(self) -> None:
+        cur = bot.parse_13f_table(info_table(Q2))
+        self.assertEqual(cur["060505104"].shares, 420_000_000)        # lines merged
+        self.assertIn("02079K305:Call", cur)
+        changes = bot.diff_13f(bot.parse_13f_table(info_table(Q1)), cur)
+        self.assertEqual([h.cusip for _, h, _ in changes["new"]], ["21036P108", "02079K305"])
+        self.assertEqual([p.cusip for p, _, _ in changes["sold"]], ["166764100"])
+        self.assertEqual({p.cusip for p, _, _ in changes["reduced"]}, {"037833100", "060505104"})
+        self.assertEqual(changes["added"], [])
+
+    def test_new_filing_is_reported_once(self) -> None:
+        cik = 1067983
+        acc2, acc1 = "0000950123-26-008100", "0000950123-26-005000"
+        subs = {"filings": {"recent": {
+            "form": ["4", "13F-HR", "SC 13G", "13F-HR"],
+            "accessionNumber": ["x", acc2, "y", acc1],
+            "filingDate": ["2026-08-20", "2026-08-14", "2026-08-01", "2026-05-15"],
+            "reportDate": ["2026-08-19", "2026-06-30", "", "2026-03-31"]}}}
+        figi_calls = []
+
+        def figi(request: httpx.Request) -> httpx.Response:
+            jobs = json.loads(request.content)
+            figi_calls.append(jobs)
+            known = {"037833100": "AAPL", "060505104": "BAC", "21036P108": "STZ", "166764100": "CVX"}
+            return httpx.Response(200, json=[{"data": [{"ticker": known[j["idValue"]]}]} if j["idValue"] in known
+                                             else {"warning": "No identifier found."} for j in jobs])
+
+        async def scenario() -> None:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = base_world()
+            w.set(f"https://data.sec.gov/submissions/CIK{cik:010d}.json", subs)
+            for acc, rows in ((acc2, Q2), (acc1, Q1)):
+                base = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc.replace('-', '')}"
+                w.set(f"{base}/index.json", {"directory": {"item": [
+                    {"name": "primary_doc.xml"}, {"name": "50240.xml"}, {"name": f"{acc}-index.htm"}]}})
+                w.set(f"{base}/50240.xml", info_table(rows))
+            w.routes[bot.OPENFIGI_URL] = figi
+            cfg = make_cfg(Path(tmp.name), guru_alerts=True, gurus=[(cik, "Warren Buffett", "Berkshire Hathaway")])
+            with mock.patch.object(bot, "SEC_MIN_INTERVAL", 0.0):
+                async with w.client() as client:
+                    radar = bot.Radar(cfg, client)
+                    await radar.refresh_tickers()
+                    await radar.check_gurus()
+                    self.assertEqual(len(w.sent), 1, [m["text"] for m in w.sent])
+                    text = w.sent[0]["text"]
+                    for part in ("Warren Buffett", "Q2 2026", "קנו (פוזיציה חדשה)", "<b>STZ</b>", "(Call)",
+                                 "הקטינו", "<b>BAC</b>", "-40%", "מכרו הכול", "<b>CVX</b>", "GuruFocus",
+                                 "gurufocus.com/guru/top-holdings", "דיווח"):
+                        self.assertIn(part, text)
+                    self.assertNotIn("Kraft", text)                            # unchanged position
+                    self.assertEqual(radar.state.gurus[str(cik)], acc2)
+                    # no new filing: nothing sent, even when the 30-minute gate opens again
+                    radar.state.guru_checked = 0
+                    await radar.check_gurus()
+                    self.assertEqual(len(w.sent), 1)
+                    self.assertEqual(len(figi_calls), 1)                    # tickers cached
+                    self.assertIn("✅ Warren Buffett", radar.gurus_text())
+
+        run(scenario())
+
+
 class StateTest(unittest.TestCase):
     def test_seen_is_capped_and_atomic(self) -> None:
         with tempfile.TemporaryDirectory() as d:
