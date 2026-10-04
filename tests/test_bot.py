@@ -172,6 +172,7 @@ class World:
 
 
 def make_cfg(tmp: Path, **overrides: Any) -> bot.Config:
+    overrides.setdefault("guru_alerts", "gurus" in overrides)   # off unless a test sets gurus
     cfg = bot.Config(
         telegram_token="123:ABC",
         chat_id="42",
@@ -1329,6 +1330,12 @@ class GuruTest(unittest.TestCase):
         self.assertEqual({p.cusip for p, _, _ in changes["reduced"]}, {"037833100", "060505104"})
         self.assertEqual(changes["added"], [])
 
+    def test_values_reported_in_thousands_are_scaled(self) -> None:
+        rows = [(n, c, v // 1000, sh, pc) for n, c, v, sh, pc in Q1]
+        cur = bot.parse_13f_table(info_table(rows))
+        self.assertEqual(cur["037833100"].value, 60_000_000_000)
+        self.assertEqual(bot.parse_13f_table(info_table(Q1))["037833100"].value, 60_000_000_000)
+
     def test_new_filing_is_reported_once(self) -> None:
         cik = 1067983
         acc2, acc1 = "0000950123-26-008100", "0000950123-26-005000"
@@ -1357,7 +1364,7 @@ class GuruTest(unittest.TestCase):
                     {"name": "primary_doc.xml"}, {"name": "50240.xml"}, {"name": f"{acc}-index.htm"}]}})
                 w.set(f"{base}/50240.xml", info_table(rows))
             w.routes[bot.OPENFIGI_URL] = figi
-            cfg = make_cfg(Path(tmp.name), guru_alerts=True, gurus=[(cik, "Warren Buffett", "Berkshire Hathaway")])
+            cfg = make_cfg(Path(tmp.name), gurus=[(cik, "Warren Buffett", "Berkshire Hathaway")])
             with mock.patch.object(bot, "SEC_MIN_INTERVAL", 0.0):
                 async with w.client() as client:
                     radar = bot.Radar(cfg, client)

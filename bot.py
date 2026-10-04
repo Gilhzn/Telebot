@@ -297,7 +297,7 @@ class Config:
     candidate_items: set[str] = field(default_factory=lambda: {"1.01", "2.01", "2.02", "7.01", "8.01"})
     catalyst_alerts: bool = True
     pump_check: bool = True
-    guru_alerts: bool = False
+    guru_alerts: bool = True
     gurus: list[tuple[int, str, str]] = field(default_factory=lambda: list(DEFAULT_GURUS))
     edgar_forms: list[str] = field(default_factory=lambda: ["8-K", "6-K"])
     edgar_poll: float = 2.0
@@ -324,7 +324,7 @@ class Config:
             candidate_items=set(_split(_env("CANDIDATE_ITEMS", "1.01,2.01,2.02,7.01,8.01"))),
             catalyst_alerts=_env_bool("CATALYST_ALERTS", True),
             pump_check=_env_bool("PUMP_CHECK", True),
-            guru_alerts=_env_bool("GURU_ALERTS", False),
+            guru_alerts=_env_bool("GURU_ALERTS", True),
             gurus=parse_gurus(_env("GURUS")) or list(DEFAULT_GURUS),
             edgar_forms=[f.upper() for f in _split(_env("EDGAR_FORMS", "8-K,6-K"))],
             edgar_poll=max(1.0, _env_float("EDGAR_POLL_SECONDS", 2.0)),
@@ -802,6 +802,12 @@ def parse_13f_table(xml_text: str) -> dict[str, Holding]:
             out[h.key].shares += h.shares
         else:
             out[h.key] = h
+    # Values are in dollars since 2023, but some filers still report thousands: then the implied
+    # share price of a typical holding comes out below $1.
+    prices = sorted(h.value / h.shares for h in out.values() if h.shares > 0)
+    if prices and prices[len(prices) // 2] < 1.0:
+        for h in out.values():
+            h.value *= 1000
     return out
 
 
