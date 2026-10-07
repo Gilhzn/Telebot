@@ -49,6 +49,8 @@ jobs:
             probe) python tools/backtest_probe.py ;;
             feeds) python tools/probe_feeds.py "$@" ;;
             guru) python tools/guru_probe.py "$@" ;;
+            gprobe) python tools/gainers_probe.py ;;
+            gainers) python tools/gainers.py "$@" ;;
             *) python tools/backtest.py "$MODE" "$@" ;;
           esac
       - name: save results
