@@ -1441,6 +1441,7 @@ class GainersStudyTest(unittest.TestCase):
                 radar.state.news_log["OKLO"] = [{"t": at(8, 0) + 20, "pub": at(8, 0), "src": "PR Newswire",
                                                  "title": "Oklo Awarded $450 Million Contract by U.S. Department of Defense"}]
                 radar.state.alert_log.append({"t": at(8, 1), "ticker": "OKLO", "score": 5, "pump": "none"})
+                radar.state.news_log_since = at(0, 0) - 86400
                 with mock.patch.object(bot, "us_eastern_now", return_value=dtm.datetime(2026, 10, 7, 20, 25, tzinfo=tz)):
                     await radar.check_gainers_study()
                     await radar.check_gainers_study()          # once a day
@@ -1459,6 +1460,24 @@ class GainersStudyTest(unittest.TestCase):
                          "התריע לפני תחילת הזינוק: 1"):
                 self.assertIn(part, summary)
             self.assertEqual(len(w.sent), 1)
+
+        run(scenario())
+
+    def test_no_study_on_the_first_partial_day(self) -> None:
+        dtm = __import__("datetime")
+        tz = bot.eastern_tz()
+
+        async def scenario() -> None:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = base_world()
+            async with w.client() as client:
+                radar = bot.Radar(make_cfg(Path(tmp.name)), client)
+                radar.state.news_log_since = dtm.datetime(2026, 10, 7, 17, 0, tzinfo=tz).timestamp()
+                with mock.patch.object(bot, "us_eastern_now", return_value=dtm.datetime(2026, 10, 7, 20, 25, tzinfo=tz)):
+                    await radar.check_gainers_study()
+            self.assertEqual(w.sent, [])
+            self.assertFalse(any("api.nasdaq.com" in str(r.url) for r in w.requests))
 
         run(scenario())
 

@@ -1514,6 +1514,7 @@ class State:
         self.gainers_log: list[dict[str, Any]] = []      # daily study of the biggest gainers
         self.gainers_day = ""
         self.learning_ready_sent = False
+        self.news_log_since = 0.0                        # when news logging started (first full day only)
         self.guru_checked = 0.0
         self.cusip_tickers: dict[str, str] = {}          # CUSIP -> ticker ("" = none found)
         self.alert_log: list[dict[str, Any]] = []       # every alert sent, for the performance report
@@ -1545,6 +1546,7 @@ class State:
         st.gainers_log = data.get("gainers_log", [])
         st.gainers_day = data.get("gainers_day", "")
         st.learning_ready_sent = bool(data.get("learning_ready_sent", False))
+        st.news_log_since = float(data.get("news_log_since", 0.0))
         st.guru_checked = float(data.get("guru_checked", 0.0))
         st.cusip_tickers = data.get("cusip_tickers", {})
         st.alert_log = data.get("alert_log", [])
@@ -1562,6 +1564,8 @@ class State:
         return self.news_log
 
     def log_news(self, ticker: str, src: str, title: str, pub: float | None) -> None:
+        if not self.news_log_since:
+            self.news_log_since = time.time()
         items = self.news_log.setdefault(ticker, [])
         key = (title or "")[:60].lower()
         if any(i["title"][:60].lower() == key for i in items):
@@ -1596,6 +1600,7 @@ class State:
             "gainers_log": self.gainers_log[-GAINERS_LOG_MAX:],
             "gainers_day": self.gainers_day,
             "learning_ready_sent": self.learning_ready_sent,
+            "news_log_since": self.news_log_since,
             "guru_checked": self.guru_checked,
             "cusip_tickers": self.cusip_tickers,
             "alert_log": self.alert_log[-ALERT_LOG_MAX:],
@@ -2281,6 +2286,10 @@ class Radar:
             return
         self.state.gainers_day = today.isoformat()
         self.state.dirty = True
+        day_start = dt.datetime.combine(today, dt.time(4, 0), tzinfo=eastern_tz()).timestamp() - 12 * 3600
+        if not self.state.news_log_since or self.state.news_log_since > day_start:
+            log.info("Gainers study: news log started mid-day, first study tomorrow")
+            return
         try:
             resp = await self.client.get(NASDAQ_SCREENER_URL, headers=NASDAQ_HEADERS, timeout=40)
             resp.raise_for_status()
