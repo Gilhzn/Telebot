@@ -13,12 +13,9 @@ import bot  # noqa: E402
 
 UA = {"User-Agent": "StockNewsRadar/1.0 (+https://github.com/Gilhzn/Telebot)", "Accept": "application/json, text/html"}
 URLS = [
-    "https://query1.finance.yahoo.com/v8/finance/spark?symbols=AAPL,SXTC,TSLA&range=5d&interval=1d",
-    "https://query1.finance.yahoo.com/v8/finance/spark?symbols=AAPL,SXTC&range=3mo&interval=1d",
-    "https://finance.yahoo.com/markets/stocks/gainers/?count=100",
-    "https://finance.yahoo.com/markets/stocks/small-cap-gainers/?count=100",
-    "https://finance.yahoo.com/research-hub/screener/small_cap_gainers/?count=100",
-    "https://finance.yahoo.com/markets/stocks/trending/",
+    "https://query1.finance.yahoo.com/v8/finance/spark?symbols=AAPL,SXTC,TSLA,NVDA,AMD,INTC,GRAB,NU,BULL,SMCI,CAT,BSP,APLD,HESM,PENG,BRZE,BKV,NWE,BKH,ALEC,EVH,CCOI,CNXC,ADCT,SSTK,LPCN,BIYA,GIPR,NIVF,SBFM,TOPP,OKLO,KOD,NVTS,IOVA,IVVD,LHX,RTX,BA,VZ,HII,SUGP,VNDA,TEVA,SCYX,LAR,MGLD,CCB,PAAC,ROC&range=5d&interval=1d",
+    "https://feeds.finance.yahoo.com/rss/2.0/headline?s=SXTC,IOVA&region=US&lang=en-US",
+    "https://query1.finance.yahoo.com/v1/finance/search?q=IOVA&newsCount=10&quotesCount=0",
 ]
 for url in URLS:
     t = time.time()
@@ -27,7 +24,10 @@ for url in URLS:
         body = r.text
         print(f"\n=== {r.status_code} {len(body)}B {time.time() - t:.1f}s {url} -> {r.url}")
         if "spark" in url:
-            print(re.sub(r"\s+", " ", body[:700]))
+            data = r.json() if r.status_code == 200 else {}
+            print("symbols returned:", len(data), sorted(data)[:60])
+        elif "rss" in url or "search" in url:
+            print(re.sub(r"\s+", " ", body[:2500]))
         else:
             rows = re.findall(r'data-testid="data-table-v2-row"(.*?)</tr>', body, re.S)
             print("table rows:", len(rows))
