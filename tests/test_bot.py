@@ -1392,57 +1392,72 @@ class GuruTest(unittest.TestCase):
 
 class GainersStudyTest(unittest.TestCase):
     def test_helpers(self) -> None:
-        rows = [{"symbol": "AAA", "pctchange": "+126.4%", "lastsale": "$2.83", "volume": "142759538", "marketCap": "50000000"},
-                {"symbol": "FUSEW", "pctchange": "+300%", "lastsale": "$0.50", "volume": "9000000"},    # warrant
-                {"symbol": "ABC", "name": "ABC Corp Rights", "pctchange": "+90%", "lastsale": "$0.50", "volume": "9000000"},
-                {"symbol": "BBB", "pctchange": "+25%", "lastsale": "$0.10", "volume": "9000000"},     # too cheap
-                {"symbol": "CCC", "pctchange": "+45%", "lastsale": "$7.00", "volume": "1000000"},
-                {"symbol": "DDD", "pctchange": "+5%", "lastsale": "$7.00", "volume": "1000000"}]
-        self.assertEqual([g["ticker"] for g in bot.pick_gainers(rows)], ["AAA", "CCC"])
+        dtm = __import__("datetime")
+        tz = bot.eastern_tz()
+        day = dtm.date(2026, 10, 7)
+        t = lambda d: int(dtm.datetime(2026, 10, d, 9, 30, tzinfo=tz).timestamp())  # noqa: E731
+        spark = {"SXTC": {"timestamp": [t(5), t(6), t(7)], "close": [1.2, 1.25, 2.83]},
+                 "OLD": {"timestamp": [t(5), t(6)], "close": [1.0, 2.0]},          # no bar today
+                 "AAPL": {"timestamp": [t(6), t(7)], "close": [100.0, 101.0]}}
+        moves = bot.spark_moves(spark, day)
+        self.assertAlmostEqual(moves["SXTC"][0], 126.4)
+        self.assertNotIn("OLD", moves)
+        self.assertAlmostEqual(moves["AAPL"][0], 1.0)
+        tm = bot.TickerMap()
+        tm.load({"fields": ["cik", "name", "ticker", "exchange"],
+                 "data": [[1, "A", "ABCD", "Nasdaq"], [2, "B", "FUSEW", "Nasdaq"], [3, "C", "BRK-B", "NYSE"]]})
+        self.assertEqual(bot.research_universe(tm), ["ABCD", "BRK-B"])
         self.assertEqual(bot.classify_catalyst("Acme Receives FDA Approval for X"), "FDA / רגולציה")
         self.assertEqual(bot.classify_catalyst("Acme Awarded $50M Army Contract"), "חוזה / הזמנה")
         self.assertEqual(bot.classify_catalyst("Acme to Be Acquired by Big Co for $5 per Share"), "מיזוג / רכישה")
         self.assertEqual(bot.classify_catalyst(""), bot.NO_NEWS)
-        pts = [(100.0, 1.0), (160.0, 1.05), (220.0, 1.12), (280.0, 1.5), (340.0, 1.3)]
-        prof = bot.move_profile(pts, 1.0)
+        prof = bot.move_profile([(100.0, 1.0), (160.0, 1.05), (220.0, 1.12), (280.0, 1.5), (340.0, 1.3)], 1.0)
         self.assertEqual(prof["start"], 220.0)
         self.assertAlmostEqual(prof["peak_pct"], 50.0)
-        day = __import__("datetime").date(2026, 10, 7)
-        data = {"data": {"rows": [{"created": "Oct 7, 2026", "title": "Acme Signs Deal"},
-                                  {"created": "Oct 6, 2026", "title": "Old"}]}}
-        self.assertEqual(bot.nasdaq_press_today(data, day), "Acme Signs Deal")
+        news = {"news": [{"title": "Acme wins", "publisher": "ACCESS Newswire", "providerPublishTime": 5,
+                          "relatedTickers": ["ACME"]},
+                         {"title": "Other co", "publisher": "X", "providerPublishTime": 6, "relatedTickers": ["ZZZ"]}]}
+        self.assertEqual(bot.yahoo_news_items(news, "ACME"), [{"pub": 5.0, "src": "ACCESS Newswire", "title": "Acme wins"}])
+        self.assertTrue(bot.is_our_source("GlobeNewswire"))
+        self.assertFalse(bot.is_our_source("ACCESS Newswire"))
 
     def test_daily_study_report_and_learning(self) -> None:
         dtm = __import__("datetime")
         tz = bot.eastern_tz()
         at = lambda h, m: dtm.datetime(2026, 10, 7, h, m, tzinfo=tz).timestamp()  # noqa: E731
-        screener = {"data": {"rows": [
-            {"symbol": "OKLO", "pctchange": "+80%", "lastsale": "$9.00", "volume": "5000000", "marketCap": "200000000"},
-            {"symbol": "TEVA", "pctchange": "+30%", "lastsale": "$20.00", "volume": "9000000", "marketCap": "2e10"}]}}
+        y = lambda: at(9, 30) - 86400  # noqa: E731
+        spark = {"OKLO": {"timestamp": [y(), at(9, 30)], "close": [5.0, 9.0]},
+                 "TEVA": {"timestamp": [y(), at(9, 30)], "close": [15.4, 20.0]},
+                 "AAPL": {"timestamp": [y(), at(9, 30)], "close": [100.0, 101.0]}}
 
         def chart(prev: float, start: float) -> dict:
-            pts = [{"x": (at(4, 0) + 60 * i) * 1000, "y": prev * (1.0 if at(4, 0) + 60 * i < start else 1.5)}
-                   for i in range(900)]
-            return {"data": {"previousClose": f"${prev}", "chart": pts}}
+            ts = [int(at(4, 0)) + 60 * i for i in range(900)]
+            px = [prev * (1.0 if t < start else 1.5) for t in ts]
+            return {"chart": {"result": [{"timestamp": ts, "indicators": {"quote": [{
+                "open": px, "high": px, "low": px, "close": px, "volume": [5000] * len(ts)}]}}]}}
 
         async def scenario() -> None:
             tmp = tempfile.TemporaryDirectory()
             self.addCleanup(tmp.cleanup)
             w = base_world()
-            w.set(bot.NASDAQ_SCREENER_URL, screener)
-            w.set("https://api.nasdaq.com/api/quote/OKLO/chart?assetclass=stocks", chart(5.0, at(8, 5)))
-            w.set("https://api.nasdaq.com/api/quote/TEVA/chart?assetclass=stocks", chart(15.4, at(10, 30)))
-            w.routes["https://api.nasdaq.com/api/news/topic/press_release*"] = (200, {"data": {"rows": [
-                {"created": "Oct 7, 2026", "title": "Teva Announces Partnership With Big Pharma"}]}})
+            w.routes["https://query1.finance.yahoo.com/v8/finance/spark*"] = (200, spark)
+            w.routes["https://query1.finance.yahoo.com/v8/finance/chart/OKLO?*"] = (200, chart(5.0, at(8, 5)))
+            w.routes["https://query1.finance.yahoo.com/v8/finance/chart/TEVA?*"] = (200, chart(15.4, at(10, 30)))
+            w.routes["https://query1.finance.yahoo.com/v1/finance/search?q=OKLO*"] = (200, {"news": []})
+            w.routes["https://query1.finance.yahoo.com/v1/finance/search?q=TEVA*"] = (200, {"news": [
+                {"title": "Teva Announces Partnership With Big Pharma", "publisher": "ACCESS Newswire",
+                 "providerPublishTime": int(at(10, 0)), "relatedTickers": ["TEVA"]}]})
             cfg = make_cfg(Path(tmp.name))
             async with w.client() as client:
                 radar = bot.Radar(cfg, client)
                 await radar.refresh_tickers()
+                radar.tickers._add(9, "Apple Inc.", "AAPL")
                 radar.state.news_log["OKLO"] = [{"t": at(8, 0) + 20, "pub": at(8, 0), "src": "PR Newswire",
                                                  "title": "Oklo Awarded $450 Million Contract by U.S. Department of Defense"}]
                 radar.state.alert_log.append({"t": at(8, 1), "ticker": "OKLO", "score": 5, "pump": "none"})
                 radar.state.news_log_since = at(0, 0) - 86400
-                with mock.patch.object(bot, "us_eastern_now", return_value=dtm.datetime(2026, 10, 7, 20, 25, tzinfo=tz)):
+                with mock.patch.object(bot, "us_eastern_now", return_value=dtm.datetime(2026, 10, 7, 20, 25, tzinfo=tz)), \
+                        mock.patch.object(bot.asyncio, "sleep", new=mock.AsyncMock()):
                     await radar.check_gainers_study()
                     await radar.check_gainers_study()          # once a day
             text = "\n".join(m["text"] for m in w.sent)
@@ -1451,13 +1466,15 @@ class GainersStudyTest(unittest.TestCase):
             self.assertIn("הזינוק התחיל 08:05", text)
             self.assertIn("חוזה / הזמנה · PR Newswire 08:00 (5 דק' לפני הזינוק)", text)
             self.assertIn("הבוט התריע 4 דק' לפני הזינוק ✅", text)
-            self.assertIn("ממקור שהבוט לא קורא", text)               # TEVA: Nasdaq press, not in our feeds
+            self.assertIn("ACCESS Newswire 10:00 (30 דק' לפני הזינוק) · מקור שהבוט לא קורא", text)
+            self.assertNotIn("AAPL", text)                                # +1% is not a gainer
             log_ = radar.state.gainers_log
             self.assertEqual([e["ticker"] for e in log_], ["OKLO", "TEVA"])
             self.assertEqual(log_[1]["cat"], "שותפות / רישיון")
+            self.assertTrue(log_[1]["missing_source"])
             summary = bot.learning_summary(log_)
             for part in ("מה למדתי", "עם חדשות שהבוט ראה: 1", "חוזה / הזמנה", "PR Newswire: 1 · 5 דק'",
-                         "התריע לפני תחילת הזינוק: 1"):
+                         "ACCESS Newswire: 1 · 30 דק' ⚠️ לא במעקב", "התריע לפני תחילת הזינוק: 1"):
                 self.assertIn(part, summary)
             self.assertEqual(len(w.sent), 1)
 

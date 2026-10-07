@@ -908,12 +908,13 @@ def format_guru_changes(guru: tuple[int, str, str], filing: dict[str, str], cur:
 # and did the bot see it in time? (data: Nasdaq market screener + 1-minute chart)
 # ---------------------------------------------------------------------------
 
-NASDAQ_SCREENER_URL = "https://api.nasdaq.com/api/screener/stocks?tableonly=true&limit=10000&offset=0&download=true"
-NASDAQ_CHART_URL = "https://api.nasdaq.com/api/quote/{symbol}/chart?assetclass=stocks"
-NASDAQ_PRESS_URL = ("https://api.nasdaq.com/api/news/topic/press_release?q=symbol:{symbol}|assetclass:stocks"
-                    "&limit=8&offset=0")
-NASDAQ_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; StockNewsRadar/1.0; +https://github.com/Gilhzn/Telebot)",
-                  "Accept": "application/json, text/plain, */*"}
+YAHOO_SPARK_URL = "https://query1.finance.yahoo.com/v8/finance/spark?symbols={symbols}&range={range}&interval=1d"
+YAHOO_NEWS_URL = "https://query1.finance.yahoo.com/v1/finance/search?q={symbol}&newsCount={count}&quotesCount=0"
+RESEARCH_HEADERS = {"User-Agent": "StockNewsRadar/1.0 (+https://github.com/Gilhzn/Telebot)",
+                    "Accept": "application/json"}
+SPARK_BATCH = 20
+# Yahoo publisher names of the wires the bot reads itself
+OUR_PUBLISHERS = ("globenewswire", "pr newswire", "prnewswire", "business wire", "businesswire")
 GAINERS_REPORT_AT = (20, 20)      # New York time, after the performance report
 GAINERS_MIN_PCT = 20.0            # a "big gainer": up 20%+ on the day
 GAINERS_MIN_PRICE = 0.30
@@ -961,39 +962,42 @@ def _pct_number(raw: Any) -> float | None:
         return None
 
 
-def pick_gainers(rows: list[dict[str, Any]], listed: set[str] | None = None) -> list[dict[str, Any]]:
-    """Today's biggest gainers from the Nasdaq screener: common shares only (no warrants/units/rights),
-    price and volume floors, biggest % first."""
-    out = []
-    for r in rows:
-        sym = normalize_ticker(r.get("symbol", ""))
-        pct, price, vol = (_pct_number(r.get("pctchange")), _pct_number(r.get("lastsale")),
-                           _pct_number(r.get("volume")))
-        if pct is None or price is None or vol is None or not sym:
+def research_universe(tickers: "TickerMap") -> list[str]:
+    """Exchange-listed common shares: no warrants, units or rights (5-letter symbols ending W/U/R)."""
+    return sorted(t for t in tickers.by_ticker
+                  if re.fullmatch(r"[A-Z]{1,5}(?:-[A-Z])?", t) and not (len(t) == 5 and t[-1] in "WUR"))
+
+
+def spark_moves(data: dict[str, Any], day: dt.date) -> dict[str, tuple[float, float, float]]:
+    """symbol -> (% change, close, previous close) for `day` from a Yahoo spark response."""
+    tz = eastern_tz()
+    out = {}
+    for sym, d in (data or {}).items():
+        ts, closes = (d or {}).get("timestamp") or [], (d or {}).get("close") or []
+        pairs = [(t, c) for t, c in zip(ts, closes) if c]
+        if len(pairs) < 2 or dt.datetime.fromtimestamp(pairs[-1][0], tz).date() != day:
             continue
-        if listed is not None and sym not in listed:
-            continue
-        if (re.search(r"(?:W|WS|U|R|RT)$", sym) and len(sym) >= 5) or \
-                re.search(r"\b(?:warrants?|units?|rights?)\b", str(r.get("name", "")), I):
-            continue
-        if pct >= GAINERS_MIN_PCT and price >= GAINERS_MIN_PRICE and vol >= GAINERS_MIN_VOLUME:
-            out.append({"ticker": sym, "pct": pct, "price": price, "volume": vol,
-                        "mcap": _pct_number(r.get("marketCap")) or 0.0, "sector": r.get("sector", ""),
-                        "industry": r.get("industry", ""), "country": r.get("country", "")})
-    out.sort(key=lambda g: -g["pct"])
+        prev, close = pairs[-2][1], pairs[-1][1]
+        if prev > 0:
+            out[normalize_ticker(sym)] = ((close / prev - 1) * 100, close, prev)
     return out
 
 
-def parse_nasdaq_chart(data: dict[str, Any]) -> tuple[list[tuple[float, float]], float | None]:
-    """(epoch seconds, price) points of today's 1-minute Nasdaq chart and the previous close."""
-    d = (data or {}).get("data") or {}
-    points = []
-    for p in d.get("chart") or []:
-        try:
-            points.append((float(p["x"]) / 1000.0, float(p["y"])))
-        except (KeyError, TypeError, ValueError):
+def yahoo_news_items(data: dict[str, Any], ticker: str) -> list[dict[str, Any]]:
+    """News about `ticker` from a Yahoo search response: publish time, publisher, title."""
+    out = []
+    for n in (data or {}).get("news") or []:
+        related = [normalize_ticker(t) for t in n.get("relatedTickers") or []]
+        if related and ticker not in related:
             continue
-    return sorted(points), _pct_number(d.get("previousClose"))
+        if n.get("providerPublishTime"):
+            out.append({"pub": float(n["providerPublishTime"]), "src": str(n.get("publisher", "")),
+                        "title": str(n.get("title", ""))[:140]})
+    return out
+
+
+def is_our_source(publisher: str) -> bool:
+    return any(p in publisher.lower() for p in OUR_PUBLISHERS)
 
 
 def move_profile(points: list[tuple[float, float]], prev_close: float | None) -> dict[str, Any]:
@@ -1004,15 +1008,6 @@ def move_profile(points: list[tuple[float, float]], prev_close: float | None) ->
     peak_t, peak = max(points, key=lambda p: p[1])
     return {"start": start, "peak_t": peak_t, "peak_pct": (peak / prev_close - 1) * 100,
             "close_pct": (points[-1][1] / prev_close - 1) * 100}
-
-
-def nasdaq_press_today(data: dict[str, Any], day: dt.date) -> str:
-    """Title of a press release Nasdaq lists for the symbol today ('' if none)."""
-    label = f"{day:%b} {day.day}, {day.year}"
-    for row in ((data or {}).get("data") or {}).get("rows") or []:
-        if str(row.get("created", "")).strip() == label:
-            return str(row.get("title", ""))
-    return ""
 
 
 def _median(values: list[float]) -> float | None:
@@ -1028,12 +1023,13 @@ def learning_summary(log_entries: list[dict[str, Any]]) -> str:
         return "📚 עדיין אין נתונים. הלמידה רצה בכל יום מסחר ב-20:20 שעון ניו יורק."
     days = sorted({e["date"] for e in log_entries})
     n = len(log_entries)
-    with_ours = [e for e in log_entries if e.get("news_src")]
-    elsewhere = [e for e in log_entries if not e.get("news_src") and e.get("press")]
-    none = [e for e in log_entries if not e.get("news_src") and not e.get("press")]
+    with_ours = [e for e in log_entries if e.get("news_src") and e.get("seen")]
+    elsewhere = [e for e in log_entries if e.get("news_src") and not e.get("seen")]
+    none = [e for e in log_entries if not e.get("news_src")]
     lines = [f"📚 <b>מה למדתי עד עכשיו</b> ({len(days)} ימי מסחר, {n} מניות שעלו {GAINERS_MIN_PCT:.0f}%+)",
              f"• עם חדשות שהבוט ראה: {len(with_ours)} ({len(with_ours) * 100 // n}%)",
-             f"• חדשות ממקור שהבוט לא קורא: {len(elsewhere)} ({len(elsewhere) * 100 // n}%)",
+             f"• חדשות שהבוט לא ראה (מקור שלא במעקב או שפורסם קודם במקום אחר): {len(elsewhere)} "
+             f"({len(elsewhere) * 100 // n}%)",
              f"• בלי חדשות פומביות (מומנטום, פמפום, סקטור): {len(none)} ({len(none) * 100 // n}%)"]
     lines.append("\n<b>איזה סוג חדשות מקפיץ מניות</b> (מספר · חציון עלייה ביום · חציון שיא)")
     cats: dict[str, list[dict[str, Any]]] = {}
@@ -1044,14 +1040,18 @@ def learning_summary(log_entries: list[dict[str, Any]]) -> str:
         peak = _median([r["peak_pct"] for r in rows if r.get("peak_pct") is not None])
         lines.append(f"• {esc(cat)}: {len(rows)} · {med:+.0f}%" + (f" · שיא {peak:+.0f}%" if peak is not None else ""))
     srcs: dict[str, list[float]] = {}
-    for e in with_ours:
+    for e in with_ours + elsewhere:
         if e.get("lead_min") is not None:
             srcs.setdefault(e["news_src"].split(" · ")[0], []).append(e["lead_min"])
     if srcs:
-        lines.append("\n<b>מאיפה החדשות הגיעו</b> (מספר · חציון דקות מהפרסום עד תחילת הזינוק)")
-        for src, leads in sorted(srcs.items(), key=lambda kv: -len(kv[1])):
-            lines.append(f"• {esc(src)}: {len(leads)} · {_median(leads):.0f} דק'")
+        lines.append("\n<b>מאיפה החדשות הגיעו ראשונות</b> (מספר · חציון דקות מהפרסום עד תחילת הזינוק)")
+        for src, leads in sorted(srcs.items(), key=lambda kv: -len(kv[1]))[:10]:
+            mark = "" if is_our_source(src) or src.startswith(("SEC", "PR Newswire", "GlobeNewswire", "Business Wire")) \
+                else " ⚠️ לא במעקב"
+            lines.append(f"• {esc(src)}: {len(leads)} · {_median(leads):.0f} דק'{mark}")
     news_driven = [e for e in log_entries if e.get("news_src") and e.get("start")]
+    small = [e for e in log_entries if 0 < e.get("price", 0) < 5]
+    lines.append(f"\n• מניות מתחת ל-$5: {len(small) * 100 // n}% מהמזנקות")
     if news_driven:
         before = [e for e in news_driven if e.get("bot_lead_min") is not None and e["bot_lead_min"] >= 0]
         after = [e for e in news_driven if e.get("bot_lead_min") is not None and e["bot_lead_min"] < 0]
@@ -1069,8 +1069,6 @@ def learning_summary(log_entries: list[dict[str, Any]]) -> str:
         names = {"pre": "טרום מסחר", "regular": "מסחר רגיל", "after": "אחרי המסחר", "closed": "סגור"}
         lines.append("\n<b>מתי הזינוקים מתחילים</b>: " +
                      " · ".join(f"{names[k]} {v}" for k, v in sorted(sess.items(), key=lambda kv: -kv[1])))
-    small = [e for e in log_entries if 0 < e.get("mcap", 0) < 300e6]
-    lines.append(f"• שווי שוק מתחת ל-$300M: {len(small) * 100 // n}% מהמזנקות")
     return "\n".join(lines)
 
 
@@ -2290,25 +2288,24 @@ class Radar:
         if not self.state.news_log_since or self.state.news_log_since > day_start:
             log.info("Gainers study: news log started mid-day, first study tomorrow")
             return
-        try:
-            resp = await self.client.get(NASDAQ_SCREENER_URL, headers=NASDAQ_HEADERS, timeout=40)
-            resp.raise_for_status()
-            rows = ((resp.json().get("data") or {}).get("rows")) or []
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Gainers study: Nasdaq screener failed: %s", describe_error(exc))
-            return
-        listed = set(self.tickers.by_ticker) if self.tickers.loaded else None
-        gainers = pick_gainers(rows, listed)[:GAINERS_TOP]
-        if not gainers:
+        candidates = await self.todays_movers(today)
+        if not candidates:
             log.info("Gainers study: no stock up %s%%+ today", GAINERS_MIN_PCT)
             return
         studied = []
-        for g in gainers:
+        for g in candidates[:GAINERS_TOP * 2]:
+            if len(studied) >= GAINERS_TOP:
+                break
             try:
-                studied.append(await self.study_gainer(g, today))
+                row = await self.study_gainer(g, today)
             except Exception as exc:  # noqa: BLE001
                 log.info("Gainers study for %s failed: %s", g["ticker"], describe_error(exc))
-            await asyncio.sleep(0.5)
+                continue
+            if row and row["volume"] >= GAINERS_MIN_VOLUME:
+                studied.append(row)
+            await asyncio.sleep(0.3)
+        if not studied:
+            return
         self.state.gainers_log.extend(studied)
         self.state.dirty = True
         await self.send_long(self.gainers_text(studied, today))
@@ -2321,37 +2318,70 @@ class Radar:
                 "הלמידה ממשיכה בכל יום, וההתראות מתעדכנות לפי מה שנמדד.\n\n"
                 + learning_summary(self.state.gainers_log))
 
-    async def study_gainer(self, g: dict[str, Any], today: dt.date) -> dict[str, Any]:
-        sym = g["ticker"]
-        resp = await self.client.get(NASDAQ_CHART_URL.format(symbol=sym), headers=NASDAQ_HEADERS, timeout=20)
-        points, prev = parse_nasdaq_chart(resp.json() if resp.status_code == 200 else {})
-        prof = move_profile(points, prev)
-        start = prof.get("start")
-        anchor = start or dt.datetime.combine(today, dt.time(16, 0), tzinfo=eastern_tz()).timestamp()
-        news = [n for n in self.state.news_log.get(sym, [])
-                if anchor - 24 * 3600 <= (n.get("pub") or n["t"]) <= anchor + 15 * 60]
-        wires = [n for n in news if not n["src"].startswith("SEC")]
-        first = min(wires or news, key=lambda n: n.get("pub") or n["t"]) if news else None
-        title = first["title"] if first and not first["src"].startswith("SEC") else ""
-        press = ""
-        if not wires:
+    async def todays_movers(self, today: dt.date) -> list[dict[str, Any]]:
+        """Every listed common share's change today (Yahoo spark, 20 symbols per request)."""
+        universe = research_universe(self.tickers) if self.tickers.loaded else []
+        moves: dict[str, tuple[float, float, float]] = {}
+        for i in range(0, len(universe), SPARK_BATCH):
+            batch = ",".join(universe[i:i + SPARK_BATCH])
             try:
-                pr = await self.client.get(NASDAQ_PRESS_URL.format(symbol=sym), headers=NASDAQ_HEADERS, timeout=20)
-                press = nasdaq_press_today(pr.json() if pr.status_code == 200 else {}, today)
+                resp = await self.client.get(YAHOO_SPARK_URL.format(symbols=batch, range="5d"),
+                                             headers=RESEARCH_HEADERS, timeout=20)
+                if resp.status_code == 200:
+                    moves.update(spark_moves(resp.json(), today))
+                elif resp.status_code == 429:
+                    await asyncio.sleep(10)
             except Exception as exc:  # noqa: BLE001
-                log.info("Nasdaq press releases for %s unavailable: %s", sym, describe_error(exc))
-        alerts = [a for a in self.state.alert_log if a.get("ticker") == sym and anchor - 24 * 3600 <= a["t"]
-                  <= anchor + 12 * 3600]
+                log.info("Spark batch failed: %s", describe_error(exc))
+            await asyncio.sleep(0.25)
+        log.info("Gainers study: %d symbols priced, %d up %s%%+", len(moves),
+                 sum(1 for m in moves.values() if m[0] >= GAINERS_MIN_PCT), GAINERS_MIN_PCT)
+        return sorted(({"ticker": t, "pct": pct, "price": close, "prev": prev}
+                       for t, (pct, close, prev) in moves.items()
+                       if pct >= GAINERS_MIN_PCT and close >= GAINERS_MIN_PRICE), key=lambda g: -g["pct"])
+
+    async def study_gainer(self, g: dict[str, Any], today: dt.date) -> dict[str, Any] | None:
+        sym = g["ticker"]
+        tz = eastern_tz()
+        day0 = dt.datetime.combine(today, dt.time(4, 0), tzinfo=tz).timestamp()
+        resp = await self.client.get(YAHOO_CHART_URL.format(symbol=sym, p1=int(day0), p2=int(day0 + 16 * 3600),
+                                                            interval=1), headers=RESEARCH_HEADERS, timeout=20)
+        bars = parse_yahoo_chart(resp.json()) if resp.status_code == 200 else []
+        prof = move_profile([(b[0], b[2]) for b in bars], g["prev"])
+        start = prof.get("start")
+        anchor = start or dt.datetime.combine(today, dt.time(16, 0), tzinfo=tz).timestamp()
+        window = (anchor - 24 * 3600, anchor + 15 * 60)
+        ours = [{**n, "seen": True} for n in self.state.news_log.get(sym, [])
+                if window[0] <= (n.get("pub") or n["t"]) <= window[1]]
+        theirs: list[dict[str, Any]] = []
+        try:
+            nr = await self.client.get(YAHOO_NEWS_URL.format(symbol=sym, count=15), headers=RESEARCH_HEADERS, timeout=20)
+            theirs = [n for n in (yahoo_news_items(nr.json(), sym) if nr.status_code == 200 else [])
+                      if window[0] <= n["pub"] <= window[1]]
+        except Exception as exc:  # noqa: BLE001
+            log.info("Yahoo news for %s unavailable: %s", sym, describe_error(exc))
+        wires = [n for n in ours if not n["src"].startswith("SEC")]
+        first_ours = min(wires or ours, key=lambda n: n.get("pub") or n["t"]) if ours else None
+        first_any = min(theirs, key=lambda n: n["pub"]) if theirs else None
+        # The earliest news anywhere; the bot "saw" it if the item is in its own log.
+        first = first_ours
+        if first_any and (not first_ours or first_any["pub"] < (first_ours.get("pub") or first_ours["t"]) - 60):
+            first = first_any
+        news_t = (first.get("pub") or first.get("t")) if first else None
+        seen = bool(first and first.get("seen"))
+        title = first["title"] if first and not first["src"].startswith("SEC") else ""
+        alerts = [a for a in self.state.alert_log if a.get("ticker") == sym
+                  and anchor - 24 * 3600 <= a["t"] <= anchor + 12 * 3600]
         alert_t = min(a["t"] for a in alerts) if alerts else None
-        news_t = (first.get("pub") or first["t"]) if first else None
         return {
-            **g, "date": today.isoformat(), "start": start, "peak_pct": prof.get("peak_pct"),
-            "peak_t": prof.get("peak_t"), "news_src": first["src"] if first else "",
-            "news_t": news_t, "title": title or press or (first["title"] if first else ""),
-            "cat": classify_catalyst(title or press or ""), "press": bool(press) and not first,
+            **g, "date": today.isoformat(), "volume": sum(b[5] for b in bars), "start": start,
+            "peak_pct": prof.get("peak_pct"), "peak_t": prof.get("peak_t"),
+            "news_src": first["src"] if first else "", "news_t": news_t, "seen": seen,
+            "missing_source": bool(first) and not seen and not is_our_source(first["src"]),
+            "title": title, "cat": classify_catalyst(title),
             "lead_min": round((start - news_t) / 60) if start and news_t else None,
             "bot_lead_min": round((start - alert_t) / 60) if start and alert_t else (0 if alert_t else None),
-            "rule_score": rule_score(title or press).score if (title or press) else None,
+            "rule_score": rule_score(title).score if title else None,
         }
 
     def gainers_text(self, studied: list[dict[str, Any]], today: dt.date) -> str:
@@ -2365,7 +2395,16 @@ class Radar:
             if e.get("start"):
                 head += f" · הזינוק התחיל {hm(e['start'])}"
             lines.append(head)
-            if e.get("news_src"):
+            if e.get("news_src") and not e.get("seen"):
+                lead = e.get("lead_min")
+                when = f" ({lead} דק' לפני הזינוק)" if lead is not None and lead >= 0 else ""
+                why = "מקור שהבוט לא קורא" if e.get("missing_source") else "פורסם שם לפני שהבוט ראה"
+                lines.append(f"📰 {esc(e['cat'])} · {esc(e['news_src'])} {hm(e['news_t'])}{when} · {why}")
+                if e.get("title"):
+                    lines.append(f"   {esc(e['title'][:110])}")
+                if e.get("bot_lead_min") is None:
+                    lines.append("🤖 הבוט לא התריע ❌")
+            elif e.get("news_src"):
                 lead = e.get("lead_min")
                 when = (f"{lead} דק' לפני הזינוק" if lead is not None and lead >= 0
                         else f"{-lead} דק' אחרי שהזינוק התחיל" if lead is not None else "")
@@ -2378,8 +2417,6 @@ class Radar:
                                                     "בתחילת הזינוק ✅" if bl == 0 else f"{-bl} דק' אחרי שהתחיל ⚠️"))
                 else:
                     lines.append(f"🤖 הבוט לא התריע ❌ (ציון לפי הכללים: {e.get('rule_score')})")
-            elif e.get("press"):
-                lines.append(f"📰 {esc(e['cat'])} · ממקור שהבוט לא קורא: {esc(e['title'][:110])}")
             else:
                 lines.append("⚪ " + NO_NEWS + " (מומנטום / פמפום / תנועת סקטור)")
         lines.append("\n/learn לסיכום מה למדתי עד עכשיו")
