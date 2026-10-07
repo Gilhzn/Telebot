@@ -50,6 +50,7 @@ jobs:
             feeds) python tools/probe_feeds.py "$@" ;;
             guru) python tools/guru_probe.py "$@" ;;
             gprobe) python tools/gainers_probe.py ;;
+            uaprobe) python tools/ua_probe.py ;;
             gainers) python tools/gainers.py "$@" ;;
             *) python tools/backtest.py "$MODE" "$@" ;;
           esac
