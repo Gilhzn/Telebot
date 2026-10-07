@@ -277,9 +277,27 @@ class RulesTest(unittest.TestCase):
         self.assertEqual(bot.rule_score("NVIDIA announces strategic partnership", "NVIDIA Corp").score, 2)
 
     def test_amount_bonus(self) -> None:
-        self.assertEqual(bot.rule_score("Receives purchase order worth $120M").score, 3)
-        self.assertEqual(bot.rule_score("Receives purchase order worth $12M").score, 2)
-        self.assertEqual(bot.rule_score("Receives purchase order worth $1.5 billion").score, 3)
+        # receiving orders scores 3 since the gainers study (it moves small caps); +1 at $100M+
+        self.assertEqual(bot.rule_score("Receives purchase order worth $120M").score, 4)
+        self.assertEqual(bot.rule_score("Receives purchase order worth $12M").score, 3)
+        self.assertEqual(bot.rule_score("Receives purchase order worth $1.5 billion").score, 4)
+        self.assertEqual(bot.rule_score("Purchase orders remain strong").score, 2)
+
+    def test_rules_learned_from_gainers(self) -> None:
+        def score(title: str, company: str = "") -> int:
+            return bot.rule_score(title, company, title=title).score
+        self.assertEqual(score("Volato Subsidiary Signs $1.2 Billion in AI Infrastructure Orders"), 4)
+        self.assertEqual(score("Kandi Secures Follow-On Order for CATL Batteries"), 3)
+        self.assertEqual(score("Nexalin Signs Definitive Exclusive Distribution and Local Manufacturing Agreement"), 3)
+        self.assertEqual(score("HeartBeam Receives FDA Breakthrough Device Designation"), 4)
+        self.assertEqual(score("Acme Receives FDA 510(k) Clearance for Its Pump"), 4)
+        self.assertEqual(score("C.H. Robinson to Acquire RXO, Redefining Logistics", "RXO, Inc."), 5)
+        self.assertEqual(score("C.H. Robinson to Acquire RXO, Redefining Logistics", "C.H. Robinson Worldwide"), 0)
+        self.assertEqual(score("TGE's profit surged by 9.9 times"), 3)
+        self.assertEqual(score("BIO-key Partners with Al Majlis Group"), 2)
+        self.assertEqual(score("Acme Announces Strategic Partnership with Beta"), 2)   # counted once
+        self.assertEqual(score("Aethlon Medical & North Immunology Announce Merger to Advance IL-13"), 3)
+        self.assertEqual(score("Sono Group and Sports One Sign Letter of Intent to Combine"), 3)
 
     def test_claude_json_parsing(self) -> None:
         self.assertEqual(bot.parse_claude_json('```json\n{"score": 7, "ticker": "X", "reason_he": "א"}\n```'),
@@ -1495,6 +1513,30 @@ class GainersStudyTest(unittest.TestCase):
                     await radar.check_gainers_study()
             self.assertEqual(w.sent, [])
             self.assertFalse(any("api.nasdaq.com" in str(r.url) for r in w.requests))
+
+        run(scenario())
+
+    def test_cheap_stock_boost(self) -> None:
+        async def scenario() -> None:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = base_world()
+            w.routes["https://query1.finance.yahoo.com/v8/finance/chart/OKLO?*"] = (
+                200, {"chart": {"result": [{"meta": {"regularMarketPrice": 1.85}}]}})
+            w.routes["https://query1.finance.yahoo.com/v8/finance/chart/TEVA?*"] = (
+                200, {"chart": {"result": [{"meta": {"regularMarketPrice": 25.0}}]}})
+            async with w.client() as client:
+                radar = bot.Radar(make_cfg(Path(tmp.name)), client)
+                cheap = bot.Candidate(source="wire", source_label="GlobeNewswire", ticker="OKLO", company="Oklo",
+                                      title="Oklo Secures Follow-On Order From Utility", link="https://x/1",
+                                      published_ts=None, watch=False, summary="Oklo secures order.")
+                rich = bot.Candidate(**{**cheap.__dict__, "ticker": "TEVA", "company": "Teva", "link": "https://x/2"})
+                s1, r1, _, _ = await radar.evaluate(cheap)
+                s2, _, _, _ = await radar.evaluate(rich)
+                await radar.evaluate(cheap)                                # price cached
+            self.assertEqual((s1, s2), (4, 3))
+            self.assertIn("מניה זולה ($1.85)", r1)
+            self.assertEqual(sum(1 for r in w.requests if "/chart/OKLO" in str(r.url)), 1)
 
         run(scenario())
 

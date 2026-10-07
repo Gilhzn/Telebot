@@ -98,6 +98,7 @@ ALERT_LOG_MAX = 5_000
 PERF_REPORT_AT = (20, 10)        # New York time: daily performance report after the evening session
 CATEGORY_FEED_EVERY = 6          # continuous mode: category wire feeds every 6th wire poll
 AI_TEXT_CHARS = 6_000
+SMALL_CAP_PRICE = 5.0            # learned: two thirds of the 20%+ gainers trade under $5
 LEAD_CHARS = 2_500               # rules score the headline + lead only
 NEGATIVE_CHARS = 4_000           # negative filter window
 ALERT_AGE_LIMIT = 3600           # the ⏱ line is shown only for items younger than 1h
@@ -210,7 +211,25 @@ POSITIVE_RULES: list[tuple[int, str, re.Pattern[str]]] = [
     (3, "זכייה בחוזה", re.compile(r"\bcontract awards?\b", I)),
     (3, "השקעה אסטרטגית", re.compile(r"\bstrategic investment\b", I)),
     (3, "הכנסות שיא", re.compile(r"\brecord (?:quarterly |annual |full[- ]year )?revenues?\b", I)),
-    (3, "Breakthrough Therapy", re.compile(r"\bbreakthrough therapy\b", I)),
+    (4, "Breakthrough Designation מה-FDA", re.compile(r"\bbreakthrough (?:therapy|device)(?: designation)?\b", I)),
+    (4, "אישור FDA (clearance)", re.compile(
+        r"\b(?:receives?|received|granted|obtains?|secures?)\b[^.\n]{0,30}\bFDA\b[^.\n]{0,25}\bclearance\b|"
+        r"\bFDA (?:510\(k\) )?clearance\b", I)),
+    # Learned from the gainers study: phrases behind small-cap jumps the bot used to score 0
+    (3, "הזמנות / הזמנה חוזרת", re.compile(
+        r"\b(?:secures?|secured|receives?|received|wins?|won|signs?|signed|books?|booked|lands?)\b"
+        r"(?:[^.\n]|\.\d){0,45}\borders?\b|\brecord orders\b", I)),
+    (3, "הסכם הפצה / רישוי בלעדי", re.compile(
+        r"\bdefinitive (?:exclusive )?(?:distribution|license|licensing|supply|manufacturing|commercial)\b[^.\n]{0,40}"
+        r"\bagreement\b|\bexclusive (?:distribution|license|licensing|supply) agreement\b", I)),
+    (3, "זינוק ברווח / בהכנסות", re.compile(
+        r"\b(?:profit|revenue|net income|earnings|sales)s?\b[^.\n]{0,15}\b(?:surged?|soared|jumped|grew|rose|increased)"
+        r"\b[^.\n]{0,12}(?:\d+(?:\.\d+)? ?(?:times|x)\b|\d{3,}%)", I)),
+    (3, "מיזוג", re.compile(
+        r"\b(?:announce[sd]? (?:a |their |its )?(?:proposed |potential )?merger|merger agreement|agree(?:s|d)? to merge|"
+        r"business combination|letter of intent to (?:combine|merge))\b", I)),
+    (2, "שותפות", re.compile(r"\b(?:partners? with|partnership with|collaboration with|teams? up with)\b", I)),
+    (2, "הסכם פריסה אצל לקוח", re.compile(r"\b(?:agreement for (?:the )?(?:phased )?deployment|deployment agreement)\b", I)),
     (2, "נבחרה על ידי לקוח", re.compile(r"\bselected by\b", I)),
     (2, "הזמנת רכש", re.compile(r"\bpurchase orders?\b", I)),
     (2, "הסכם רב-שנתי", re.compile(r"\bmulti-?year (?:agreement|contract|deal|supply agreement)\b", I)),
@@ -222,6 +241,10 @@ POSITIVE_RULES: list[tuple[int, str, re.Pattern[str]]] = [
         r"Space Force|Marine Corps|DARPA|Pentagon|Missile Defense Agency)\b)|\bDoD\b")),
     (1, "NASA", re.compile(r"\bNASA\b")),
 ]
+
+# Overlapping phrases count once, at the higher score.
+RULE_GROUPS = {"הזמנת רכש": "orders", "הזמנות / הזמנה חוזרת": "orders",
+               "שותפות אסטרטגית": "partner", "שותפות": "partner"}
 
 MEGA_COMPANIES = [
     "NVIDIA", "Nvidia", "Microsoft", "Amazon", "AWS", "Google", "Alphabet", "Apple",
@@ -516,11 +539,23 @@ def rule_score(text: str, company: str = "", strong_text: str | None = None,
         strong_text = text
     if title and PERSONNEL_TITLE_RE.search(title):
         strong_text = title
+    grouped: dict[str, int] = {}
     for points, label, pattern in POSITIVE_RULES:
         if pattern.search(strong_text if points >= 4 else text):
+            group = RULE_GROUPS.get(label)
+            if group:
+                if points <= grouped.get(group, 0):
+                    continue
+                score -= grouped.get(group, 0)
+                grouped[group] = points
             score += points
             if label not in labels:
                 labels.append(label)
+    target = re.search(r"\bto acquire\b(.{0,60})", strong_text, I)
+    name_key = normalize_company(company).split(" ")[0] if company else ""
+    if target and len(name_key) >= 3 and re.search(rf"\b{re.escape(name_key)}\b", target.group(1), I):
+        score += 5
+        labels.append("החברה נרכשת")
     if score > 0:
         company_l = company.lower()
         for m in MEGA_RE.finditer(text):
@@ -923,7 +958,8 @@ GAINERS_TOP = 15
 MOVE_START_PCT = 0.10             # the move starts at the first minute 10% above the previous close
 NEWS_LOG_HOURS = 72
 GAINERS_LOG_MAX = 4_000
-LEARNING_READY_DAYS = 10          # trading days of data before the "ready" summary
+LEARNING_READY_DAYS = 10
+SPLIT_ARTIFACT_PCT = 15.0         # a "gain" whose 1-minute bars never rose 15% is a reverse split, not a move          # trading days of data before the "ready" summary
 
 CATALYSTS: list[tuple[str, re.Pattern[str]]] = [
     ("FDA / רגולציה", re.compile(r"\b(?:FDA|EMA|clearance|cleared|breakthrough (?:therapy|device)|fast track|"
@@ -1767,6 +1803,7 @@ class Radar:
         self.stats = {"checked": 0, "candidates": 0, "ai_calls": 0, "ai_errors": 0, "alerts": 0}
         self.stop_event = asyncio.Event()
         self.pending_status = False
+        self.prices: dict[str, tuple[float, float]] = {}
         # --once handles ~5 minutes of news per pass, so it gets a larger per-source cap.
         self.max_per_cycle = cfg.max_per_cycle * (4 if once else 1)  # --once: answer /status after polling, with fresh data
 
@@ -2054,6 +2091,11 @@ class Radar:
         if rules.score < 4:  # a strong item is the result itself, not an announcement of one
             catalyst = find_catalyst(f"{c.title}\n{body[:LEAD_CHARS]}", us_eastern_now().date())
         score, reason = rules.score, rules.reason_he
+        if 2 <= score < self.cfg.min_score and c.ticker and not self.cfg.anthropic_key:
+            price = await self.last_price(c.ticker)
+            if price is not None and price < SMALL_CAP_PRICE:
+                score += 1
+                reason = ", ".join(x for x in (reason, f"מניה זולה (${price:.2f}): חדשות כאלה מזיזות מניות קטנות") if x)
         if self.cfg.anthropic_key and (rules.score >= 1 or c.watch):
             head = f"{c.title}\n{body}" if c.title else body
             ai = await self.claude_score(c, head)
@@ -2063,6 +2105,23 @@ class Radar:
                 if not c.ticker and ai["ticker"]:
                     c.ticker = normalize_ticker(ai["ticker"])
         return score, reason, None, catalyst
+
+    async def last_price(self, ticker: str) -> float | None:
+        """Latest price from Yahoo (cached 10 minutes); None when unavailable."""
+        cached = self.prices.get(ticker)
+        if cached and time.time() - cached[0] < 600:
+            return cached[1]
+        try:
+            now = int(time.time())
+            resp = await self.client.get(YAHOO_CHART_URL.format(symbol=ticker, p1=now - 4 * 86400, p2=now, interval=5),
+                                         headers=RESEARCH_HEADERS, timeout=4)
+            meta = ((resp.json().get("chart") or {}).get("result") or [{}])[0].get("meta") or {}
+            price = float(meta["regularMarketPrice"])
+        except Exception as exc:  # noqa: BLE001
+            log.info("Price for %s unavailable: %s", ticker, describe_error(exc))
+            return None
+        self.prices[ticker] = (time.time(), price)
+        return price
 
     async def process(self, c: Candidate) -> None:
         self.stats["candidates"] += 1
@@ -2348,6 +2407,9 @@ class Radar:
                                                             interval=1), headers=RESEARCH_HEADERS, timeout=20)
         bars = parse_yahoo_chart(resp.json()) if resp.status_code == 200 else []
         prof = move_profile([(b[0], b[2]) for b in bars], g["prev"])
+        if bars and (prof.get("peak_pct") or 0) < SPLIT_ARTIFACT_PCT:
+            log.info("Gainers study: %s +%.0f%% is not a real move (reverse split?)", sym, g["pct"])
+            return None
         start = prof.get("start")
         anchor = start or dt.datetime.combine(today, dt.time(16, 0), tzinfo=tz).timestamp()
         window = (anchor - 24 * 3600, anchor + 15 * 60)

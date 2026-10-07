@@ -140,7 +140,8 @@ async def study(days: int) -> None:
             await asyncio.gather(*(attribute(s_, by_sym[s_]) for s_ in syms[i:i + 4]))
             if i % 80 == 0:
                 log(f"attributed {i}/{len(syms)} symbols")
-    rows = [g for g in gainers if g.get("volume") is None or g["volume"] >= bot.GAINERS_MIN_VOLUME]
+    rows = [g for g in gainers if (g.get("volume") is None or g["volume"] >= bot.GAINERS_MIN_VOLUME)
+            and (g.get("peak_pct") is None or g["peak_pct"] >= bot.SPLIT_ARTIFACT_PCT)]
     (OUT / "rows.jsonl").write_text("".join(json.dumps(g, ensure_ascii=False) + "\n" for g in rows), encoding="utf-8")
     report(rows, state)
 
