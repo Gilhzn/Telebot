@@ -128,3 +128,19 @@ class PipelineTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GainersHistoryTest(unittest.TestCase):
+    def test_daily_rows_and_gainer_days(self) -> None:
+        import gainers
+        data = {"data": {"tradesTable": {"rows": [
+            {"date": "10/07/2026", "close": "$2.83", "high": "$9.59", "volume": "142,759,538"},
+            {"date": "10/06/2026", "close": "$1.25", "high": "$1.30", "volume": "1,000,000"},
+            {"date": "10/05/2026", "close": "$1.20", "high": "$1.22", "volume": "900,000"}]}}}
+        rows = gainers.daily_rows(data)
+        self.assertEqual([r[0].day for r in rows], [5, 6, 7])
+        days = gainers.find_gainer_days("SXTC", rows, dt.date(2026, 10, 1))
+        self.assertEqual(len(days), 1)
+        self.assertEqual(days[0]["date"], "2026-10-07")
+        self.assertAlmostEqual(days[0]["pct"], 126.4)
+        self.assertAlmostEqual(days[0]["high_pct"], 667.2)

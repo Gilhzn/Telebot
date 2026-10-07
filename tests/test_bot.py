@@ -1061,7 +1061,9 @@ class CatalystTest(unittest.TestCase):
     def test_catalysts_survive_restart(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             radar = self.run_teaser(base_world(), Path(d))
-            radar.state.save()
+            with mock.patch.object(bot, "us_eastern_now",
+                                   return_value=__import__("datetime").datetime(2026, 9, 23, 9, 0)):
+                radar.state.save()
             st = bot.State.load(Path(d) / "state.json", [])
         self.assertIn("KOD:2026-09-28", st.catalysts)
 
@@ -1386,6 +1388,88 @@ class GuruTest(unittest.TestCase):
                     self.assertIn("✅ Warren Buffett", radar.gurus_text())
 
         run(scenario())
+
+
+class GainersStudyTest(unittest.TestCase):
+    def test_helpers(self) -> None:
+        rows = [{"symbol": "AAA", "pctchange": "+126.4%", "lastsale": "$2.83", "volume": "142759538", "marketCap": "50000000"},
+                {"symbol": "FUSEW", "pctchange": "+300%", "lastsale": "$0.50", "volume": "9000000"},    # warrant
+                {"symbol": "ABC", "name": "ABC Corp Rights", "pctchange": "+90%", "lastsale": "$0.50", "volume": "9000000"},
+                {"symbol": "BBB", "pctchange": "+25%", "lastsale": "$0.10", "volume": "9000000"},     # too cheap
+                {"symbol": "CCC", "pctchange": "+45%", "lastsale": "$7.00", "volume": "1000000"},
+                {"symbol": "DDD", "pctchange": "+5%", "lastsale": "$7.00", "volume": "1000000"}]
+        self.assertEqual([g["ticker"] for g in bot.pick_gainers(rows)], ["AAA", "CCC"])
+        self.assertEqual(bot.classify_catalyst("Acme Receives FDA Approval for X"), "FDA / רגולציה")
+        self.assertEqual(bot.classify_catalyst("Acme Awarded $50M Army Contract"), "חוזה / הזמנה")
+        self.assertEqual(bot.classify_catalyst("Acme to Be Acquired by Big Co for $5 per Share"), "מיזוג / רכישה")
+        self.assertEqual(bot.classify_catalyst(""), bot.NO_NEWS)
+        pts = [(100.0, 1.0), (160.0, 1.05), (220.0, 1.12), (280.0, 1.5), (340.0, 1.3)]
+        prof = bot.move_profile(pts, 1.0)
+        self.assertEqual(prof["start"], 220.0)
+        self.assertAlmostEqual(prof["peak_pct"], 50.0)
+        day = __import__("datetime").date(2026, 10, 7)
+        data = {"data": {"rows": [{"created": "Oct 7, 2026", "title": "Acme Signs Deal"},
+                                  {"created": "Oct 6, 2026", "title": "Old"}]}}
+        self.assertEqual(bot.nasdaq_press_today(data, day), "Acme Signs Deal")
+
+    def test_daily_study_report_and_learning(self) -> None:
+        dtm = __import__("datetime")
+        tz = bot.eastern_tz()
+        at = lambda h, m: dtm.datetime(2026, 10, 7, h, m, tzinfo=tz).timestamp()  # noqa: E731
+        screener = {"data": {"rows": [
+            {"symbol": "OKLO", "pctchange": "+80%", "lastsale": "$9.00", "volume": "5000000", "marketCap": "200000000"},
+            {"symbol": "TEVA", "pctchange": "+30%", "lastsale": "$20.00", "volume": "9000000", "marketCap": "2e10"}]}}
+
+        def chart(prev: float, start: float) -> dict:
+            pts = [{"x": (at(4, 0) + 60 * i) * 1000, "y": prev * (1.0 if at(4, 0) + 60 * i < start else 1.5)}
+                   for i in range(900)]
+            return {"data": {"previousClose": f"${prev}", "chart": pts}}
+
+        async def scenario() -> None:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = base_world()
+            w.set(bot.NASDAQ_SCREENER_URL, screener)
+            w.set("https://api.nasdaq.com/api/quote/OKLO/chart?assetclass=stocks", chart(5.0, at(8, 5)))
+            w.set("https://api.nasdaq.com/api/quote/TEVA/chart?assetclass=stocks", chart(15.4, at(10, 30)))
+            w.routes["https://api.nasdaq.com/api/news/topic/press_release*"] = (200, {"data": {"rows": [
+                {"created": "Oct 7, 2026", "title": "Teva Announces Partnership With Big Pharma"}]}})
+            cfg = make_cfg(Path(tmp.name))
+            async with w.client() as client:
+                radar = bot.Radar(cfg, client)
+                await radar.refresh_tickers()
+                radar.state.news_log["OKLO"] = [{"t": at(8, 0) + 20, "pub": at(8, 0), "src": "PR Newswire",
+                                                 "title": "Oklo Awarded $450 Million Contract by U.S. Department of Defense"}]
+                radar.state.alert_log.append({"t": at(8, 1), "ticker": "OKLO", "score": 5, "pump": "none"})
+                with mock.patch.object(bot, "us_eastern_now", return_value=dtm.datetime(2026, 10, 7, 20, 25, tzinfo=tz)):
+                    await radar.check_gainers_study()
+                    await radar.check_gainers_study()          # once a day
+            text = "\n".join(m["text"] for m in w.sent)
+            self.assertIn("המזנקות של היום", text)
+            self.assertIn("<b>OKLO</b> +80%", text)
+            self.assertIn("הזינוק התחיל 08:05", text)
+            self.assertIn("חוזה / הזמנה · PR Newswire 08:00 (5 דק' לפני הזינוק)", text)
+            self.assertIn("הבוט התריע 4 דק' לפני הזינוק ✅", text)
+            self.assertIn("ממקור שהבוט לא קורא", text)               # TEVA: Nasdaq press, not in our feeds
+            log_ = radar.state.gainers_log
+            self.assertEqual([e["ticker"] for e in log_], ["OKLO", "TEVA"])
+            self.assertEqual(log_[1]["cat"], "שותפות / רישיון")
+            summary = bot.learning_summary(log_)
+            for part in ("מה למדתי", "עם חדשות שהבוט ראה: 1", "חוזה / הזמנה", "PR Newswire: 1 · 5 דק'",
+                         "התריע לפני תחילת הזינוק: 1"):
+                self.assertIn(part, summary)
+            self.assertEqual(len(w.sent), 1)
+
+        run(scenario())
+
+    def test_news_log_is_pruned_and_deduplicated(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            st = bot.State(Path(d) / "s.json")
+            st.log_news("AAA", "PR Newswire", "Acme wins big contract", 1.0)
+            st.log_news("AAA", "PR Newswire · technology", "Acme wins big contract", 1.0)
+            self.assertEqual(len(st.news_log["AAA"]), 1)
+            st.news_log["OLD"] = [{"t": 0, "pub": 0, "src": "x", "title": "old"}]
+            self.assertNotIn("OLD", st.pruned_news_log())
 
 
 class StateTest(unittest.TestCase):
