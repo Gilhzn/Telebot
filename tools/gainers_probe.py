@@ -13,12 +13,14 @@ import bot  # noqa: E402
 BROWSER = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
                          "Chrome/124.0 Safari/537.36"}
 URLS = [
-    ("screener", "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_gainers&count=25"),
-    ("screener2", "https://query2.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_gainers&count=25&formatted=false"),
-    ("rss_headline", "https://feeds.finance.yahoo.com/rss/2.0/headline?s=NVTS&region=US&lang=en-US"),
-    ("gainers_page", "https://finance.yahoo.com/markets/stocks/gainers/"),
-    ("search_news", "https://query1.finance.yahoo.com/v1/finance/search?q=NVTS&newsCount=20&quotesCount=0"),
-    ("nasdaq_movers", "https://api.nasdaq.com/api/marketmovers?assetclass=stocks&exchange=nasdaq"),
+    ("nq_screener", "https://api.nasdaq.com/api/screener/stocks?tableonly=true&limit=25&offset=0&download=true"),
+    ("nq_movers", "https://api.nasdaq.com/api/marketmovers?assetclass=stocks&exchange=nasdaq"),
+    ("nq_news", "https://api.nasdaq.com/api/news/topic/articlebysymbol?q=SXTC|stocks&offset=0&limit=10&fallback=true"),
+    ("nq_press", "https://api.nasdaq.com/api/news/topic/press_release?q=symbol:SXTC|assetclass:stocks&limit=10&offset=0"),
+    ("nq_chart", "https://api.nasdaq.com/api/quote/SXTC/chart?assetclass=stocks"),
+    ("nq_extended", "https://api.nasdaq.com/api/quote/SXTC/extended-trading?assetclass=stocks&markettype=pre"),
+    ("yahoo_chart", "https://query1.finance.yahoo.com/v8/finance/chart/SXTC?interval=1m&range=1d&includePrePost=true"),
+    ("yahoo_chart2", "https://query2.finance.yahoo.com/v8/finance/chart/SXTC?interval=2m&range=5d&includePrePost=true"),
 ]
 
 
@@ -35,7 +37,7 @@ def main() -> None:
                     print("symbols:", len(flat), flat[:40])
                     print(re.sub(r"\s+", " ", bot.html_to_text(body))[:1500])
                 else:
-                    print(re.sub(r"\s+", " ", body[:1800]))
+                    print(re.sub(r"\s+", " ", body[:2500]))
             except Exception as exc:  # noqa: BLE001
                 print(f"\n=== {name}: ERROR {bot.describe_error(exc)}")
 
