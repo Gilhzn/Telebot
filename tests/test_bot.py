@@ -1621,6 +1621,20 @@ class MomentumTest(unittest.TestCase):
 
         run(scenario())
 
+    def test_breakout_names_news_from_outside_the_bot_sources(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        radar = bot.Radar(make_cfg(Path(tmp.name)), mock.Mock())
+        now = time.time()
+        web = [{"pub": now - 1800, "src": "Business Wire",
+                "title": "bioAffinity Technologies Announces Japanese Patent Allowance"}]
+        text = radar.breakout_text("BIAF", 19, 7.33, 47e6, now - 1500, web)
+        self.assertIn("Business Wire", text)
+        self.assertIn("Japanese Patent Allowance", text)
+        old = [{"pub": now - 2 * 86400, "src": "ACCESS Newswire", "title": "The OLB Group Launches Share Buyback"}]
+        self.assertIn("לפני 2 ימים", radar.breakout_text("OLB", 44, 0.56, 51e6, now - 600, old))
+        self.assertIn("אין שום ידיעה", radar.breakout_text("JZ", 45, 0.68, 9.5e6, now - 600, []))
+
 
 class StateTest(unittest.TestCase):
     def test_seen_is_capped_and_atomic(self) -> None:

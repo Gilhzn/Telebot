@@ -2785,10 +2785,23 @@ class Radar:
         start = next((b[0] for b in bars if b[2] >= prev * (1 + MOVE_START_PCT)), bars[-1][0])
         self.state.momentum["tickers"].append(ticker)
         self.state.dirty = True
-        await self.reply(self.breakout_text(ticker, pct, price, dollars, start))
+        await self.reply(self.breakout_text(ticker, pct, price, dollars, start, await self.recent_headlines(ticker)))
         log.info("BREAKOUT %s +%.0f%% ($%.0f traded)", ticker, pct, dollars)
 
-    def breakout_text(self, ticker: str, pct: float, price: float, dollars: float, start: float) -> str:
+    async def recent_headlines(self, ticker: str) -> list[dict[str, Any]]:
+        """Yahoo's headlines about the ticker from the last 3 days, oldest first: the news the bot's own
+        sources do not carry (Reuters, Dow Jones, foreign exchanges, Business Wire categories it skips)."""
+        try:
+            resp = await self.client.get(YAHOO_NEWS_URL.format(symbol=quote(ticker), count=10),
+                                         headers=RESEARCH_HEADERS, timeout=6)
+            items = yahoo_news_items(resp.json(), ticker)
+        except Exception as exc:  # noqa: BLE001
+            log.info("Momentum: news for %s unavailable: %s", ticker, describe_error(exc))
+            return []
+        return sorted((n for n in items if time.time() - n["pub"] <= 72 * 3600 and n["title"]), key=lambda n: n["pub"])
+
+    def breakout_text(self, ticker: str, pct: float, price: float, dollars: float, start: float,
+                      web_news: list[dict[str, Any]] | None = None) -> str:
         tz = eastern_tz()
         hm = lambda t: dt.datetime.fromtimestamp(t, tz).strftime("%H:%M")  # noqa: E731
         found = self.tickers.lookup(ticker)
@@ -2804,10 +2817,18 @@ class Radar:
             lines.append(f"📰 {esc(n['src'])} {hm(n.get('pub') or n['t'])} · {esc(classify_catalyst(n['title']))} "
                          f"(ציון {score}):")
             lines.append(f"   {esc(n['title'][:120])}")
+        elif web_news:
+            n = web_news[-1]
+            age = time.time() - n["pub"]
+            when = hm(n["pub"]) if age < 20 * 3600 else f"לפני {age / 86400:.0f} ימים: המשך של תנועה קודמת"
+            lines.append(f"📰 {esc(n['src'] or 'Yahoo')} {when} · {esc(classify_catalyst(n['title']))}:")
+            lines.append(f"   {esc(n['title'][:120])}")
+            if news:
+                lines.append(f"   + דיווח ל-SEC: {esc(news[-1]['title'])}")
         elif news:
             lines.append(f"📰 דיווח ל-SEC: {esc(news[-1]['title'])}")
         else:
-            lines.append("⚪ לא נמצאה ידיעה במקורות של הבוט: ייתכן פמפום, שמועה או תנועת סקטור")
+            lines.append("⚪ אין שום ידיעה ב-3 הימים האחרונים (גם לא ב-Yahoo): כנראה פמפום, שמועה או תנועת סקטור")
         lines.append(f'<a href="https://finance.yahoo.com/quote/{quote(ticker)}">גרף ב-Yahoo</a>')
         return "\n".join(lines)
 
