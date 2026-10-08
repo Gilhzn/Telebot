@@ -1550,6 +1550,76 @@ class GainersStudyTest(unittest.TestCase):
             self.assertNotIn("OLD", st.pruned_news_log())
 
 
+class MomentumTest(unittest.TestCase):
+    def test_due_tickers(self) -> None:
+        async def scenario() -> None:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = base_world()
+            async with w.client() as client:
+                radar = bot.Radar(make_cfg(Path(tmp.name)), client)
+                now = time.time()
+                radar.state.news_log = {
+                    "AAA": [{"t": now - 600, "pub": now - 600, "src": "GlobeNewswire", "title": "A"}],
+                    "BBB": [{"t": now - 600, "pub": now - 600, "src": "SEC 8-K", "title": "8-K 8.01"}],
+                    "CCC": [{"t": now - 30 * 3600, "pub": None, "src": "PR Newswire", "title": "old"}],
+                    "DDD": [{"t": now - 5 * 3600, "pub": None, "src": "Business Wire", "title": "D"}],
+                }
+                self.assertEqual(sorted(radar.momentum_due(now)), ["AAA", "DDD"])
+                radar.momentum_checked["AAA"] = now - 60          # checked a minute ago (fresh news: every 2 min)
+                radar.momentum_checked["DDD"] = now - 300         # older news: every 10 minutes
+                self.assertEqual(radar.momentum_due(now), [])
+                radar.state.momentum["tickers"] = ["AAA"]
+                self.assertEqual(radar.momentum_due(now + 1000), ["DDD"])
+
+        run(scenario())
+
+    def test_breakout_alert_once_with_the_news(self) -> None:
+        dtm = __import__("datetime")
+        tz = bot.eastern_tz()
+        day = dtm.datetime.now(tz).date()
+        while day.weekday() >= 5:
+            day -= dtm.timedelta(days=1)
+
+        def chart(prev: float, last: float, vol: int) -> dict:
+            t0 = int(time.time()) - 3600
+            ts = [t0 + 60 * i for i in range(30)]
+            px = [prev * 1.02] * 10 + [last] * 20
+            return {"chart": {"result": [{"meta": {"chartPreviousClose": prev}, "timestamp": ts, "indicators": {
+                "quote": [{"open": px, "high": px, "low": px, "close": px, "volume": [vol] * 30}]}}]}}
+
+        async def scenario() -> None:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = base_world()
+            w.routes["https://query1.finance.yahoo.com/v8/finance/chart/OKLO?*"] = (200, chart(5.0, 6.2, 20_000))
+            w.routes["https://query1.finance.yahoo.com/v8/finance/chart/TEVA?*"] = (200, chart(20.0, 21.0, 90_000))
+            async with w.client() as client:
+                radar = bot.Radar(make_cfg(Path(tmp.name)), client)
+                await radar.refresh_tickers()
+                now = time.time()
+                radar.state.news_log = {
+                    "OKLO": [{"t": now - 900, "pub": now - 900, "src": "PR Newswire",
+                              "title": "Oklo Secures Follow-On Order From Utility"}],
+                    "TEVA": [{"t": now - 900, "pub": now - 900, "src": "GlobeNewswire", "title": "Teva update"}]}
+                et = dtm.datetime.combine(day, dtm.time(8, 20), tzinfo=tz)
+                with mock.patch.object(bot, "us_eastern_now", return_value=et), \
+                        mock.patch.object(bot.asyncio, "sleep", new=mock.AsyncMock()):
+                    await radar.check_momentum()
+                    radar.momentum_checked.clear()
+                    await radar.check_momentum()              # once per ticker per day
+            texts = [m["text"] for m in w.sent]
+            self.assertEqual(len(texts), 1, texts)
+            self.assertIn("זינוק בתהליך", texts[0])
+            self.assertIn("<b>OKLO</b>", texts[0])
+            self.assertIn("+24%", texts[0])
+            self.assertIn("Oklo Secures Follow-On Order", texts[0])
+            self.assertIn("חוזה / הזמנה", texts[0])
+            self.assertEqual(radar.state.momentum["tickers"], ["OKLO"])
+
+        run(scenario())
+
+
 class StateTest(unittest.TestCase):
     def test_seen_is_capped_and_atomic(self) -> None:
         with tempfile.TemporaryDirectory() as d:

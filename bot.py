@@ -959,7 +959,12 @@ MOVE_START_PCT = 0.10             # the move starts at the first minute 10% abov
 NEWS_LOG_HOURS = 72
 GAINERS_LOG_MAX = 4_000
 LEARNING_READY_DAYS = 10
-SPLIT_ARTIFACT_PCT = 15.0         # a "gain" whose 1-minute bars never rose 15% is a reverse split, not a move          # trading days of data before the "ready" summary
+SPLIT_ARTIFACT_PCT = 15.0
+MOMENTUM_PCT = 15.0               # "breakout in progress": up 15%+ on the previous close
+MOMENTUM_DOLLAR_VOLUME = 200_000  # with at least $200K traded today (no illiquid ticks)
+MOMENTUM_NEWS_HOURS = 18          # watch tickers that had wire news in the last 18 hours
+MOMENTUM_SCAN_SECONDS = 600       # full-market scan (regular session only: Yahoo spark has no pre-market)
+MOMENTUM_MAX_CHECKS = 80          # chart requests per minute, at most         # a "gain" whose 1-minute bars never rose 15% is a reverse split, not a move          # trading days of data before the "ready" summary
 
 CATALYSTS: list[tuple[str, re.Pattern[str]]] = [
     ("FDA / רגולציה", re.compile(r"\b(?:FDA|EMA|clearance|cleared|breakthrough (?:therapy|device)|fast track|"
@@ -1549,6 +1554,7 @@ class State:
         self.gainers_day = ""
         self.learning_ready_sent = False
         self.news_log_since = 0.0                        # when news logging started (first full day only)
+        self.momentum: dict[str, Any] = {"date": "", "tickers": []}  # breakout alerts sent today
         self.guru_checked = 0.0
         self.cusip_tickers: dict[str, str] = {}          # CUSIP -> ticker ("" = none found)
         self.alert_log: list[dict[str, Any]] = []       # every alert sent, for the performance report
@@ -1581,6 +1587,7 @@ class State:
         st.gainers_day = data.get("gainers_day", "")
         st.learning_ready_sent = bool(data.get("learning_ready_sent", False))
         st.news_log_since = float(data.get("news_log_since", 0.0))
+        st.momentum = data.get("momentum", {"date": "", "tickers": []})
         st.guru_checked = float(data.get("guru_checked", 0.0))
         st.cusip_tickers = data.get("cusip_tickers", {})
         st.alert_log = data.get("alert_log", [])
@@ -1635,6 +1642,7 @@ class State:
             "gainers_day": self.gainers_day,
             "learning_ready_sent": self.learning_ready_sent,
             "news_log_since": self.news_log_since,
+            "momentum": self.momentum,
             "guru_checked": self.guru_checked,
             "cusip_tickers": self.cusip_tickers,
             "alert_log": self.alert_log[-ALERT_LOG_MAX:],
@@ -1804,6 +1812,8 @@ class Radar:
         self.stop_event = asyncio.Event()
         self.pending_status = False
         self.prices: dict[str, tuple[float, float]] = {}
+        self.momentum_checked: dict[str, float] = {}
+        self.momentum_scan_at = 0.0
         # --once handles ~5 minutes of news per pass, so it gets a larger per-source cap.
         self.max_per_cycle = cfg.max_per_cycle * (4 if once else 1)  # --once: answer /status after polling, with fresh data
 
@@ -2377,7 +2387,7 @@ class Radar:
                 "הלמידה ממשיכה בכל יום, וההתראות מתעדכנות לפי מה שנמדד.\n\n"
                 + learning_summary(self.state.gainers_log))
 
-    async def todays_movers(self, today: dt.date) -> list[dict[str, Any]]:
+    async def todays_movers(self, today: dt.date, min_pct: float = GAINERS_MIN_PCT) -> list[dict[str, Any]]:
         """Every listed common share's change today (Yahoo spark, 20 symbols per request)."""
         universe = research_universe(self.tickers) if self.tickers.loaded else []
         moves: dict[str, tuple[float, float, float]] = {}
@@ -2397,7 +2407,7 @@ class Radar:
                  sum(1 for m in moves.values() if m[0] >= GAINERS_MIN_PCT), GAINERS_MIN_PCT)
         return sorted(({"ticker": t, "pct": pct, "price": close, "prev": prev}
                        for t, (pct, close, prev) in moves.items()
-                       if pct >= GAINERS_MIN_PCT and close >= GAINERS_MIN_PRICE), key=lambda g: -g["pct"])
+                       if pct >= min_pct and close >= GAINERS_MIN_PRICE), key=lambda g: -g["pct"])
 
     async def study_gainer(self, g: dict[str, Any], today: dt.date) -> dict[str, Any] | None:
         sym = g["ticker"]
@@ -2495,6 +2505,100 @@ class Radar:
         if chunk:
             await self.reply("\n".join(chunk))
 
+    # ----- breakout in progress (momentum) ---------------------------------
+
+    async def momentum_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                await self.check_momentum()
+            except Exception:  # noqa: BLE001
+                log.exception("Momentum check failed")
+            await self._sleep(60)
+
+    def momentum_due(self, now: float) -> list[str]:
+        """Tickers with wire news in the last hours, checked every 2 minutes for 3 hours after the news,
+        then every 10 minutes."""
+        due = []
+        for ticker, items in self.state.news_log.items():
+            wires = [i for i in items if not i["src"].startswith("SEC") and now - i["t"] <= MOMENTUM_NEWS_HOURS * 3600]
+            if not wires or ticker in self.state.momentum.get("tickers", []):
+                continue
+            age = now - max(i["t"] for i in wires)
+            interval = 120 if age < 3 * 3600 else 600
+            if now - self.momentum_checked.get(ticker, 0) >= interval:
+                due.append(ticker)
+        return due
+
+    async def check_momentum(self) -> None:
+        et = us_eastern_now()
+        if et.weekday() >= 5 or not (4 <= et.hour < 20) or not self.chat_id:
+            return
+        if self.state.momentum.get("date") != et.date().isoformat():
+            self.state.momentum = {"date": et.date().isoformat(), "tickers": []}
+        now = time.time()
+        due = self.momentum_due(now)[:MOMENTUM_MAX_CHECKS]
+        if session_of(now) == "regular" and now - self.momentum_scan_at >= MOMENTUM_SCAN_SECONDS:
+            self.momentum_scan_at = now
+            movers = await self.todays_movers(et.date(), min_pct=MOMENTUM_PCT)
+            due += [m["ticker"] for m in movers if m["ticker"] not in due
+                    and m["ticker"] not in self.state.momentum["tickers"]][:30]
+        for ticker in due:
+            self.momentum_checked[ticker] = now
+            await self.check_breakout(ticker, et.date())
+            await asyncio.sleep(0.3)
+
+    async def check_breakout(self, ticker: str, today: dt.date) -> None:
+        day0 = dt.datetime.combine(today, dt.time(4, 0), tzinfo=eastern_tz()).timestamp()
+        try:
+            resp = await self.client.get(YAHOO_CHART_URL.format(symbol=ticker, p1=int(day0), p2=int(time.time()),
+                                                                interval=1), headers=RESEARCH_HEADERS, timeout=10)
+            if resp.status_code == 429:
+                log.warning("Yahoo rate limit during the momentum scan")
+                await asyncio.sleep(30)
+                return
+            data = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            log.info("Momentum: chart for %s unavailable: %s", ticker, describe_error(exc))
+            return
+        bars = parse_yahoo_chart(data)
+        meta = ((data.get("chart") or {}).get("result") or [{}])[0].get("meta") or {}
+        prev = meta.get("chartPreviousClose") or meta.get("previousClose")
+        if not bars or not prev:
+            return
+        price = bars[-1][4]
+        pct = (price / prev - 1) * 100
+        dollars = sum(b[4] * b[5] for b in bars)
+        if pct < MOMENTUM_PCT or dollars < MOMENTUM_DOLLAR_VOLUME or ticker in self.state.momentum["tickers"]:
+            return
+        start = next((b[0] for b in bars if b[2] >= prev * (1 + MOVE_START_PCT)), bars[-1][0])
+        self.state.momentum["tickers"].append(ticker)
+        self.state.dirty = True
+        await self.reply(self.breakout_text(ticker, pct, price, dollars, start))
+        log.info("BREAKOUT %s +%.0f%% ($%.0f traded)", ticker, pct, dollars)
+
+    def breakout_text(self, ticker: str, pct: float, price: float, dollars: float, start: float) -> str:
+        tz = eastern_tz()
+        hm = lambda t: dt.datetime.fromtimestamp(t, tz).strftime("%H:%M")  # noqa: E731
+        found = self.tickers.lookup(ticker)
+        head = f"<b>{esc(ticker)}</b>" + (f" | {esc(found[1])}" if found else "")
+        lines = ["🚀 <b>זינוק בתהליך</b> (המניה כבר עולה, זו לא תחזית)", head,
+                 f"{pct:+.0f}% · ${price:.2f} · מחזור ${dollars / 1e6:.1f}M · עלתה מעל 10% ב-{hm(start)} (שעון ניו יורק)"]
+        news = sorted((n for n in self.state.news_log.get(ticker, []) if time.time() - n["t"] <= 24 * 3600),
+                      key=lambda n: n.get("pub") or n["t"])
+        wires = [n for n in news if not n["src"].startswith("SEC")]
+        if wires:
+            n = wires[-1]
+            score = rule_score(n["title"], found[1] if found else "", title=n["title"]).score
+            lines.append(f"📰 {esc(n['src'])} {hm(n.get('pub') or n['t'])} · {esc(classify_catalyst(n['title']))} "
+                         f"(ציון {score}):")
+            lines.append(f"   {esc(n['title'][:120])}")
+        elif news:
+            lines.append(f"📰 דיווח ל-SEC: {esc(news[-1]['title'])}")
+        else:
+            lines.append("⚪ לא נמצאה ידיעה במקורות של הבוט: ייתכן פמפום, שמועה או תנועת סקטור")
+        lines.append(f'<a href="https://finance.yahoo.com/quote/{quote(ticker)}">גרף ב-Yahoo</a>')
+        return "\n".join(lines)
+
     # ----- performance report ----------------------------------------------
 
     async def check_performance_report(self) -> None:
@@ -2582,6 +2686,7 @@ class Radar:
             "/perf — מה היה קורה אם היית קונה 3 דקות אחרי כל התראה\n"
             "/gurus — משקיעי-העל שבמעקב (קניות ומכירות מדיווחי 13F)\n"
             "/learn — מה למדתי על המניות שמזנקות (סוג חדשות, מקור, תזמון)\n"
+            "🚀 התראת \"זינוק בתהליך\" נשלחת אוטומטית כשמניה עולה 15%+ עם מחזור אמיתי\n"
             "/status — מצב המקורות והמונים\n"
             "/test — התראת דוגמה\n"
             "/help — ההודעה הזו\n\n"
@@ -2823,7 +2928,7 @@ class Radar:
         else:
             log.warning("TELEGRAM_CHAT_ID is empty — open the bot in Telegram and press Start")
         loops = [self.edgar_loop(), self.wire_loop(), self.command_loop(),
-                 self.ticker_refresh_loop(), self.save_loop(), self.catalyst_loop()]
+                 self.ticker_refresh_loop(), self.save_loop(), self.catalyst_loop(), self.momentum_loop()]
         tasks = [asyncio.create_task(c) for c in loops]
         try:
             await self.stop_event.wait()
