@@ -25,5 +25,6 @@ jobs:
           set -- $(awk 'NF {print; exit}' .github/probe-request)
           case "${1:-}" in
             race) python tools/source_race.py "${2:-1200}" ;;   # every channel, halts included
+            html) python tools/html_probe.py ;;                  # newsroom page structure
             *) python tools/latency_probe.py 200 ;;
           esac
