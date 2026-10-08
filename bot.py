@@ -321,6 +321,7 @@ class Config:
     catalyst_alerts: bool = True
     pump_check: bool = True
     guru_alerts: bool = True
+    jump_model: bool = True
     gurus: list[tuple[int, str, str]] = field(default_factory=lambda: list(DEFAULT_GURUS))
     edgar_forms: list[str] = field(default_factory=lambda: ["8-K", "6-K"])
     edgar_poll: float = 2.0
@@ -348,6 +349,7 @@ class Config:
             catalyst_alerts=_env_bool("CATALYST_ALERTS", True),
             pump_check=_env_bool("PUMP_CHECK", True),
             guru_alerts=_env_bool("GURU_ALERTS", True),
+            jump_model=_env_bool("JUMP_MODEL", True),
             gurus=parse_gurus(_env("GURUS")) or list(DEFAULT_GURUS),
             edgar_forms=[f.upper() for f in _split(_env("EDGAR_FORMS", "8-K,6-K"))],
             edgar_poll=max(1.0, _env_float("EDGAR_POLL_SECONDS", 2.0)),
@@ -1114,6 +1116,138 @@ def learning_summary(log_entries: list[dict[str, Any]]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Jump model: how often news like this made the stock jump 20%+ in the past year.
+# Learned by tools/catalysts.py from every 8-K/6-K press release and its price reaction;
+# the features here are shared by the study and the live bot so both see the same thing.
+# ---------------------------------------------------------------------------
+
+JUMP_MODEL_FILE = Path(__file__).resolve().parent / "data" / "jump_model.json"
+SEC_SHARES_URL = "https://data.sec.gov/api/xbrl/companyconcept/CIK{cik:010d}/dei/EntityCommonStockSharesOutstanding.json"
+YAHOO_DAILY_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=10d&interval=1d"
+_MONTH_NAMES_RE = (r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|June?|July?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|"
+           r"Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)")
+_DATE_RE = re.compile(r"\b" + _MONTH_NAMES_RE + r"\.?,?\s\d{1,2},?\s\d{4}|\((?:GLOBE NEWSWIRE|BUSINESS WIRE)\)|/PRNewswire|"
+                      r"ACCESS Newswire|ACCESSWIRE|Newsfile Corp")
+_CITY_RE = re.compile(r"(?:\s[A-Z][A-Z.'\-]+){1,3},?(?:\s[A-Z]{2,}[.,]?)*[\s,/–\-]*$|"
+                      r"\s(?:(?:New|San|Los|Las|Fort|Salt|Palo|Santa|St\.|Saint|West|East|North|South|Boca|Kansas|"
+                      r"Grand|Redwood|Menlo|Long|Woodland|Jersey|Oklahoma|Rancho|Newport|Bala)\s)?[A-Z][A-Za-z.'\-]+,"
+                      r"\s(?:[A-Z]{2}|[A-Z][a-z]+\.?)[,:\s/–\-]*$|[\s,/–\-(]+$")
+_PREFIX_RE = re.compile(r"^(?:EX-\d+[.\d]*\s+\d+\s+\S+\s+)?(?:EX-\d+[.\d]*\s+)?(?:Exhibit\s+\d+[.\d]*\s*)?"
+                        r"(?:Press Release\s+|News Release\s+|For Immediate Release\s+)*", re.I)
+_NOISE_RE = re.compile(r"\b(?:20\d\d|" + _MONTH_NAMES_RE.lower() + r"|exhibit|ex-\d\S*|htm|99|com|www|form|item|"
+                       r"release|nasdaq|nyse)\b")
+_STOP = set("the a an of and to for in on with by its at as from inc corp ltd llc co company announces announce "
+            "announced reports report reported our has have will be is are that this".split())
+
+
+def release_headline(lead: str) -> str:
+    """The press release headline from the start of an exhibit ('' for a filing's own text)."""
+    s = _PREFIX_RE.sub("", " ".join(lead.split()))
+    if s.startswith(("Item ", "6-K ", "8-K ", "false ", "UNITED STATES")) or "Washington, D.C." in s[:200] \
+            or re.match(r"\d{10} ", s):
+        return ""
+    m = _DATE_RE.search(s)
+    if m:
+        s = s[:m.start()]
+    return _CITY_RE.sub("", s).strip()[:200]
+
+
+def sector_of(sic: int | None) -> str:
+    if not sic:
+        return "לא ידוע"
+    for lo, hi, name in ((2830, 2836, "ביוטק / פארמה"), (3840, 3851, "מכשור רפואי"), (8000, 8099, "שירותי בריאות"),
+                         (7370, 7379, "תוכנה / IT"), (3570, 3579, "חומרה / שבבים"), (3670, 3679, "חומרה / שבבים"),
+                         (3600, 3699, "אלקטרוניקה"), (3720, 3729, "תעופה / ביטחון"), (3760, 3769, "תעופה / ביטחון"),
+                         (3710, 3716, "רכב"), (1300, 1399, "נפט וגז"), (1000, 1499, "כרייה"), (4900, 4999, "אנרגיה / תשתיות"),
+                         (6770, 6770, "SPAC"), (6000, 6799, "פיננסים"), (4000, 4899, "תחבורה / תקשורת"),
+                         (5000, 5999, "מסחר"), (2000, 3999, "תעשייה"), (8700, 8799, "שירותים / מחקר")):
+        if lo <= sic <= hi:
+            return name
+    return "אחר"
+
+
+def cap_bucket(mcap: float | None) -> str:
+    if not mcap:
+        return "שווי לא ידוע"
+    return ("מתחת ל-$50M" if mcap < 50e6 else "$50M–300M" if mcap < 300e6 else "$300M–2B" if mcap < 2e9
+            else "מעל $2B")
+
+
+def price_bucket(px: float | None) -> str:
+    if not px:
+        return "מחיר לא ידוע"
+    return "מתחת ל-$1" if px < 1 else "$1–5" if px < 5 else "$5–20" if px < 20 else "מעל $20"
+
+
+def amount_bucket(text: str, mcap: float | None) -> str:
+    amounts = [_amount_usd(m.group(1), m.group(2)) for m in AMOUNT_RE.finditer(text)]
+    if not amounts or not mcap:
+        return "ללא סכום"
+    r = max(amounts) / mcap
+    return ("סכום <5% משווי החברה" if r < 0.05 else "סכום 5–25% משווי החברה" if r < 0.25
+            else "סכום 25–100% משווי החברה" if r < 1 else "סכום גדול משווי החברה")
+
+
+def headline_phrases(text: str) -> set[str]:
+    words = [w for w in re.findall(r"[a-z0-9$][a-z0-9$\-]*", text.lower()) if w not in _STOP and len(w) > 1]
+    out = set(words)
+    out |= {" ".join(words[i:i + 2]) for i in range(len(words) - 1)}
+    out |= {" ".join(words[i:i + 3]) for i in range(len(words) - 2)}
+    return {p for p in out if not re.fullmatch(r"[\d$.,\-]+", p) and not _NOISE_RE.search(p)}
+
+
+def jump_features(r: dict[str, Any], vocab: set[str]) -> list[str]:
+    """r: cat, cap, price, sector, session, pump, amount, score, pre5, headline, lead."""
+    pre5 = r.get("pre5") or 0.0
+    f = [f"cat={r['cat']}", f"cap={r['cap']}", f"price={r['price']}", f"sector={r['sector']}", f"sess={r['session']}",
+         f"pump={r['pump']}", f"amount={r['amount']}", f"score={max(-1, min(5, r['score']))}",
+         f"cat×cap={r['cat']}|{r['cap']}", f"pre5={'up' if pre5 > 0.2 else 'down' if pre5 < -0.2 else 'flat'}"]
+    f += [f"p={p}" for p in headline_phrases(r["headline"] or r["lead"][:160]) if p in vocab]
+    return f
+
+
+def jump_probability(weights: dict[str, float], feats: list[str]) -> float:
+    z = weights.get("bias", 0.0) + sum(weights.get(k, 0.0) for k in feats)
+    return 1 / (1 + 2.718281828459045 ** -max(-30.0, min(30.0, z)))
+
+
+def load_jump_model(path: Path = JUMP_MODEL_FILE) -> dict[str, Any] | None:
+    try:
+        model = json.loads(path.read_text(encoding="utf-8"))
+        model["vocab_set"] = set(model.get("vocab", []))
+        return model
+    except (OSError, ValueError):
+        return None
+
+
+@dataclass
+class JumpOdds:
+    probability: float       # chance of a 20%+ jump within two days, from the past year
+    base: float              # the same for an average press release
+    reasons: list[str]       # the features that pushed it up most, in Hebrew
+
+    @property
+    def golden(self) -> bool:
+        return self.probability >= 4 * self.base
+
+
+FEATURE_HE = {"cat": "סוג החדשות", "cap": "שווי שוק", "price": "מחיר", "sector": "סקטור", "sess": "שעת פרסום",
+              "pump": "סיכון פמפום", "amount": "גודל הסכום", "p": "בכותרת", "pre5": "מגמה בשבוע האחרון"}
+
+
+def explain_features(weights: dict[str, float], feats: list[str], top: int = 3) -> list[str]:
+    out = []
+    for k in sorted(feats, key=lambda k: -weights.get(k, 0.0))[:top]:
+        if weights.get(k, 0.0) < 0.25 or k.startswith(("score=", "cat×cap=")):
+            continue
+        name, _, value = k.partition("=")
+        value = {"pre": "טרום מסחר", "regular": "מסחר רגיל", "after": "אחרי המסחר", "closed": "שוק סגור",
+                 "up": "עלתה", "down": "ירדה", "flat": "יציבה"}.get(value, value)
+        out.append(f"{FEATURE_HE.get(name, name)}: {value}" if name != "p" else f"„{value}” בכותרת")
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Trade outcome: "what if I had bought 3 minutes after the alert?"
 # Used by the daily performance report and by tools/backtest.py.
 # ---------------------------------------------------------------------------
@@ -1749,9 +1883,11 @@ def score_tag(score: int | None) -> str:
 
 
 def format_alert(c: Candidate, score: int | None, reason: str, now: float | None = None,
-                 risk: PumpRisk | None = None) -> str:
+                 risk: PumpRisk | None = None, odds: "JumpOdds | None" = None) -> str:
     now = time.time() if now is None else now
     lines = [score_tag(score)]
+    if odds and odds.golden:
+        lines.insert(0, "🏆 ידיעת זהב: חדשות מהסוג שהקפיץ מניות בעבר")
     head = f"<b>{esc(c.ticker or '—')}</b>"
     if c.company:
         head += f" | {esc(c.company)}"
@@ -1765,6 +1901,12 @@ def format_alert(c: Candidate, score: int | None, reason: str, now: float | None
         lines.append(esc(c.title))
     if reason:
         lines.append(f"💡 {esc(reason)}")
+    if odds:
+        line = (f"🎯 סיכוי היסטורי לקפיצה של 20%+: {odds.probability * 100:.0f}% "
+                f"(פי {odds.probability / odds.base:.1f} מהודעה רגילה)" if odds.base else "")
+        if odds.reasons:
+            line += " · " + ", ".join(esc(r) for r in odds.reasons)
+        lines.append(line)
     if risk and risk.level:
         tag = "🔴 סיכון פמפום גבוה" if risk.level == "high" else "🟠 סיכון פמפום בינוני"
         lines.append(f"⚠️ {tag}: " + "; ".join(esc(r) for r in risk.reasons))
@@ -1811,7 +1953,9 @@ class Radar:
         self.stats = {"checked": 0, "candidates": 0, "ai_calls": 0, "ai_errors": 0, "alerts": 0}
         self.stop_event = asyncio.Event()
         self.pending_status = False
-        self.prices: dict[str, tuple[float, float]] = {}
+        self.prices: dict[str, tuple[float, float, float]] = {}    # ticker -> (fetched at, price, 5-day change)
+        self.sec_cache: dict[str, tuple[float, Any]] = {}
+        self.jump_model = load_jump_model() if cfg.jump_model else None
         self.momentum_checked: dict[str, float] = {}
         self.momentum_scan_at = 0.0
         # --once handles ~5 minutes of news per pass, so it gets a larger per-source cap.
@@ -2117,21 +2261,74 @@ class Radar:
         return score, reason, None, catalyst
 
     async def last_price(self, ticker: str) -> float | None:
-        """Latest price from Yahoo (cached 10 minutes); None when unavailable."""
+        quote_ = await self.daily_quote(ticker)
+        return quote_[0] if quote_ else None
+
+    async def daily_quote(self, ticker: str) -> tuple[float, float] | None:
+        """(latest price, change over the 5 sessions before today) from Yahoo, cached 10 minutes."""
         cached = self.prices.get(ticker)
         if cached and time.time() - cached[0] < 600:
-            return cached[1]
+            return cached[1], cached[2]
         try:
-            now = int(time.time())
-            resp = await self.client.get(YAHOO_CHART_URL.format(symbol=ticker, p1=now - 4 * 86400, p2=now, interval=5),
-                                         headers=RESEARCH_HEADERS, timeout=4)
-            meta = ((resp.json().get("chart") or {}).get("result") or [{}])[0].get("meta") or {}
-            price = float(meta["regularMarketPrice"])
+            resp = await self.client.get(YAHOO_DAILY_URL.format(symbol=ticker), headers=RESEARCH_HEADERS, timeout=4)
+            res = ((resp.json().get("chart") or {}).get("result") or [{}])[0]
+            price = float((res.get("meta") or {})["regularMarketPrice"])
+            today = us_eastern_now().date()
+            closes = [c for t, c in zip(res.get("timestamp") or [], ((res.get("indicators") or {}).get("quote")
+                                                                      or [{}])[0].get("close") or [])
+                      if c and dt.datetime.fromtimestamp(t, eastern_tz()).date() < today][-6:]
+            pre5 = closes[-1] / closes[0] - 1 if len(closes) >= 2 and closes[0] > 0 else 0.0
         except Exception as exc:  # noqa: BLE001
             log.info("Price for %s unavailable: %s", ticker, describe_error(exc))
             return None
-        self.prices[ticker] = (time.time(), price)
-        return price
+        self.prices[ticker] = (time.time(), price, pre5)
+        return price, pre5
+
+    async def sec_json(self, url: str, max_age: float = 3600) -> Any:
+        """A small SEC JSON document (submissions, share count), cached; None when unavailable."""
+        cached = self.sec_cache.get(url)
+        if cached and time.time() - cached[0] < max_age:
+            return cached[1]
+        try:
+            resp = await self.fetcher.get(url, timeout=4.0)
+            data = resp.json() if resp is not None and resp.status_code == 200 else None
+        except Exception as exc:  # noqa: BLE001
+            log.info("SEC %s unavailable: %s", url, describe_error(exc))
+            return None
+        if len(self.sec_cache) > 500:
+            self.sec_cache.clear()
+        self.sec_cache[url] = (time.time(), data)
+        return data
+
+    async def jump_odds(self, c: Candidate, score: int | None, risk: PumpRisk | None) -> JumpOdds | None:
+        """The past year's jump rate for news like this one (data/jump_model.json); None without a model."""
+        model = self.jump_model
+        found = self.tickers.lookup(c.ticker) if c.ticker else None
+        if not model or not found or score is None:
+            return None
+        cik = found[0]
+        quote_, subs, facts = await asyncio.gather(
+            self.daily_quote(c.ticker or ""), self.sec_json(SEC_SUBMISSIONS_URL.format(cik=cik)),
+            self.sec_json(SEC_SHARES_URL.format(cik=cik), max_age=86400))
+        price, pre5 = quote_ or (None, 0.0)
+        units = ((facts or {}).get("units") or {}).get("shares") or []
+        shares = float(max(units, key=lambda u: u.get("end", ""))["val"]) if units else None
+        mcap = price * shares if price and shares else None
+        try:
+            sic = int((subs or {}).get("sic") or 0)
+        except ValueError:
+            sic = 0
+        body = strip_boilerplate(c.text or c.summary)
+        lead = body[:300]
+        head = c.title if c.source == "wire" else release_headline(lead)
+        text = f"{head}\n{lead}"
+        row = {"cat": classify_catalyst(text), "cap": cap_bucket(mcap), "price": price_bucket(price),
+               "sector": sector_of(sic), "session": session_of(time.time()), "pump": (risk.level if risk else "") or "none",
+               "amount": amount_bucket(text, mcap), "score": score, "pre5": pre5, "headline": head, "lead": lead}
+        feats = jump_features(row, model["vocab_set"])
+        weights = model["weights"]
+        return JumpOdds(jump_probability(weights, feats), float(model.get("base_rate", 0.05)),
+                        explain_features(weights, feats))
 
     async def process(self, c: Candidate) -> None:
         self.stats["candidates"] += 1
@@ -2144,7 +2341,7 @@ class Radar:
             if rejected:
                 log.info("Rejected %s (%s): %s", c.ticker, rejected, c.title or c.items)
                 return
-            if score < self.cfg.min_score:
+            if score < self.cfg.min_score and not (self.jump_model and score >= 0 and c.ticker):
                 log.info("Below threshold %s (%s): %s", c.ticker, score, c.title or c.items)
                 return
         now = time.time()
@@ -2156,33 +2353,48 @@ class Radar:
         if not self.chat_id:
             log.warning("No TELEGRAM_CHAT_ID yet — cannot send alert for %s", key)
             return
+        risk = await self.pump_risk(c) if self.cfg.pump_check and score is not None else None
+        odds = await self.jump_odds(c, score, risk) if self.jump_model and score is not None else None
+        if score is not None and not self.should_alert(score, odds):
+            log.info("Below threshold %s (%s, jump odds %s): %s", c.ticker, score,
+                     f"{odds.probability:.0%}" if odds else "—", c.title or c.items)
+            return
+        last = self.state.last_alert.get(key)
+        if last is not None and time.time() - last < self.cfg.dedup_hours * 3600:   # alerted meanwhile
+            return
         self.state.last_alert[key] = now
         self.state.dirty = True
-        risk = await self.pump_risk(c) if self.cfg.pump_check and score is not None else None
         try:
-            await self.tg.send(self.chat_id, format_alert(c, score, reason, now, risk))
+            await self.tg.send(self.chat_id, format_alert(c, score, reason, now, risk, odds))
             self.stats["alerts"] += 1
-            log.info("ALERT %s score=%s %s", key, score, c.title or c.items)
+            log.info("ALERT %s score=%s jump=%s %s", key, score, f"{odds.probability:.2f}" if odds else "-",
+                     c.title or c.items)
             self.state.alert_log.append({
                 "t": now, "ticker": c.ticker, "score": score, "pump": (risk.level if risk else "") or "none",
                 "src": c.source_label, "title": (c.title or ", ".join(c.items) or c.form)[:100],
+                **({"jump": round(odds.probability, 3)} if odds else {}),
             })
         except Exception as exc:  # noqa: BLE001
             if self.state.last_alert.get(key) == now:
                 del self.state.last_alert[key]
             log.error("Sending alert for %s failed: %s", key, exc)
 
+    def should_alert(self, score: int, odds: JumpOdds | None) -> bool:
+        """Rules decide; the jump model, when present, adds golden news the rules scored low and
+        drops high-scored news that historically almost never moved the stock."""
+        if odds is None or not self.jump_model:
+            return score >= self.cfg.min_score
+        if odds.probability >= float(self.jump_model.get("promote_at", 2.0)):
+            return True
+        if odds.probability < float(self.jump_model.get("mute_below", 0.0)):
+            return False
+        return score >= self.cfg.min_score
+
     async def pump_risk(self, c: Candidate) -> PumpRisk | None:
         """Crash-risk warning for an alert. Never delays an alert by more than a few seconds."""
         text = f"{c.title}\n{strip_boilerplate(c.text or c.summary)[:LEAD_CHARS]}"
         found = self.tickers.lookup(c.ticker) if c.ticker else None
-        submissions = None
-        if found:
-            try:
-                resp = await self.fetcher.get(SEC_SUBMISSIONS_URL.format(cik=found[0]), timeout=4.0)
-                submissions = resp.json() if resp is not None else None
-            except Exception as exc:  # noqa: BLE001
-                log.info("SEC submissions for %s unavailable: %s", c.ticker, describe_error(exc))
+        submissions = await self.sec_json(SEC_SUBMISSIONS_URL.format(cik=found[0])) if found else None
         risk = assess_pump_risk(text, submissions, us_eastern_now().date())
         if risk.level:
             log.info("Pump risk %s for %s: %s", risk.level, c.ticker, "; ".join(risk.reasons))

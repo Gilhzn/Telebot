@@ -144,15 +144,15 @@ class GainersHistoryTest(unittest.TestCase):
 
 class CatalystStudyTest(unittest.TestCase):
     def test_headline_from_exhibit_lead(self) -> None:
-        import catalysts
+        import bot as bot_mod
         lead = ("EX-99.1 4 ex99-1.htm EX-99.1 Exhibit 99.1 Elong Power Holding Limited Announces Pricing of US$7.6 "
                 "Million Public Offering BEIJING, Feb, 2, 2026 (GLOBE NEWSWIRE) – Elong Power Holding Limited")
-        self.assertEqual(catalysts.headline(lead),
+        self.assertEqual(bot_mod.release_headline(lead),
                          "Elong Power Holding Limited Announces Pricing of US$7.6 Million Public Offering")
         lead = ("EX-99.1 2 d59086dex991.htm EX-99.1 Exhibit 99.1 Gladstone Commercial Corporation Announces "
                 "Strategic Succession Plan McLean, VA, March 23, 2026: Gladstone Commercial")
-        self.assertEqual(catalysts.headline(lead), "Gladstone Commercial Corporation Announces Strategic Succession Plan")
-        self.assertEqual(catalysts.headline("Item 8.01 Other Events. On March 2, 2026 the company"), "")
+        self.assertEqual(bot_mod.release_headline(lead), "Gladstone Commercial Corporation Announces Strategic Succession Plan")
+        self.assertEqual(bot_mod.release_headline("Item 8.01 Other Events. On March 2, 2026 the company"), "")
 
     def test_outcome_reaction_day_and_reference(self) -> None:
         import catalysts

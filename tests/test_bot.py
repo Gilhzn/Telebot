@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import sys
 import tempfile
 import time
@@ -173,6 +174,7 @@ class World:
 
 def make_cfg(tmp: Path, **overrides: Any) -> bot.Config:
     overrides.setdefault("guru_alerts", "gurus" in overrides)   # off unless a test sets gurus
+    overrides.setdefault("jump_model", False)                  # tests set a model explicitly
     cfg = bot.Config(
         telegram_token="123:ABC",
         chat_id="42",
@@ -1645,3 +1647,64 @@ class StateTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class JumpModelTest(unittest.TestCase):
+    MODEL = {"weights": {"bias": -3.0, "cap=מתחת ל-$50M": 1.0, "p=contract": 1.5, "amount=סכום גדול משווי החברה": 0.3},
+             "vocab": ["contract"], "base_rate": 0.05, "promote_at": 0.3, "mute_below": 0.02}
+
+    def world(self) -> World:
+        w = base_world()
+        day = 86400
+        now = int(time.time())
+        w.set(bot.YAHOO_DAILY_URL.format(symbol="OKLO"), {"chart": {"result": [{
+            "meta": {"regularMarketPrice": 3.0},
+            "timestamp": [now - 8 * day, now - 7 * day, now - 6 * day, now - 5 * day, now - 4 * day],
+            "indicators": {"quote": [{"close": [2.0, 2.1, 2.2, 2.3, 2.5]}]}}]}})
+        w.set(bot.SEC_SHARES_URL.format(cik=1849056), {"units": {"shares": [
+            {"end": "2025-12-31", "val": 9_000_000}, {"end": "2026-06-30", "val": 10_000_000}]}})
+        w.set("https://data.sec.gov/submissions/CIK0001849056.json", {"sic": "4911", "filings": {"recent": {}}})
+        return w
+
+    def test_odds_from_live_data_and_golden_alert(self) -> None:
+        async def scenario() -> None:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            with mock.patch.object(bot, "SEC_MIN_INTERVAL", 0.0):
+                async with self.world().client() as client:
+                    radar = bot.Radar(make_cfg(Path(tmp.name)), client)
+                    radar.jump_model = {**self.MODEL, "vocab_set": {"contract"}}
+                    await radar.refresh_tickers()
+                    c = bot.Candidate(**{**bot.SAMPLE_CANDIDATE.__dict__, "published_ts": time.time()})
+                    odds = await radar.jump_odds(c, 2, None)
+                    assert odds is not None
+                    self.assertAlmostEqual(odds.probability, 1 / (1 + math.exp(0.2)), places=4)
+                    self.assertTrue(odds.golden)
+                    self.assertTrue(radar.should_alert(2, odds))           # promoted despite a low rule score
+                    msg = bot.format_alert(c, 2, "", odds=odds)
+                    self.assertIn("🏆 ידיעת זהב", msg)
+                    self.assertIn("סיכוי היסטורי לקפיצה של 20%+: 45%", msg)
+                    self.assertIn("„contract” בכותרת", msg)
+                    self.assertIn("שווי שוק: מתחת ל-$50M", msg)
+                    self.assertEqual(radar.prices["OKLO"][1:], (3.0, 0.25))
+
+        run(scenario())
+
+    def test_gate(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        radar = bot.Radar(make_cfg(Path(tmp.name)), mock.Mock())
+        self.assertTrue(radar.should_alert(4, None))
+        self.assertFalse(radar.should_alert(3, None))
+        radar.jump_model = self.MODEL
+        self.assertFalse(radar.should_alert(5, bot.JumpOdds(0.01, 0.05, [])))   # news that never moved stocks
+        self.assertTrue(radar.should_alert(4, bot.JumpOdds(0.05, 0.05, [])))
+        self.assertFalse(radar.should_alert(3, bot.JumpOdds(0.05, 0.05, [])))
+
+    def test_model_file_round_trip(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        p = Path(tmp.name) / "m.json"
+        p.write_text(json.dumps(self.MODEL), encoding="utf-8")
+        self.assertEqual(bot.load_jump_model(p)["vocab_set"], {"contract"})
+        self.assertIsNone(bot.load_jump_model(Path(tmp.name) / "missing.json"))
