@@ -15,6 +15,8 @@ jobs:
     timeout-minutes: 40
     env:
       SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+      ALPACA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY_ID }}
+      ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -26,5 +28,6 @@ jobs:
           case "${1:-}" in
             race) python tools/source_race.py "${2:-1200}" ;;   # every channel, halts included
             html) python tools/html_probe.py ;;                  # newsroom page structure
+            alpaca) pip install -q "websockets>=12,<16" && python tools/alpaca_probe.py "${2:-900}" ;;
             *) python tools/latency_probe.py 200 ;;
           esac

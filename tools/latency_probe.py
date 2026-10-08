@@ -32,7 +32,7 @@ CHANNELS = {
     "PRN html list": ("prn", "html", "https://www.prnewswire.com/news-releases/news-releases-list/"),
     "PRN html list p100": ("prn", "html",
                            "https://www.prnewswire.com/news-releases/news-releases-list/?page=1&pagesize=100"),
-    "Globe rss (public cos)": ("globe", "rss", bot._split(bot.DEFAULT_WIRE_FEEDS)[8]),
+    "Globe rss (public cos)": ("globe", "rss", next(u for u in bot._split(bot.DEFAULT_WIRE_FEEDS) if "orgclass" in u)),
     "Globe html newsroom": ("globe", "html", "https://www.globenewswire.com/newsroom"),
 }
 ID_RE = {"prn": PRN_ID, "globe": GLOBE_ID}

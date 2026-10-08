@@ -37,7 +37,7 @@ ID_RE = {
 CHANNELS = {
     "PRN rss": ("prn", "rss", "https://www.prnewswire.com/rss/news-releases-list.rss", 1),
     "PRN html list": ("prn", "html", "https://www.prnewswire.com/news-releases/news-releases-list/?page=1&pagesize=100", 1),
-    "Globe rss": ("globe", "rss", bot._split(bot.DEFAULT_WIRE_FEEDS)[8], 1),
+    "Globe rss": ("globe", "rss", next(u for u in bot._split(bot.DEFAULT_WIRE_FEEDS) if "orgclass" in u), 1),
     "Globe html newsroom": ("globe", "html", "https://www.globenewswire.com/newsroom", 1),
     "BW rss": ("bw", "rss", "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeGVtRWA==", 1),
     "BW html newsroom": ("bw", "html", "https://www.businesswire.com/newsroom?language=en", 2),
