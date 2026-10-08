@@ -958,13 +958,13 @@ GAINERS_TOP = 15
 MOVE_START_PCT = 0.10             # the move starts at the first minute 10% above the previous close
 NEWS_LOG_HOURS = 72
 GAINERS_LOG_MAX = 4_000
-LEARNING_READY_DAYS = 10
-SPLIT_ARTIFACT_PCT = 15.0
+LEARNING_READY_DAYS = 10          # trading days of data before the "ready" summary
+SPLIT_ARTIFACT_PCT = 15.0         # a "gain" whose 1-minute bars never rose 15% is a reverse split, not a move
 MOMENTUM_PCT = 15.0               # "breakout in progress": up 15%+ on the previous close
 MOMENTUM_DOLLAR_VOLUME = 200_000  # with at least $200K traded today (no illiquid ticks)
 MOMENTUM_NEWS_HOURS = 18          # watch tickers that had wire news in the last 18 hours
 MOMENTUM_SCAN_SECONDS = 600       # full-market scan (regular session only: Yahoo spark has no pre-market)
-MOMENTUM_MAX_CHECKS = 80          # chart requests per minute, at most         # a "gain" whose 1-minute bars never rose 15% is a reverse split, not a move          # trading days of data before the "ready" summary
+MOMENTUM_MAX_CHECKS = 80          # chart requests per minute, at most
 
 CATALYSTS: list[tuple[str, re.Pattern[str]]] = [
     ("FDA / רגולציה", re.compile(r"\b(?:FDA|EMA|clearance|cleared|breakthrough (?:therapy|device)|fast track|"
