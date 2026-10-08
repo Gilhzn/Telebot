@@ -1291,13 +1291,15 @@ def load_jump_model(path: Path = JUMP_MODEL_FILE) -> dict[str, Any] | None:
 
 @dataclass
 class JumpOdds:
-    probability: float       # chance of a 20%+ jump within two days, from the past year
+    probability: float       # chance of the model's target move (its "label"), from the past year
     base: float              # the same for an average press release
     reasons: list[str]       # the features that pushed it up most, in Hebrew
+    label: str = "קפיצה של 20%+"
+    golden_at: float = 2.0   # probability that marks golden news (2.0 = never)
 
     @property
     def golden(self) -> bool:
-        return self.probability >= 4 * self.base
+        return self.probability >= self.golden_at
 
 
 FEATURE_HE = {"cat": "סוג החדשות", "cap": "שווי שוק", "price": "מחיר", "sector": "סקטור", "sess": "שעת פרסום",
@@ -2039,7 +2041,7 @@ def format_alert(c: Candidate, score: int | None, reason: str, now: float | None
     if reason:
         lines.append(f"💡 {esc(reason)}")
     if odds:
-        line = (f"🎯 סיכוי היסטורי לקפיצה של 20%+: {odds.probability * 100:.0f}% "
+        line = (f"🎯 סיכוי היסטורי ל{odds.label}: {odds.probability * 100:.0f}% "
                 f"(פי {odds.probability / odds.base:.1f} מהודעה רגילה)" if odds.base else "")
         if odds.reasons:
             line += " · " + ", ".join(esc(r) for r in odds.reasons)
@@ -2581,7 +2583,8 @@ class Radar:
         feats = jump_features(row, model["vocab_set"])
         weights = model["weights"]
         return JumpOdds(jump_probability(weights, feats), float(model.get("base_rate", 0.05)),
-                        explain_features(weights, feats))
+                        explain_features(weights, feats), str(model.get("label", "קפיצה של 20%+")),
+                        float(model.get("golden_at", 2.0)))
 
     def takeover_target(self, c: Candidate) -> Candidate | None:
         """"Viatris Agrees To Acquire Pacira BioSciences": the jump is in the target, whose ticker the
@@ -2608,7 +2611,8 @@ class Radar:
             if rejected:
                 log.info("Rejected %s (%s): %s", c.ticker, rejected, c.title or c.items)
                 return
-            if score < self.cfg.min_score and not (self.jump_model and score >= 0 and c.ticker):
+            promotes = bool(self.jump_model) and float(self.jump_model.get("promote_at", 2.0)) <= 1.0
+            if score < self.cfg.min_score and not (promotes and score >= 0 and c.ticker):
                 log.info("Below threshold %s (%s): %s", c.ticker, score, c.title or c.items)
                 return
         now = time.time()

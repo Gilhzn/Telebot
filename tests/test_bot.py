@@ -1706,7 +1706,7 @@ if __name__ == "__main__":
 
 class JumpModelTest(unittest.TestCase):
     MODEL = {"weights": {"bias": -3.0, "cap=מתחת ל-$50M": 1.0, "p=contract": 1.5, "amount=סכום גדול משווי החברה": 0.3},
-             "vocab": ["contract"], "base_rate": 0.05, "promote_at": 0.3, "mute_below": 0.02}
+             "vocab": ["contract"], "base_rate": 0.05, "promote_at": 0.3, "mute_below": 0.02, "golden_at": 0.2}
 
     def world(self) -> World:
         w = base_world()
@@ -1980,3 +1980,19 @@ class AlpacaMoversTest(unittest.TestCase):
             async with base_world().client() as client:
                 return await bot.Radar(make_cfg(Path(tmp.name)), client).alpaca_movers()
         self.assertEqual(run(scenario()), [])
+
+
+class DeployedJumpModelTest(unittest.TestCase):
+    def test_model_file_scores_news(self) -> None:
+        model = bot.load_jump_model()
+        assert model is not None
+        self.assertIn("label", model)
+        row = {"cat": "תוצאות ניסוי קליני", "cap": "מעל $2B", "price": "מעל $20", "sector": "ביוטק / פארמה",
+               "session": "pre", "pump": "none", "amount": "ללא סכום", "score": 5, "pre5": 0.0,
+               "headline": "Positive Phase 3 Results Met Primary Endpoint", "lead": ""}
+        good = bot.jump_probability(model["weights"], bot.jump_features(row, model["vocab_set"]))
+        dull = bot.jump_probability(model["weights"], bot.jump_features(
+            {**row, "cat": "החזר מניות / דיבידנד", "sector": "פיננסים", "score": 0,
+             "headline": "Declares Quarterly Cash Dividend"}, model["vocab_set"]))
+        self.assertGreater(good, model["base_rate"])
+        self.assertLess(dull, model["mute_below"])

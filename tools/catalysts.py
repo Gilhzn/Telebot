@@ -47,7 +47,10 @@ def log(msg: str) -> None:
 
 # ---------------------------------------------------------------------------
 # outcome
+
+
 # ---------------------------------------------------------------------------
+
 
 def outcome(bars: list[tuple[dt.date, float, float, float, float, float]], ts: float) -> dict[str, Any] | None:
     """How the stock reacted. bars: (date, open, high, low, close, volume) split-adjusted, oldest first.
@@ -78,9 +81,13 @@ def outcome(bars: list[tuple[dt.date, float, float, float, float, float]], ts: f
         "session": bot.session_of(ts),
     }
 
+
 # ---------------------------------------------------------------------------
 # data collection (runner)
+
+
 # ---------------------------------------------------------------------------
+
 
 def load_events() -> list[dict[str, Any]]:
     seen, rows = set(), []
@@ -95,6 +102,7 @@ def load_events() -> list[dict[str, Any]]:
             rows.append(r)
     return rows
 
+
 def parse_daily(data: dict[str, Any]) -> list[tuple[dt.date, float, float, float, float, float]]:
     res = ((data.get("chart") or {}).get("result") or [None])[0] or {}
     q = ((res.get("indicators") or {}).get("quote") or [{}])[0]
@@ -105,6 +113,7 @@ def parse_daily(data: dict[str, Any]) -> list[tuple[dt.date, float, float, float
         if None not in vals[:4]:
             out.append((dt.datetime.fromtimestamp(t, tz).date(), *[float(v or 0) for v in vals]))
     return out
+
 
 async def collect() -> list[dict[str, Any]]:
     events = load_events()
@@ -176,12 +185,23 @@ async def collect() -> list[dict[str, Any]]:
                 log(f"priced {i}/{len(tickers)} tickers, {len(rows)} events with outcomes")
     return rows
 
+
 # ---------------------------------------------------------------------------
 # analysis
+
+
 # ---------------------------------------------------------------------------
 
+
+UP_TARGET = False           # "big": +10% high that holds +5% at the close (set by `report big`)
+MIN_CAP = 0.0
+
+
 def jumped(r: dict[str, Any]) -> bool:
+    if UP_TARGET:
+        return r["high2"] >= 0.10 and r["close_r"] >= 0.05
     return r["high2"] >= JUMP
+
 
 def rate_table(rows: list[dict[str, Any]], key, min_n: int = 30, top: int = 25) -> list[str]:
     groups: dict[str, list[dict[str, Any]]] = {}
@@ -190,7 +210,8 @@ def rate_table(rows: list[dict[str, Any]], key, min_n: int = 30, top: int = 25) 
         if k:
             groups.setdefault(k, []).append(r)
     base = sum(jumped(r) for r in rows) / max(1, len(rows))
-    out = ["| קבוצה | אירועים | קפצו 20%+ | פי מהממוצע | סגירה ב-10%+ | חציון שיא |", "|---|---|---|---|---|---|"]
+    out = [f"| קבוצה | אירועים | {'עלו 10%+ ונסגרו 5%+' if UP_TARGET else 'קפצו 20%+'} | פי מהממוצע | סגירה ב-10%+ "
+           "| חציון שיא |", "|---|---|---|---|---|---|"]
     stats = []
     for k, rs in groups.items():
         if len(rs) < min_n:
@@ -202,6 +223,7 @@ def rate_table(rows: list[dict[str, Any]], key, min_n: int = 30, top: int = 25) 
     for jr, k, n, cr, med in sorted(stats, reverse=True)[:top]:
         out.append(f"| {k} | {n} | {jr * 100:.1f}% | ×{jr / base:.1f} | {cr * 100:.1f}% | {med * 100:+.1f}% |" if base else "")
     return out
+
 
 def phrase_lift(rows: list[dict[str, Any]], min_n: int = 40) -> list[tuple[float, str, int, float, float]]:
     """(lift, phrase, count, hit rate, z-score) for headline phrases, most predictive first."""
@@ -220,9 +242,12 @@ def phrase_lift(rows: list[dict[str, Any]], min_n: int = 40) -> list[tuple[float
             out.append((rate / base, p, n, j / n, z))
     return sorted(out, reverse=True)
 
+
 # --- logistic model (pure Python, sparse binary features shared with the bot: bot.jump_features) ---
 
+
 features = bot.jump_features
+
 
 def train(rows: list[dict[str, Any]], vocab: set[str], epochs: int = 12, lr: float = 0.05, l2: float = 2e-3) -> dict[str, float]:
     w: dict[str, float] = {"bias": math.log(max(1e-3, sum(jumped(r) for r in rows) / len(rows)))}
@@ -239,7 +264,9 @@ def train(rows: list[dict[str, Any]], vocab: set[str], epochs: int = 12, lr: flo
                 w[k] = w.get(k, 0.0) - lr * (g + l2 * w.get(k, 0.0))
     return w
 
+
 predict = bot.jump_probability
+
 
 def auc(scored: list[tuple[float, bool]]) -> float:
     pos = [s for s, y in scored if y]
@@ -257,6 +284,7 @@ def auc(scored: list[tuple[float, bool]]) -> float:
         i = j
     return (rank_sum - len(pos) * (len(pos) + 1) / 2) / (len(pos) * len(neg))
 
+
 def report(rows: list[dict[str, Any]]) -> dict[str, Any]:
     OUT.mkdir(parents=True, exist_ok=True)
     rows = [r for r in rows if not r.get("rejected")]
@@ -265,7 +293,9 @@ def report(rows: list[dict[str, Any]]) -> dict[str, Any]:
     base = sum(jumped(r) for r in rows) / max(1, n)
     days = sorted({r["date"] for r in rows})
     lines = [f"# מה באמת מקפיץ מניה: {n} הודעות לעיתונות ב-SEC ({days[0]} עד {days[-1]})", "",
-             "- קפיצה = שיא של 20%+ ביום הידיעה או ביום שאחריו, ביחס לסגירה שלפני הידיעה. מניות שנסחרו בפחות מ-$300K ביום התגובה לא נכללו.",
+             ("- רק חברות של מיליארד דולר ומעלה. קפיצה = שיא של 10%+ ביום הידיעה או ביום שאחריו, וסגירה של 5%+ ביום התגובה"
+              if UP_TARGET else "- קפיצה = שיא של 20%+ ביום הידיעה או ביום שאחריו")
+             + ", ביחס לסגירה שלפני הידיעה. מניות שנסחרו בפחות מ-$300K ביום התגובה לא נכללו.",
              f"- **שיעור הבסיס: {base * 100:.1f}%** מכל ההודעות הקפיצו את המניה. כלומר רוב החדשות הטובות לא מזיזות כלום.",
              f"- הודעות שהבוט נתן להן 4+: {sum(1 for r in rows if r['score'] >= 4)}, מתוכן קפצו "
              f"{sum(jumped(r) for r in rows if r['score'] >= 4) * 100 // max(1, sum(1 for r in rows if r['score'] >= 4))}%", ""]
@@ -327,6 +357,7 @@ def report(rows: list[dict[str, Any]]) -> dict[str, Any]:
     print(text)
     return model
 
+
 def main() -> int:
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
     if mode == "run":
@@ -336,7 +367,11 @@ def main() -> int:
         report(rows)
         return 0
     if mode == "report":
+        global UP_TARGET, MIN_CAP
         rows = [json.loads(x) for x in (OUT / "rows.jsonl").read_text(encoding="utf-8").splitlines() if x.strip()]
+        if "big" in sys.argv[2:]:      # the bot's universe: $1B+ companies, a move that holds
+            UP_TARGET, MIN_CAP = True, 1e9
+            rows = [r for r in rows if (r.get("mcap") or 0) >= MIN_CAP]
         report(rows)
         return 0
     print(__doc__)
