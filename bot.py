@@ -972,6 +972,9 @@ RUNNER_PCT = 30.0                 # "runner": a 30%+ day in the last month; thes
 RUNNER_MAX_PRICE = 10.0           # and still a small, cheap stock
 RUNNER_SECONDS = 180              # outside the regular session, runners are checked every 3 minutes
 RUNNER_MAX = 250
+HALTS_URL = "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"   # Nasdaq's own halts feed, all US exchanges
+HALTS_POLL_SECONDS = 10
+HALT_FRESH_SECONDS = 600          # after a restart, only halts from the last 10 minutes are new
 MOMENTUM_MAX_CHECKS = 80          # chart requests per minute, at most
 
 CATALYSTS: list[tuple[str, re.Pattern[str]]] = [
@@ -1029,6 +1032,31 @@ def spark_moves(data: dict[str, Any], day: dt.date) -> dict[str, tuple[float, fl
         prev, close = pairs[-2][1], pairs[-1][1]
         if prev > 0:
             out[normalize_ticker(sym)] = ((close / prev - 1) * 100, close, prev)
+    return out
+
+
+@dataclass
+class Halt:
+    ticker: str
+    name: str
+    code: str        # T1 = news pending, LUDP = limit-up pause, LUDS = limit-down, ...
+    ts: float        # when trading stopped
+    key: str
+
+
+def parse_halts(body: bytes | str) -> list[Halt]:
+    """Nasdaq's trade-halts RSS (every US exchange): one entry per halt."""
+    out = []
+    for e in feedparser.parse(body).entries:
+        sym = normalize_ticker(e.get("ndaq_issuesymbol") or e.get("title") or "")
+        code = (e.get("ndaq_reasoncode") or "").strip().upper()
+        day, at = e.get("ndaq_haltdate") or "", (e.get("ndaq_halttime") or "").split(".")[0]
+        try:
+            when = dt.datetime.strptime(f"{day} {at}", "%m/%d/%Y %H:%M:%S").replace(tzinfo=eastern_tz()).timestamp()
+        except ValueError:
+            continue
+        if sym and code:
+            out.append(Halt(sym, (e.get("ndaq_issuename") or "").strip(), code, when, f"{sym}|{day}|{at}|{code}"))
     return out
 
 
@@ -1710,6 +1738,7 @@ class State:
         self.news_log_since = 0.0                        # when news logging started (first full day only)
         self.momentum: dict[str, Any] = {"date": "", "tickers": []}  # breakout alerts sent today
         self.runners: dict[str, Any] = {"day": "", "tickers": []}   # recent runners, watched before the open
+        self.halts: dict[str, Any] = {"date": "", "seen": []}      # trading halts already handled today
         self.guru_checked = 0.0
         self.cusip_tickers: dict[str, str] = {}          # CUSIP -> ticker ("" = none found)
         self.alert_log: list[dict[str, Any]] = []       # every alert sent, for the performance report
@@ -1744,6 +1773,7 @@ class State:
         st.news_log_since = float(data.get("news_log_since", 0.0))
         st.momentum = data.get("momentum", {"date": "", "tickers": []})
         st.runners = data.get("runners", {"day": "", "tickers": []})
+        st.halts = data.get("halts", {"date": "", "seen": []})
         st.guru_checked = float(data.get("guru_checked", 0.0))
         st.cusip_tickers = data.get("cusip_tickers", {})
         st.alert_log = data.get("alert_log", [])
@@ -1800,6 +1830,7 @@ class State:
             "news_log_since": self.news_log_since,
             "momentum": self.momentum,
             "runners": self.runners,
+            "halts": self.halts,
             "guru_checked": self.guru_checked,
             "cusip_tickers": self.cusip_tickers,
             "alert_log": self.alert_log[-ALERT_LOG_MAX:],
@@ -2782,8 +2813,7 @@ class Radar:
         et = us_eastern_now()
         if et.weekday() >= 5 or not (4 <= et.hour < 20) or not self.chat_id:
             return
-        if self.state.momentum.get("date") != et.date().isoformat():
-            self.state.momentum = {"date": et.date().isoformat(), "tickers": []}
+        self.reset_momentum_day(et.date())
         now = time.time()
         due = self.momentum_due(now)[:MOMENTUM_MAX_CHECKS]
         if session_of(now) != "regular":
@@ -2800,6 +2830,55 @@ class Radar:
             self.momentum_checked[ticker] = now
             await self.check_breakout(ticker, et.date())
             await asyncio.sleep(0.3)
+
+    async def halts_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                await self.check_halts()
+            except Exception:  # noqa: BLE001
+                log.exception("Halts check failed")
+            await self._sleep(HALTS_POLL_SECONDS)
+
+    async def check_halts(self) -> None:
+        """The exchange's own first-hand signals: T1 = trading stopped because material news is about
+        to come out, LUDP = trading paused because the price shot up (limit up). Both are seen within
+        about a minute, often before any headline."""
+        et = us_eastern_now()
+        if et.weekday() >= 5 or not (4 <= et.hour < 20) or not self.chat_id or not self.tickers.loaded:
+            return
+        try:
+            resp = await self.client.get(HALTS_URL, headers=RESEARCH_HEADERS, timeout=8)
+            resp.raise_for_status()
+            halts = parse_halts(resp.content)
+        except Exception as exc:  # noqa: BLE001
+            self._source_error("Nasdaq Halts", describe_error(exc))
+            return
+        self._source_ok("Nasdaq Halts")
+        today = et.date().isoformat()
+        if self.state.halts.get("date") != today:
+            self.state.halts = {"date": today, "seen": []}
+        seen = set(self.state.halts["seen"])
+        universe = set(research_universe(self.tickers))
+        for h in halts:
+            if h.key in seen:
+                continue
+            self.state.halts["seen"].append(h.key)
+            self.state.dirty = True
+            if time.time() - h.ts > HALT_FRESH_SECONDS or h.ticker not in universe:
+                continue
+            hm = dt.datetime.fromtimestamp(h.ts, eastern_tz()).strftime("%H:%M:%S")
+            if h.code == "T1":
+                found = self.tickers.lookup(h.ticker)
+                await self.reply(f"⏸ <b>עצירת מסחר: חדשות מהותיות בדרך</b>\n<b>{esc(h.ticker)}</b>"
+                                 + (f" | {esc(found[1])}" if found else "")
+                                 + f"\nהבורסה עצרה את המסחר ב-{hm} (שעון ניו יורק, קוד T1). הידיעה צפויה להתפרסם "
+                                   "בדקות הקרובות, לרוב מיזוג, רכישה, תוצאות ניסוי או החלטת רגולטור. "
+                                   "הבוט יבדוק אותה ברגע שתצא.")
+                log.info("HALT T1 %s at %s", h.ticker, hm)
+            elif h.code == "LUDP" and h.ticker not in self.state.momentum.get("tickers", []):
+                log.info("HALT LUDP %s at %s", h.ticker, hm)
+                await self.check_breakout(h.ticker, et.date(),
+                                          note=f"⏸ נעצרה למסחר ב-{hm} בגלל קפיצה חדה (Limit Up, LUDP)")
 
     async def refresh_runners(self, today: dt.date) -> None:
         """Once a day, before the pre-market: the small stocks that had a 30%+ day in the last month.
@@ -2827,7 +2906,7 @@ class Radar:
             log.info("Runners: %d small stocks had a %s%%+ day this month", len(found), RUNNER_PCT)
         self.state.dirty = True
 
-    async def check_breakout(self, ticker: str, today: dt.date) -> None:
+    async def check_breakout(self, ticker: str, today: dt.date, note: str = "") -> None:
         day0 = dt.datetime.combine(today, dt.time(4, 0), tzinfo=eastern_tz()).timestamp()
         try:
             resp = await self.client.get(YAHOO_CHART_URL.format(symbol=ticker, p1=int(day0), p2=int(time.time()),
@@ -2848,13 +2927,18 @@ class Radar:
         price = bars[-1][4]
         pct = (price / prev - 1) * 100
         dollars = sum(b[4] * b[5] for b in bars)
+        self.reset_momentum_day(today)
         if pct < MOMENTUM_PCT or dollars < MOMENTUM_DOLLAR_VOLUME or ticker in self.state.momentum["tickers"]:
             return
         start = next((b[0] for b in bars if b[2] >= prev * (1 + MOVE_START_PCT)), bars[-1][0])
         self.state.momentum["tickers"].append(ticker)
         self.state.dirty = True
-        await self.reply(self.breakout_text(ticker, pct, price, dollars, start, await self.recent_headlines(ticker)))
+        await self.reply(self.breakout_text(ticker, pct, price, dollars, start, await self.recent_headlines(ticker), note))
         log.info("BREAKOUT %s +%.0f%% ($%.0f traded)", ticker, pct, dollars)
+
+    def reset_momentum_day(self, day: dt.date) -> None:
+        if self.state.momentum.get("date") != day.isoformat():
+            self.state.momentum = {"date": day.isoformat(), "tickers": []}
 
     async def recent_headlines(self, ticker: str) -> list[dict[str, Any]]:
         """Yahoo's headlines about the ticker from the last 3 days, oldest first: the news the bot's own
@@ -2869,7 +2953,7 @@ class Radar:
         return sorted((n for n in items if time.time() - n["pub"] <= 72 * 3600 and n["title"]), key=lambda n: n["pub"])
 
     def breakout_text(self, ticker: str, pct: float, price: float, dollars: float, start: float,
-                      web_news: list[dict[str, Any]] | None = None) -> str:
+                      web_news: list[dict[str, Any]] | None = None, note: str = "") -> str:
         tz = eastern_tz()
         hm = lambda t: dt.datetime.fromtimestamp(t, tz).strftime("%H:%M")  # noqa: E731
         found = self.tickers.lookup(ticker)
@@ -2880,7 +2964,7 @@ class Radar:
         runner = " · 🔁 רצה חזק גם החודש" if ticker in self.state.runners.get("tickers", []) else ""
         lines = [tag, head,
                  f"{pct:+.0f}% · ${price:.2f} · מחזור ${dollars / 1e6:.1f}M · עלתה מעל 10% ב-{hm(start)} "
-                 f"(שעון ניו יורק, לפני {minutes:.0f} דק'){runner}"]
+                 f"(שעון ניו יורק, לפני {minutes:.0f} דק'){runner}"] + ([esc(note)] if note else [])
         news = sorted((n for n in self.state.news_log.get(ticker, []) if time.time() - n["t"] <= 24 * 3600),
                       key=lambda n: n.get("pub") or n["t"])
         wires = [n for n in news if not n["src"].startswith("SEC")]
@@ -3234,7 +3318,8 @@ class Radar:
         else:
             log.warning("TELEGRAM_CHAT_ID is empty — open the bot in Telegram and press Start")
         loops = [self.edgar_loop(), self.wire_loop(), self.command_loop(),
-                 self.ticker_refresh_loop(), self.save_loop(), self.catalyst_loop(), self.momentum_loop()]
+                 self.ticker_refresh_loop(), self.save_loop(), self.catalyst_loop(), self.momentum_loop(),
+                 self.halts_loop()]
         tasks = [asyncio.create_task(c) for c in loops]
         try:
             await self.stop_event.wait()

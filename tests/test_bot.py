@@ -1784,3 +1784,55 @@ class TakeoverTargetTest(unittest.TestCase):
                     self.assertIsNone(radar.takeover_target(bot.Candidate(**{**c.__dict__, "title": title})))
 
         run(scenario())
+
+
+class HaltsTest(unittest.TestCase):
+    @staticmethod
+    def feed(items: list[tuple[str, str, float]]) -> str:
+        tz = bot.eastern_tz()
+        rows = "".join(
+            f"<item><title>{sym}</title><ndaq:HaltDate>{dt_.strftime('%m/%d/%Y')}</ndaq:HaltDate>"
+            f"<ndaq:HaltTime>{dt_.strftime('%H:%M:%S')}.183</ndaq:HaltTime><ndaq:IssueSymbol>{sym}</ndaq:IssueSymbol>"
+            f"<ndaq:IssueName>{sym} Inc.</ndaq:IssueName><ndaq:ReasonCode>{code}</ndaq:ReasonCode></item>"
+            for sym, code, ts in items for dt_ in [__import__("datetime").datetime.fromtimestamp(ts, tz)])
+        return ('<?xml version="1.0"?><rss version="2.0" xmlns:ndaq="http://www.nasdaqtrader.com/">'
+                f"<channel><title>halts</title>{rows}</channel></rss>")
+
+    def test_parse(self) -> None:
+        now = time.time()
+        h = bot.parse_halts(self.feed([("RZAI", "LUDP", now)]))
+        self.assertEqual((h[0].ticker, h[0].code), ("RZAI", "LUDP"))
+        self.assertAlmostEqual(h[0].ts, int(now), delta=1)
+
+    def test_t1_and_limit_up_alerts_once(self) -> None:
+        dtm = __import__("datetime")
+
+        async def scenario() -> None:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = base_world()
+            now = time.time()
+            w.set(bot.HALTS_URL, self.feed([("OKLO", "T1", now - 60), ("TEVA", "LUDP", now - 30),
+                                            ("TEVA", "T1", now - 3 * 3600)]))     # old: ignored
+            t0 = int(now) - 600
+            px = [20.0] * 5 + [24.0] * 5
+            w.routes["https://query1.finance.yahoo.com/v8/finance/chart/TEVA?*"] = (200, {"chart": {"result": [{
+                "meta": {"chartPreviousClose": 20.0}, "timestamp": [t0 + 60 * i for i in range(10)],
+                "indicators": {"quote": [{"open": px, "high": px, "low": px, "close": px, "volume": [50_000] * 10}]}}]}})
+            async with w.client() as client:
+                radar = bot.Radar(make_cfg(Path(tmp.name)), client)
+                await radar.refresh_tickers()
+                et = dtm.datetime.now(bot.eastern_tz()).replace(hour=11)
+                while et.weekday() >= 5:
+                    et -= dtm.timedelta(days=1)
+                with mock.patch.object(bot, "us_eastern_now", return_value=et):
+                    await radar.check_halts()
+                    await radar.check_halts()                       # nothing twice
+            texts = [m["text"] for m in w.sent]
+            self.assertEqual(len(texts), 2, texts)
+            self.assertIn("חדשות מהותיות בדרך", texts[0])
+            self.assertIn("<b>OKLO</b>", texts[0])
+            self.assertIn("Limit Up", texts[1])
+            self.assertIn("<b>TEVA</b>", texts[1])
+
+        run(scenario())
