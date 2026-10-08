@@ -1621,6 +1621,46 @@ class MomentumTest(unittest.TestCase):
 
         run(scenario())
 
+    def test_runners_from_a_month_of_closes(self) -> None:
+        data = {"FLYE": {"close": [1.0, 1.61, 1.5, 1.4, 1.3]},          # +61% day, still cheap
+                "BIG": {"close": [100.0, 140.0, 141.0]},               # too expensive
+                "CALM": {"close": [2.0, 2.1, 2.2]},                    # never ran
+                "SPLIT": {"close": [0.1, 5.0, 5.1]}}                   # reverse split artifact
+        self.assertEqual(set(bot.spark_runners(data)), {"FLYE"})
+
+    def test_premarket_runner_caught_at_the_start(self) -> None:
+        dtm = __import__("datetime")
+        tz = bot.eastern_tz()
+
+        async def scenario() -> None:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = base_world()
+            t0 = int(time.time()) - 600
+            px = [2.0] * 5 + [2.25] * 5                       # +12.5%, started 5 minutes ago
+            w.routes["https://query1.finance.yahoo.com/v8/finance/chart/OKLO?*"] = (200, {"chart": {"result": [{
+                "meta": {"chartPreviousClose": 2.0}, "timestamp": [t0 + 60 * i for i in range(10)],
+                "indicators": {"quote": [{"open": px, "high": px, "low": px, "close": px, "volume": [60_000] * 10}]}}]}})
+            async with w.client() as client:
+                radar = bot.Radar(make_cfg(Path(tmp.name)), client)
+                await radar.refresh_tickers()
+                et = dtm.datetime.now(tz)
+                while et.weekday() >= 5:
+                    et -= dtm.timedelta(days=1)
+                et = et.replace(hour=7, minute=20)
+                radar.state.runners = {"day": et.date().isoformat(), "tickers": ["OKLO"]}
+                with mock.patch.object(bot, "us_eastern_now", return_value=et), \
+                        mock.patch.object(bot, "session_of", return_value="pre"), \
+                        mock.patch.object(bot.asyncio, "sleep", new=mock.AsyncMock()):
+                    await radar.check_momentum()
+            texts = [m["text"] for m in w.sent]
+            self.assertEqual(len(texts), 1, texts)
+            self.assertIn("תחילת זינוק", texts[0])
+            self.assertIn("רצה חזק גם החודש", texts[0])
+            self.assertIn("+12%", texts[0])
+
+        run(scenario())
+
     def test_breakout_names_news_from_outside_the_bot_sources(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)

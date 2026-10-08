@@ -964,10 +964,14 @@ NEWS_LOG_HOURS = 72
 GAINERS_LOG_MAX = 4_000
 LEARNING_READY_DAYS = 10          # trading days of data before the "ready" summary
 SPLIT_ARTIFACT_PCT = 15.0         # a "gain" whose 1-minute bars never rose 15% is a reverse split, not a move
-MOMENTUM_PCT = 15.0               # "breakout in progress": up 15%+ on the previous close
-MOMENTUM_DOLLAR_VOLUME = 200_000  # with at least $200K traded today (no illiquid ticks)
+MOMENTUM_PCT = 10.0               # "breakout starting": up 10%+ on the previous close (the move's start)
+MOMENTUM_DOLLAR_VOLUME = 100_000  # with at least $100K traded today (no illiquid ticks)
 MOMENTUM_NEWS_HOURS = 18          # watch tickers that had wire news in the last 18 hours
-MOMENTUM_SCAN_SECONDS = 600       # full-market scan (regular session only: Yahoo spark has no pre-market)
+MOMENTUM_SCAN_SECONDS = 300       # full-market scan (regular session only: Yahoo spark has no pre-market)
+RUNNER_PCT = 30.0                 # "runner": a 30%+ day in the last month; these tend to run again
+RUNNER_MAX_PRICE = 10.0           # and still a small, cheap stock
+RUNNER_SECONDS = 180              # outside the regular session, runners are checked every 3 minutes
+RUNNER_MAX = 250
 MOMENTUM_MAX_CHECKS = 80          # chart requests per minute, at most
 
 CATALYSTS: list[tuple[str, re.Pattern[str]]] = [
@@ -1025,6 +1029,20 @@ def spark_moves(data: dict[str, Any], day: dt.date) -> dict[str, tuple[float, fl
         prev, close = pairs[-2][1], pairs[-1][1]
         if prev > 0:
             out[normalize_ticker(sym)] = ((close / prev - 1) * 100, close, prev)
+    return out
+
+
+def spark_runners(data: dict[str, Any]) -> dict[str, tuple[float, float]]:
+    """symbol -> (biggest one-day gain %, last close) over a Yahoo spark response's daily closes,
+    for small stocks that had a RUNNER_PCT+ day: the ones most likely to run again."""
+    out = {}
+    for sym, d in (data or {}).items():
+        closes = [c for c in ((d or {}).get("close") or []) if c]
+        if len(closes) < 2 or not (GAINERS_MIN_PRICE <= closes[-1] <= RUNNER_MAX_PRICE):
+            continue
+        best = max((b / a - 1) * 100 for a, b in zip(closes, closes[1:]) if a > 0)
+        if RUNNER_PCT <= best < 2000:          # beyond that it is a reverse split, not a move
+            out[normalize_ticker(sym)] = (best, closes[-1])
     return out
 
 
@@ -1691,6 +1709,7 @@ class State:
         self.learning_ready_sent = False
         self.news_log_since = 0.0                        # when news logging started (first full day only)
         self.momentum: dict[str, Any] = {"date": "", "tickers": []}  # breakout alerts sent today
+        self.runners: dict[str, Any] = {"day": "", "tickers": []}   # recent runners, watched before the open
         self.guru_checked = 0.0
         self.cusip_tickers: dict[str, str] = {}          # CUSIP -> ticker ("" = none found)
         self.alert_log: list[dict[str, Any]] = []       # every alert sent, for the performance report
@@ -1724,6 +1743,7 @@ class State:
         st.learning_ready_sent = bool(data.get("learning_ready_sent", False))
         st.news_log_since = float(data.get("news_log_since", 0.0))
         st.momentum = data.get("momentum", {"date": "", "tickers": []})
+        st.runners = data.get("runners", {"day": "", "tickers": []})
         st.guru_checked = float(data.get("guru_checked", 0.0))
         st.cusip_tickers = data.get("cusip_tickers", {})
         st.alert_log = data.get("alert_log", [])
@@ -1779,6 +1799,7 @@ class State:
             "learning_ready_sent": self.learning_ready_sent,
             "news_log_since": self.news_log_since,
             "momentum": self.momentum,
+            "runners": self.runners,
             "guru_checked": self.guru_checked,
             "cusip_tickers": self.cusip_tickers,
             "alert_log": self.alert_log[-ALERT_LOG_MAX:],
@@ -2765,15 +2786,46 @@ class Radar:
             self.state.momentum = {"date": et.date().isoformat(), "tickers": []}
         now = time.time()
         due = self.momentum_due(now)[:MOMENTUM_MAX_CHECKS]
+        if session_of(now) != "regular":
+            await self.refresh_runners(et.date())
+            due += [t for t in self.state.runners.get("tickers", []) if t not in due
+                    and t not in self.state.momentum["tickers"]
+                    and now - self.momentum_checked.get(t, 0) >= RUNNER_SECONDS][:MOMENTUM_MAX_CHECKS - len(due)]
         if session_of(now) == "regular" and now - self.momentum_scan_at >= MOMENTUM_SCAN_SECONDS:
             self.momentum_scan_at = now
             movers = await self.todays_movers(et.date(), min_pct=MOMENTUM_PCT)
             due += [m["ticker"] for m in movers if m["ticker"] not in due
-                    and m["ticker"] not in self.state.momentum["tickers"]][:30]
+                    and m["ticker"] not in self.state.momentum["tickers"]][:50]
         for ticker in due:
             self.momentum_checked[ticker] = now
             await self.check_breakout(ticker, et.date())
             await asyncio.sleep(0.3)
+
+    async def refresh_runners(self, today: dt.date) -> None:
+        """Once a day, before the pre-market: the small stocks that had a 30%+ day in the last month.
+        Pre-market jumps without news come mostly from these, and Yahoo's market-wide prices
+        (spark) do not cover the pre-market, so they are watched one by one."""
+        if self.state.runners.get("day") == today.isoformat() or not self.tickers.loaded:
+            return
+        self.state.runners = {"day": today.isoformat(), "tickers": self.state.runners.get("tickers", [])}
+        universe = research_universe(self.tickers)
+        found: dict[str, tuple[float, float]] = {}
+        for i in range(0, len(universe), SPARK_BATCH):
+            try:
+                resp = await self.client.get(YAHOO_SPARK_URL.format(symbols=",".join(universe[i:i + SPARK_BATCH]),
+                                                                    range="1mo"), headers=RESEARCH_HEADERS, timeout=20)
+                if resp.status_code == 200:
+                    found.update(spark_runners(resp.json()))
+                elif resp.status_code == 429:
+                    await asyncio.sleep(10)
+            except Exception as exc:  # noqa: BLE001
+                log.info("Runners batch failed: %s", describe_error(exc))
+            await asyncio.sleep(0.25)
+        if found:
+            ranked = sorted(found, key=lambda t: -found[t][0])[:RUNNER_MAX]
+            self.state.runners["tickers"] = ranked
+            log.info("Runners: %d small stocks had a %s%%+ day this month", len(found), RUNNER_PCT)
+        self.state.dirty = True
 
     async def check_breakout(self, ticker: str, today: dt.date) -> None:
         day0 = dt.datetime.combine(today, dt.time(4, 0), tzinfo=eastern_tz()).timestamp()
@@ -2822,8 +2874,13 @@ class Radar:
         hm = lambda t: dt.datetime.fromtimestamp(t, tz).strftime("%H:%M")  # noqa: E731
         found = self.tickers.lookup(ticker)
         head = f"<b>{esc(ticker)}</b>" + (f" | {esc(found[1])}" if found else "")
-        lines = ["🚀 <b>זינוק בתהליך</b> (המניה כבר עולה, זו לא תחזית)", head,
-                 f"{pct:+.0f}% · ${price:.2f} · מחזור ${dollars / 1e6:.1f}M · עלתה מעל 10% ב-{hm(start)} (שעון ניו יורק)"]
+        minutes = max(0, (time.time() - start) / 60)
+        tag = ("🟢 <b>תחילת זינוק</b> (המניה התחילה לעלות עכשיו)" if pct < 25 and minutes <= 20
+               else "🚀 <b>זינוק בתהליך</b> (המניה כבר עולה, זו לא תחזית)")
+        runner = " · 🔁 רצה חזק גם החודש" if ticker in self.state.runners.get("tickers", []) else ""
+        lines = [tag, head,
+                 f"{pct:+.0f}% · ${price:.2f} · מחזור ${dollars / 1e6:.1f}M · עלתה מעל 10% ב-{hm(start)} "
+                 f"(שעון ניו יורק, לפני {minutes:.0f} דק'){runner}"]
         news = sorted((n for n in self.state.news_log.get(ticker, []) if time.time() - n["t"] <= 24 * 3600),
                       key=lambda n: n.get("pub") or n["t"])
         wires = [n for n in news if not n["src"].startswith("SEC")]
