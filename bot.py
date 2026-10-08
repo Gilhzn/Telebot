@@ -53,6 +53,12 @@ TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 # busy morning (that is how a KOD topline release was missed). Category feeds hold 20 items
 # each for a narrower slice, so together they keep far more history between polls.
 _PRN = "https://www.prnewswire.com/rss/"
+ALPACA_NEWS_STREAM = "wss://stream.data.alpaca.markets/v1beta1/news"   # Benzinga's real-time feed, pushed
+ALPACA_SOURCE = "Benzinga"
+# Benzinga's own write-ups about moves that already happened, not news.
+BENZINGA_SKIP_RE = re.compile(r"stocks? moving|movers|here are|price target|analyst|shares are trading|"
+                              r"why .{1,40} (?:shares|stock) (?:is|are)|trading (?:higher|lower)|"
+                              r"options activity|short interest|earnings preview|what's going on", re.I)
 PRN_LIST_URL = "https://www.prnewswire.com/news-releases/news-releases-list/?page=1&pagesize=25"
 DEFAULT_WIRE_FEEDS = ",".join([
     PRN_LIST_URL,                 # the newsroom page lists every release ~20-80s before the RSS feed
@@ -314,6 +320,8 @@ class Config:
     chat_id: str
     sec_user_agent: str
     anthropic_key: str = ""
+    alpaca_key_id: str = ""
+    alpaca_secret: str = ""
     anthropic_model: str = DEFAULT_MODEL
     positive_only: bool = True
     min_score: int = 4
@@ -342,6 +350,8 @@ class Config:
             chat_id=_env("TELEGRAM_CHAT_ID"),
             sec_user_agent=_env("SEC_USER_AGENT"),
             anthropic_key=_env("ANTHROPIC_API_KEY"),
+            alpaca_key_id=_env("ALPACA_API_KEY_ID"),
+            alpaca_secret=_env("ALPACA_API_SECRET_KEY"),
             anthropic_model=_env("ANTHROPIC_MODEL", DEFAULT_MODEL),
             positive_only=_env_bool("POSITIVE_ONLY", True),
             min_score=max(-5, min(5, _env_int("MIN_SCORE", 4))),
@@ -1604,6 +1614,21 @@ def parse_prn_list(page: str, now: dt.datetime | None = None) -> list[WireItem]:
     return items
 
 
+def alpaca_news_item(m: dict[str, Any]) -> WireItem | None:
+    """A message from Alpaca's news stream as a wire item; None for Benzinga's market commentary."""
+    if m.get("T") != "n" or not m.get("headline") or BENZINGA_SKIP_RE.search(m["headline"]):
+        return None
+    symbols = [normalize_ticker(x) for x in m.get("symbols") or []]
+    if not symbols or len(symbols) > 3:
+        return None    # roundups name many stocks
+    try:
+        ts = dt.datetime.fromisoformat(str(m.get("created_at", "")).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        ts = None
+    body = html_to_text(m.get("content") or "") or html_to_text(m.get("summary") or "")
+    return WireItem(f"bz:{m.get('id')}", html_to_text(m["headline"]), m.get("url") or "", body, ts, symbols)
+
+
 def wire_item_ids(it: WireItem) -> list[str]:
     """Seen-keys of an item: its own, plus a wire-wide id so the same PR Newswire release from the
     newsroom page and from the RSS feeds is handled once."""
@@ -2243,6 +2268,68 @@ class Radar:
             self.state.initialized.add(init_key)
             self.state.dirty = True
             log.info("%s initialized: %d existing items marked as seen", name, len(items))
+
+    async def alpaca_news_loop(self) -> None:
+        """Alpaca's real-time news stream (Benzinga, which carries every wire, ACCESS Newswire and
+        Newsfile included): pushed within seconds, no polling. Runs only with Alpaca keys."""
+        if not (self.cfg.alpaca_key_id and self.cfg.alpaca_secret):
+            return
+        try:
+            import websockets
+        except ImportError:
+            log.warning("Alpaca keys are set but the websockets package is missing")
+            return
+        backoff = 5.0
+        while not self.stop_event.is_set():
+            try:
+                async with websockets.connect(ALPACA_NEWS_STREAM, open_timeout=15, ping_interval=20) as ws:
+                    await ws.recv()
+                    await ws.send(json.dumps({"action": "auth", "key": self.cfg.alpaca_key_id,
+                                              "secret": self.cfg.alpaca_secret}))
+                    reply = json.loads(await ws.recv())
+                    if not any(r.get("msg") == "authenticated" for r in reply):
+                        self._source_error(ALPACA_SOURCE, f"Alpaca refused the keys: {str(reply)[:120]}")
+                        await self._sleep(600)
+                        continue
+                    await ws.send(json.dumps({"action": "subscribe", "news": ["*"]}))
+                    await ws.recv()
+                    self._source_ok(ALPACA_SOURCE)
+                    log.info("Alpaca news stream connected")
+                    backoff = 5.0
+                    while not self.stop_event.is_set():
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                        except asyncio.TimeoutError:
+                            continue
+                        for m in json.loads(raw):
+                            self.handle_alpaca_news(m)
+            except Exception as exc:  # noqa: BLE001
+                self._source_error(ALPACA_SOURCE, describe_error(exc))
+                log.warning("Alpaca news stream: %s, reconnecting in %.0fs", describe_error(exc), backoff)
+                await self._sleep(backoff)
+                backoff = min(backoff * 2, 120.0)
+
+    def handle_alpaca_news(self, m: dict[str, Any]) -> None:
+        it = alpaca_news_item(m)
+        if it is None:
+            return
+        keys = wire_item_ids(it)
+        if any(self.state.is_seen(k) for k in keys):
+            return
+        for k in keys:
+            self.state.mark_seen(k)
+        self._source_ok(ALPACA_SOURCE)
+        self.stats["checked"] += 1
+        listed = [t for t in it.tickers if self.tickers.lookup(t)]
+        if not listed:
+            return
+        cand = self.wire_candidate(WireItem(it.key, it.title, it.link, it.summary[:500], it.published_ts, listed),
+                                   ALPACA_SOURCE)
+        if cand is None:
+            return
+        cand.text = f"{it.title}\n{it.summary}" if it.summary else None
+        self.state.log_news(cand.ticker or "", ALPACA_SOURCE, it.title, it.published_ts)
+        self.spawn(self.process(cand))
 
     async def process_from_page(self, it: WireItem, source_name: str) -> None:
         try:
@@ -3391,7 +3478,7 @@ class Radar:
             log.warning("TELEGRAM_CHAT_ID is empty — open the bot in Telegram and press Start")
         loops = [self.edgar_loop(), self.wire_loop(), self.command_loop(),
                  self.ticker_refresh_loop(), self.save_loop(), self.catalyst_loop(), self.momentum_loop(),
-                 self.halts_loop()]
+                 self.halts_loop(), self.alpaca_news_loop()]
         tasks = [asyncio.create_task(c) for c in loops]
         try:
             await self.stop_event.wait()

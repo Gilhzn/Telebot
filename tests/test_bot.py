@@ -1883,3 +1883,38 @@ class PrnListTest(unittest.TestCase):
             self.assertIn("<b>OKLO</b>", texts[0])
 
         run(scenario())
+
+
+class AlpacaNewsTest(unittest.TestCase):
+    MSG = {"T": "n", "id": 4242, "headline": "Oklo Awarded $450 Million Contract by U.S. Department of Defense",
+           "summary": "", "content": "<p>Oklo Inc. (NYSE: OKLO) today announced it has been awarded a $450 million "
+           "contract by the U.S. Department of Defense.</p>", "created_at": "2026-10-08T12:00:01Z",
+           "symbols": ["OKLO"], "source": "benzinga", "url": "https://www.benzinga.com/x"}
+
+    def test_item_and_commentary_filter(self) -> None:
+        it = bot.alpaca_news_item(self.MSG)
+        assert it is not None
+        self.assertEqual((it.key, it.tickers), ("bz:4242", ["OKLO"]))
+        self.assertIn("$450 million", it.summary)
+        for headline in ("12 Industrials Stocks Moving In Thursday's Pre-Market Session",
+                         "Why Oklo Shares Are Trading Higher Today"):
+            self.assertIsNone(bot.alpaca_news_item({**self.MSG, "headline": headline}))
+        self.assertIsNone(bot.alpaca_news_item({**self.MSG, "symbols": ["A", "B", "C", "D"]}))
+
+    def test_stream_message_becomes_an_alert(self) -> None:
+        async def scenario() -> None:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = base_world()
+            async with w.client() as client:
+                radar = bot.Radar(make_cfg(Path(tmp.name)), client)
+                await radar.refresh_tickers()
+                radar.handle_alpaca_news(self.MSG)
+                radar.handle_alpaca_news(self.MSG)                  # the same item twice: once
+                await radar.drain(5)
+            texts = [m["text"] for m in w.sent]
+            self.assertEqual(len(texts), 1, texts)
+            self.assertIn("<b>OKLO</b>", texts[0])
+            self.assertIn("Benzinga", texts[0])
+
+        run(scenario())
