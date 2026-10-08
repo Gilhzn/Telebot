@@ -53,7 +53,9 @@ TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 # busy morning (that is how a KOD topline release was missed). Category feeds hold 20 items
 # each for a narrower slice, so together they keep far more history between polls.
 _PRN = "https://www.prnewswire.com/rss/"
+PRN_LIST_URL = "https://www.prnewswire.com/news-releases/news-releases-list/?page=1&pagesize=25"
 DEFAULT_WIRE_FEEDS = ",".join([
+    PRN_LIST_URL,                 # the newsroom page lists every release ~20-80s before the RSS feed
     _PRN + "news-releases-list.rss",
     _PRN + "health-latest-news/health-latest-news-list.rss",
     _PRN + "health-latest-news/biotechnology-list.rss",
@@ -1567,9 +1569,53 @@ def parse_wire_feed(content: bytes | str) -> list[WireItem]:
     return items
 
 
+PRN_CARD_RE = re.compile(r'<a class="newsreleaseconsolidatelink[^"]*" href="(/news-releases/[^"]+?-(\d{9})\.html)"'
+                         r'(.*?)</a>', re.S)
+PRN_ID_RE = re.compile(r"prnewswire\.com/news-releases/[^\s\"'<>]*?-(\d{9})\.html")
+
+
+def parse_prn_list(page: str, now: dt.datetime | None = None) -> list[WireItem]:
+    """PR Newswire's newsroom list page: link, headline, time ("11:19 ET" today, or a full date)
+    and the opening of the release (tickers are usually further down, in the release itself)."""
+    now = now or us_eastern_now()
+    items = []
+    for m in PRN_CARD_RE.finditer(page):
+        card = m.group(3)
+        head = re.search(r"<h3>\s*<small>([^<]*)</small>(.*?)</h3>", card, re.S)
+        if not head:
+            continue
+        when, title = head.group(1).strip(), html_to_text(head.group(2)).strip()
+        para = re.search(r'<p class="remove-outline">(.*?)</p>', card, re.S)
+        summary = html_to_text(para.group(1)) if para else ""
+        ts = None
+        hm = re.fullmatch(r"(\d{1,2}):(\d{2}) ET", when)
+        try:
+            if hm:
+                t = now.replace(hour=int(hm.group(1)), minute=int(hm.group(2)), second=0, microsecond=0)
+                if t > now + dt.timedelta(minutes=5):
+                    t -= dt.timedelta(days=1)
+                ts = t.replace(tzinfo=eastern_tz()).timestamp()
+            elif when:
+                ts = dt.datetime.strptime(when, "%b %d, %Y, %H:%M ET").replace(tzinfo=eastern_tz()).timestamp()
+        except ValueError:
+            ts = None
+        link = "https://www.prnewswire.com" + m.group(1)
+        items.append(WireItem(link, title, link, summary, ts, extract_tickers(f"{title}\n{summary}")))
+    return items
+
+
+def wire_item_ids(it: WireItem) -> list[str]:
+    """Seen-keys of an item: its own, plus a wire-wide id so the same PR Newswire release from the
+    newsroom page and from the RSS feeds is handled once."""
+    m = PRN_ID_RE.search(it.link) or PRN_ID_RE.search(it.key)
+    return [f"wire:{it.key}"] + ([f"prn:{m.group(1)}"] if m else [])
+
+
 def wire_source_name(url: str) -> str:
     parsed = urlparse(url)
     host = parsed.netloc.lower()
+    if url == PRN_LIST_URL or ("prnewswire" in host and parsed.path.endswith("news-releases-list/")):
+        return "PR Newswire"
     for needle, name in (("prnewswire", "PR Newswire"), ("globenewswire", "GlobeNewswire"),
                          ("businesswire", "Business Wire"), ("accessnewswire", "ACCESS Newswire")):
         if needle in host:
@@ -2158,7 +2204,8 @@ class Radar:
         if resp is None:
             self._source_ok(name)
             return
-        items = parse_wire_feed(resp.content)
+        is_page = "prnewswire" in url and "news-releases-list/" in url
+        items = parse_prn_list(resp.text) if is_page else parse_wire_feed(resp.content)
         if not items:
             self._source_error(name, "הפיד ריק או לא תקין — בדוק את הכתובת ב-WIRE_FEEDS")
             return
@@ -2168,14 +2215,21 @@ class Radar:
         self._check_overflow(name, [f"wire:{it.key}" for it in items], first)
         dispatched = 0
         for it in reversed(items):
-            key = f"wire:{it.key}"
-            if self.state.is_seen(key):
+            keys = wire_item_ids(it)
+            if any(self.state.is_seen(k) for k in keys):
+                for k in keys:
+                    self.state.mark_seen(k)
                 continue
-            self.state.mark_seen(key)
+            for k in keys:
+                self.state.mark_seen(k)
             if first:
                 continue
             self.stats["checked"] += 1
             cand = self.wire_candidate(it, name)
+            if cand is None and is_page:
+                # The list shows only the release's opening; the ticker is in the release itself.
+                self.spawn(self.process_from_page(it, name))
+                continue
             if cand and cand.ticker:
                 self.state.log_news(cand.ticker, name, it.title, it.published_ts)
             if cand is None:
@@ -2189,6 +2243,24 @@ class Radar:
             self.state.initialized.add(init_key)
             self.state.dirty = True
             log.info("%s initialized: %d existing items marked as seen", name, len(items))
+
+    async def process_from_page(self, it: WireItem, source_name: str) -> None:
+        try:
+            page = await self.fetcher.get(it.link, timeout=8.0)
+            body = extract_article_text(page.text) if page is not None else ""
+        except Exception as exc:  # noqa: BLE001
+            log.info("%s: release page %s unavailable: %s", source_name, it.link, describe_error(exc))
+            return
+        tickers = extract_tickers(body[:4000])
+        if not tickers:
+            return  # no US exchange ticker: private or non-US company
+        cand = self.wire_candidate(WireItem(it.key, it.title, it.link, it.summary, it.published_ts, tickers),
+                                   source_name)
+        if cand is None:
+            return
+        cand.text = body
+        self.state.log_news(cand.ticker or "", source_name, it.title, it.published_ts)
+        await self.process(cand)
 
     def wire_candidate(self, it: WireItem, source_name: str) -> Candidate | None:
         # Ticker from the feed text, else from a listed company's name opening the headline

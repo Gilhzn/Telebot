@@ -1836,3 +1836,50 @@ class HaltsTest(unittest.TestCase):
             self.assertIn("<b>TEVA</b>", texts[1])
 
         run(scenario())
+
+
+PRN_LIST_PAGE = """<div class="row newsCards" lang="en-US"> <div role="group" aria-label="News Release" class="card col-view">
+<a class="newsreleaseconsolidatelink display-outline w-100" href="/news-releases/oklo-awarded-450-million-contract-302902476.html">
+<div class="col-sm-8 col-lg-9 pull-left card"> <h3> <small>11:19 ET</small> Oklo Awarded $450 Million Contract by U.S. Department of Defense </h3>
+<p class="remove-outline">The contract covers the deployment of microreactors ...</p> </div> </a> </div> </div>
+<div class="row newsCards"><div class="card col-view"><a class="newsreleaseconsolidatelink display-outline w-100" href="/news-releases/old-news-302800001.html">
+<div class="card"><h3><small>Oct 07, 2026, 18:00 ET</small> Old news </h3><p class="remove-outline">x</p></div></a></div></div>"""
+
+
+class PrnListTest(unittest.TestCase):
+    def test_parse_cards(self) -> None:
+        now = __import__("datetime").datetime(2026, 10, 8, 11, 20)
+        items = bot.parse_prn_list(PRN_LIST_PAGE, now)
+        self.assertEqual([i.title for i in items],
+                         ["Oklo Awarded $450 Million Contract by U.S. Department of Defense", "Old news"])
+        self.assertEqual(items[0].link, "https://www.prnewswire.com/news-releases/oklo-awarded-450-million-contract-302902476.html")
+        et = __import__("datetime").datetime.fromtimestamp(items[0].published_ts, bot.eastern_tz())
+        self.assertEqual((et.day, et.hour, et.minute), (8, 11, 19))
+        self.assertEqual(bot.wire_item_ids(items[0])[1], "prn:302902476")
+
+    def test_same_release_from_rss_is_not_handled_twice(self) -> None:
+        page_item = bot.parse_prn_list(PRN_LIST_PAGE)[0]
+        rss_item_ = bot.WireItem("some-guid", page_item.title, page_item.link + "?tc=eml", "", None, [])
+        self.assertEqual(bot.wire_item_ids(page_item)[1], bot.wire_item_ids(rss_item_)[1])
+
+    def test_ticker_from_the_release_page(self) -> None:
+        async def scenario() -> None:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = base_world()
+            w.set(bot.PRN_LIST_URL, PRN_LIST_PAGE.replace("old-news", "older-news"))
+            async with w.client() as client:
+                radar = bot.Radar(make_cfg(Path(tmp.name), wire_feeds=[bot.PRN_LIST_URL]), client)
+                await radar.refresh_tickers()
+                await radar.poll_wire(bot.PRN_LIST_URL)                       # first poll: baseline
+                w.set(bot.PRN_LIST_URL, PRN_LIST_PAGE.replace("302902476", "302902999"))
+                w.set("https://www.prnewswire.com/news-releases/oklo-awarded-450-million-contract-302902999.html",
+                      CONTRACT_PR)
+                with mock.patch.object(bot, "SEC_MIN_INTERVAL", 0.0):
+                    await radar.poll_wire(bot.PRN_LIST_URL)
+                    await radar.drain(5)
+            texts = [m["text"] for m in w.sent]
+            self.assertEqual(len(texts), 1, texts)
+            self.assertIn("<b>OKLO</b>", texts[0])
+
+        run(scenario())
