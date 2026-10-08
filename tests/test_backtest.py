@@ -140,3 +140,50 @@ class GainersHistoryTest(unittest.TestCase):
         days = gainers.gainer_days(data, dt.date(2026, 10, 1))
         self.assertEqual([(d["ticker"], d["date"]) for d in days], [("SXTC", "2026-10-07")])
         self.assertAlmostEqual(days[0]["pct"], 126.4)
+
+
+class CatalystStudyTest(unittest.TestCase):
+    def test_headline_from_exhibit_lead(self) -> None:
+        import catalysts
+        lead = ("EX-99.1 4 ex99-1.htm EX-99.1 Exhibit 99.1 Elong Power Holding Limited Announces Pricing of US$7.6 "
+                "Million Public Offering BEIJING, Feb, 2, 2026 (GLOBE NEWSWIRE) – Elong Power Holding Limited")
+        self.assertEqual(catalysts.headline(lead),
+                         "Elong Power Holding Limited Announces Pricing of US$7.6 Million Public Offering")
+        lead = ("EX-99.1 2 d59086dex991.htm EX-99.1 Exhibit 99.1 Gladstone Commercial Corporation Announces "
+                "Strategic Succession Plan McLean, VA, March 23, 2026: Gladstone Commercial")
+        self.assertEqual(catalysts.headline(lead), "Gladstone Commercial Corporation Announces Strategic Succession Plan")
+        self.assertEqual(catalysts.headline("Item 8.01 Other Events. On March 2, 2026 the company"), "")
+
+    def test_outcome_reaction_day_and_reference(self) -> None:
+        import catalysts
+        d = dt.date
+        bars = [(d(2026, 3, 9), 1, 1, 1, 1.0, 1e6), (d(2026, 3, 10), 1, 1.1, 1, 1.0, 1e6),
+                (d(2026, 3, 11), 1.5, 2.0, 1.4, 1.6, 1e6), (d(2026, 3, 12), 1.6, 1.7, 1.2, 1.3, 1e6)]
+        pre = catalysts.outcome(bars, et(2026, 3, 11, 7, 0))       # pre-market: reacts the same day
+        assert pre is not None
+        self.assertAlmostEqual(pre["high2"], 1.0)
+        self.assertAlmostEqual(pre["close_r"], 0.6)
+        evening = catalysts.outcome(bars, et(2026, 3, 10, 18, 0))  # after the close: reacts the next day
+        assert evening is not None
+        self.assertAlmostEqual(evening["ref"], 1.0)
+        self.assertAlmostEqual(evening["close_r"], 0.6)
+        self.assertEqual(evening["session"], "after")
+        self.assertIsNone(catalysts.outcome(bars, et(2026, 3, 12, 18, 0)))   # no reaction day yet
+        split = [(d(2026, 3, 9), 1, 1, 1, 1.0, 1e6), (d(2026, 3, 10), 10, 10.5, 9.8, 10.2, 1e5)]
+        self.assertIsNone(catalysts.outcome(split, et(2026, 3, 10, 7, 0)))   # unadjusted reverse split
+
+    def test_model_learns_a_signal_and_auc(self) -> None:
+        import catalysts
+        base = {"cap": "מתחת ל-$50M", "price": "$1–5", "sector": "ביוטק / פארמה", "session": "pre", "pump": "none",
+                "amount": "ללא סכום", "form": "8-K", "score": 3, "pre5": 0.0, "lead": "", "close_r": 0.0}
+        rows = []
+        for i in range(400):
+            hit = i % 4 == 0
+            rows.append({**base, "cat": "FDA / רגולציה" if hit else "דוחות / תחזית",
+                         "headline": "receives fda approval" if hit else "reports quarterly results",
+                         "high2": 0.5 if hit else 0.02})
+        w = catalysts.train(rows, {"fda approval"})
+        self.assertGreater(catalysts.predict(w, catalysts.features(rows[0], {"fda approval"})),
+                           catalysts.predict(w, catalysts.features(rows[1], {"fda approval"})) + 0.5)
+        self.assertEqual(catalysts.auc([(0.9, True), (0.1, False), (0.8, True), (0.2, False)]), 1.0)
+        self.assertEqual(catalysts.auc([(0.5, True), (0.5, False)]), 0.5)

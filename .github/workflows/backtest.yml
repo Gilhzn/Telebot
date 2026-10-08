@@ -40,6 +40,12 @@ jobs:
           echo "mode: $MODE args: $*"
           case "$MODE" in
             probe) python tools/backtest_probe.py ;;
+            catalysts)  # one-year catalyst study over every collected signal; optional START END to collect first
+              if git fetch --depth 1 origin backtest-recent 2>/dev/null; then
+                git archive FETCH_HEAD backtest-out/pilot | tar -x && echo "pilot signals restored"
+              fi
+              if [ -n "${1:-}" ]; then python tools/backtest.py collect "$1" "$2" --out backtest-out/main; fi
+              python tools/catalysts.py run ;;
             *) python tools/backtest.py "$MODE" "$@" ;;
           esac
       - name: save results
