@@ -55,6 +55,8 @@ TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 _PRN = "https://www.prnewswire.com/rss/"
 ALPACA_NEWS_STREAM = "wss://stream.data.alpaca.markets/v1beta1/news"   # Benzinga's real-time feed, pushed
 ALPACA_SOURCE = "Benzinga"
+ALPACA_MOVERS_URL = "https://data.alpaca.markets/v1beta1/screener/stocks/movers?top=50"   # market-wide, real time
+MOVERS_RECHECK_SECONDS = 180
 # Benzinga's own write-ups about moves that already happened, not news.
 BENZINGA_SKIP_RE = re.compile(r"stocks? moving|movers|here are|price target|analyst|shares are trading|"
                               r"why .{1,40} (?:shares|stock) (?:is|are)|trading (?:higher|lower)|"
@@ -3023,6 +3025,10 @@ class Radar:
             due += [t for t in self.state.runners.get("tickers", []) if t not in due
                     and t not in self.state.momentum["tickers"]
                     and now - self.momentum_checked.get(t, 0) >= RUNNER_SECONDS][:MOMENTUM_MAX_CHECKS - len(due)]
+        for t in await self.alpaca_movers():
+            if t not in due and t not in self.state.momentum["tickers"] \
+                    and now - self.momentum_checked.get(t, 0) >= MOVERS_RECHECK_SECONDS:
+                due.append(t)
         if session_of(now) == "regular" and now - self.momentum_scan_at >= MOMENTUM_SCAN_SECONDS:
             self.momentum_scan_at = now
             movers = await self.todays_movers(et.date(), min_pct=MOMENTUM_PCT)
@@ -3085,6 +3091,22 @@ class Radar:
                 await self.check_breakout(h.ticker, et.date(),
                                           note=f"⏸ נעצרה למסחר ב-{hm} בגלל קפיצה חדה (Limit Up, LUDP)")
 
+    async def alpaca_movers(self) -> list[str]:
+        """Today's biggest gainers across the whole market from Alpaca, in one request (with keys)."""
+        if not (self.cfg.alpaca_key_id and self.cfg.alpaca_secret):
+            return []
+        try:
+            resp = await self.client.get(ALPACA_MOVERS_URL, timeout=8, headers={
+                "APCA-API-KEY-ID": self.cfg.alpaca_key_id, "APCA-API-SECRET-KEY": self.cfg.alpaca_secret})
+            resp.raise_for_status()
+            gainers = resp.json().get("gainers") or []
+        except Exception as exc:  # noqa: BLE001
+            log.info("Alpaca movers unavailable: %s", describe_error(exc))
+            return []
+        universe = set(research_universe(self.tickers))
+        return [normalize_ticker(g["symbol"]) for g in gainers
+                if (g.get("percent_change") or 0) >= MOMENTUM_PCT and normalize_ticker(g.get("symbol", "")) in universe]
+
     async def refresh_runners(self, today: dt.date) -> None:
         """Once a day, before the pre-market: the small stocks that had a 30%+ day in the last month.
         Pre-market jumps without news come mostly from these, and Yahoo's market-wide prices
@@ -3112,6 +3134,10 @@ class Radar:
         self.state.dirty = True
 
     async def check_breakout(self, ticker: str, today: dt.date, note: str = "") -> None:
+        known = self.mcaps.get(ticker)
+        if self.cfg.min_market_cap > 0 and known and time.time() - known[0] < 6 * 3600 \
+                and (known[1] or 0) < self.cfg.min_market_cap:
+            return    # too small for the alerts: no need for its chart
         day0 = dt.datetime.combine(today, dt.time(4, 0), tzinfo=eastern_tz()).timestamp()
         try:
             resp = await self.client.get(YAHOO_CHART_URL.format(symbol=ticker, p1=int(day0), p2=int(time.time()),

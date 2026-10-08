@@ -1953,3 +1953,30 @@ class MarketCapTest(unittest.TestCase):
 
     def test_money_format(self) -> None:
         self.assertEqual([bot.fmt_money(v) for v in (5e8, 2.04e9, 3.1e12)], ["$500M", "$2.0B", "$3.1T"])
+
+
+class AlpacaMoversTest(unittest.TestCase):
+    def test_movers_filtered_to_listed_common_shares(self) -> None:
+        async def scenario() -> list[str]:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = base_world()
+            w.set(bot.ALPACA_MOVERS_URL, {"gainers": [
+                {"symbol": "OKLO", "percent_change": 22.5}, {"symbol": "DAAQW", "percent_change": 190.0},
+                {"symbol": "TEVA", "percent_change": 4.0}]})
+            async with w.client() as client:
+                radar = bot.Radar(make_cfg(Path(tmp.name), alpaca_key_id="k", alpaca_secret="s"), client)
+                await radar.refresh_tickers()
+                got = await radar.alpaca_movers()
+                sent = [r for r in w.requests if "alpaca" in str(r.url)][0]
+                self.assertEqual(sent.headers["APCA-API-KEY-ID"], "k")
+                return got
+        self.assertEqual(run(scenario()), ["OKLO"])
+
+    def test_no_keys_no_request(self) -> None:
+        async def scenario() -> list[str]:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            async with base_world().client() as client:
+                return await bot.Radar(make_cfg(Path(tmp.name)), client).alpaca_movers()
+        self.assertEqual(run(scenario()), [])
