@@ -325,6 +325,7 @@ class Config:
     anthropic_model: str = DEFAULT_MODEL
     positive_only: bool = True
     min_score: int = 4
+    min_market_cap: float = 1e9      # alerts only for companies worth at least this much (0 = all)
     marketwide: bool = True
     watchlist: list[str] = field(default_factory=list)
     candidate_items: set[str] = field(default_factory=lambda: {"1.01", "2.01", "2.02", "7.01", "8.01"})
@@ -355,6 +356,7 @@ class Config:
             anthropic_model=_env("ANTHROPIC_MODEL", DEFAULT_MODEL),
             positive_only=_env_bool("POSITIVE_ONLY", True),
             min_score=max(-5, min(5, _env_int("MIN_SCORE", 4))),
+            min_market_cap=max(0.0, _env_float("MIN_MARKET_CAP", 1e9)),
             marketwide=_env_bool("MARKETWIDE", True),
             watchlist=[normalize_ticker(t) for t in _split(_env("WATCHLIST"))],
             candidate_items=set(_split(_env("CANDIDATE_ITEMS", "1.01,2.01,2.02,7.01,8.01"))),
@@ -479,6 +481,10 @@ def extract_tickers(text: str) -> list[str]:
 
 def esc(text: str) -> str:
     return html.escape(text or "", quote=False)
+
+
+def fmt_money(v: float) -> str:
+    return f"${v / 1e12:.1f}T" if v >= 1e12 else f"${v / 1e9:.1f}B" if v >= 1e9 else f"${v / 1e6:.0f}M"
 
 
 def fmt_duration(seconds: float) -> str:
@@ -1182,6 +1188,7 @@ def learning_summary(log_entries: list[dict[str, Any]]) -> str:
 # ---------------------------------------------------------------------------
 
 JUMP_MODEL_FILE = Path(__file__).resolve().parent / "data" / "jump_model.json"
+SEC_FRAMES_URL = "https://data.sec.gov/api/xbrl/frames/dei/EntityCommonStockSharesOutstanding/shares/{period}.json"
 SEC_SHARES_URL = "https://data.sec.gov/api/xbrl/companyconcept/CIK{cik:010d}/dei/EntityCommonStockSharesOutstanding.json"
 YAHOO_DAILY_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=10d&interval=1d"
 _MONTH_NAMES_RE = (r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|June?|July?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|"
@@ -2008,7 +2015,8 @@ def score_tag(score: int | None) -> str:
 
 
 def format_alert(c: Candidate, score: int | None, reason: str, now: float | None = None,
-                 risk: PumpRisk | None = None, odds: "JumpOdds | None" = None) -> str:
+                 risk: PumpRisk | None = None, odds: "JumpOdds | None" = None,
+                 mcap: float | None = None) -> str:
     now = time.time() if now is None else now
     lines = [score_tag(score)]
     if odds and odds.golden:
@@ -2016,6 +2024,8 @@ def format_alert(c: Candidate, score: int | None, reason: str, now: float | None
     head = f"<b>{esc(c.ticker or '—')}</b>"
     if c.company:
         head += f" | {esc(c.company)}"
+    if mcap:
+        head += f" · שווי {fmt_money(mcap)}"
     lines.append(head)
     if c.source == "sec":
         if c.items:
@@ -2080,6 +2090,7 @@ class Radar:
         self.pending_status = False
         self.prices: dict[str, tuple[float, float, float]] = {}    # ticker -> (fetched at, price, 5-day change)
         self.sec_cache: dict[str, tuple[float, Any]] = {}
+        self.mcaps: dict[str, tuple[float, float | None]] = {}     # ticker -> (computed at, market cap)
         self.jump_model = load_jump_model() if cfg.jump_model else None
         self.momentum_checked: dict[str, float] = {}
         self.momentum_scan_at = 0.0
@@ -2513,6 +2524,33 @@ class Radar:
         self.sec_cache[url] = (time.time(), data)
         return data
 
+    async def market_cap(self, ticker: str, price: float | None = None) -> float | None:
+        """Shares outstanding (SEC, the company's latest cover page) x price (Yahoo), cached 6 hours."""
+        cached = self.mcaps.get(ticker)
+        if cached and time.time() - cached[0] < 6 * 3600 and price is None:
+            return cached[1]
+        found = self.tickers.lookup(ticker)
+        if not found:
+            return None
+        facts = await self.sec_json(SEC_SHARES_URL.format(cik=found[0]), max_age=86400)
+        units = ((facts or {}).get("units") or {}).get("shares") or []
+        shares = float(max(units, key=lambda u: u.get("end", ""))["val"]) if units else None
+        if price is None:
+            quote_ = await self.daily_quote(ticker)
+            price = quote_[0] if quote_ else None
+        mcap = price * shares if price and shares else None
+        self.mcaps[ticker] = (time.time(), mcap)
+        return mcap
+
+    async def big_enough(self, ticker: str | None, price: float | None = None) -> tuple[bool, float | None]:
+        """(passes MIN_MARKET_CAP, market cap). Unknown size does not pass while a minimum is set."""
+        if not ticker:
+            return self.cfg.min_market_cap <= 0, None
+        mcap = await self.market_cap(ticker, price)
+        if self.cfg.min_market_cap <= 0:
+            return True, mcap
+        return mcap is not None and mcap >= self.cfg.min_market_cap, mcap
+
     async def jump_odds(self, c: Candidate, score: int | None, risk: PumpRisk | None) -> JumpOdds | None:
         """The past year's jump rate for news like this one (data/jump_model.json); None without a model."""
         model = self.jump_model
@@ -2580,6 +2618,11 @@ class Radar:
         if not self.chat_id:
             log.warning("No TELEGRAM_CHAT_ID yet — cannot send alert for %s", key)
             return
+        big, mcap = await self.big_enough(c.ticker) if not c.watch else (True, None)
+        if not big:
+            log.info("Too small %s (market cap %s): %s", c.ticker, fmt_money(mcap) if mcap else "unknown",
+                     c.title or c.items)
+            return
         risk = await self.pump_risk(c) if self.cfg.pump_check and score is not None else None
         odds = await self.jump_odds(c, score, risk) if self.jump_model and score is not None else None
         if score is not None and not self.should_alert(score, odds):
@@ -2592,7 +2635,7 @@ class Radar:
         self.state.last_alert[key] = now
         self.state.dirty = True
         try:
-            await self.tg.send(self.chat_id, format_alert(c, score, reason, now, risk, odds))
+            await self.tg.send(self.chat_id, format_alert(c, score, reason, now, risk, odds, mcap))
             self.stats["alerts"] += 1
             log.info("ALERT %s score=%s jump=%s %s", key, score, f"{odds.probability:.2f}" if odds else "-",
                      c.title or c.items)
@@ -3027,6 +3070,9 @@ class Radar:
                 continue
             hm = dt.datetime.fromtimestamp(h.ts, eastern_tz()).strftime("%H:%M:%S")
             if h.code == "T1":
+                big, mcap = await self.big_enough(h.ticker)
+                if not big:
+                    continue
                 found = self.tickers.lookup(h.ticker)
                 await self.reply(f"⏸ <b>עצירת מסחר: חדשות מהותיות בדרך</b>\n<b>{esc(h.ticker)}</b>"
                                  + (f" | {esc(found[1])}" if found else "")
@@ -3089,10 +3135,14 @@ class Radar:
         self.reset_momentum_day(today)
         if pct < MOMENTUM_PCT or dollars < MOMENTUM_DOLLAR_VOLUME or ticker in self.state.momentum["tickers"]:
             return
+        big, mcap = await self.big_enough(ticker, price)
+        if not big:
+            return
         start = next((b[0] for b in bars if b[2] >= prev * (1 + MOVE_START_PCT)), bars[-1][0])
         self.state.momentum["tickers"].append(ticker)
         self.state.dirty = True
-        await self.reply(self.breakout_text(ticker, pct, price, dollars, start, await self.recent_headlines(ticker), note))
+        await self.reply(self.breakout_text(ticker, pct, price, dollars, start, await self.recent_headlines(ticker),
+                                            note, mcap))
         log.info("BREAKOUT %s +%.0f%% ($%.0f traded)", ticker, pct, dollars)
 
     def reset_momentum_day(self, day: dt.date) -> None:
@@ -3112,11 +3162,11 @@ class Radar:
         return sorted((n for n in items if time.time() - n["pub"] <= 72 * 3600 and n["title"]), key=lambda n: n["pub"])
 
     def breakout_text(self, ticker: str, pct: float, price: float, dollars: float, start: float,
-                      web_news: list[dict[str, Any]] | None = None, note: str = "") -> str:
+                      web_news: list[dict[str, Any]] | None = None, note: str = "", mcap: float | None = None) -> str:
         tz = eastern_tz()
         hm = lambda t: dt.datetime.fromtimestamp(t, tz).strftime("%H:%M")  # noqa: E731
         found = self.tickers.lookup(ticker)
-        head = f"<b>{esc(ticker)}</b>" + (f" | {esc(found[1])}" if found else "")
+        head = f"<b>{esc(ticker)}</b>" + (f" | {esc(found[1])}" if found else "") + (f" · שווי {fmt_money(mcap)}" if mcap else "")
         minutes = max(0, (time.time() - start) / 60)
         tag = ("🟢 <b>תחילת זינוק</b> (המניה התחילה לעלות עכשיו)" if pct < 25 and minutes <= 20
                else "🚀 <b>זינוק בתהליך</b> (המניה כבר עולה, זו לא תחזית)")

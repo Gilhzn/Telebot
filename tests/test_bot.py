@@ -175,6 +175,7 @@ class World:
 def make_cfg(tmp: Path, **overrides: Any) -> bot.Config:
     overrides.setdefault("guru_alerts", "gurus" in overrides)   # off unless a test sets gurus
     overrides.setdefault("jump_model", False)                  # tests set a model explicitly
+    overrides.setdefault("min_market_cap", 0.0)                # size filter tested on its own
     cfg = bot.Config(
         telegram_token="123:ABC",
         chat_id="42",
@@ -1918,3 +1919,37 @@ class AlpacaNewsTest(unittest.TestCase):
             self.assertIn("Benzinga", texts[0])
 
         run(scenario())
+
+
+class MarketCapTest(unittest.TestCase):
+    def world(self, shares: float) -> World:
+        w = base_world()
+        w.set(bot.YAHOO_DAILY_URL.format(symbol="OKLO"), {"chart": {"result": [{
+            "meta": {"regularMarketPrice": 50.0}, "timestamp": [], "indicators": {"quote": [{"close": []}]}}]}})
+        w.set(bot.SEC_SHARES_URL.format(cik=1849056), {"units": {"shares": [
+            {"end": "2025-12-31", "val": 1}, {"end": "2026-06-30", "val": shares}]}})
+        return w
+
+    def alerts(self, shares: float) -> list[str]:
+        async def scenario() -> list[str]:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = self.world(shares)
+            async with w.client() as client:
+                radar = bot.Radar(make_cfg(Path(tmp.name), min_market_cap=1e9), client)
+                await radar.refresh_tickers()
+                radar.handle_alpaca_news(AlpacaNewsTest.MSG)
+                await radar.drain(5)
+            return [m["text"] for m in w.sent]
+        return run(scenario())
+
+    def test_large_company_alerts_with_its_size(self) -> None:
+        texts = self.alerts(40_000_000)                     # 40M x $50 = $2.0B
+        self.assertEqual(len(texts), 1, texts)
+        self.assertIn("שווי $2.0B", texts[0])
+
+    def test_small_company_is_skipped(self) -> None:
+        self.assertEqual(self.alerts(10_000_000), [])       # $500M
+
+    def test_money_format(self) -> None:
+        self.assertEqual([bot.fmt_money(v) for v in (5e8, 2.04e9, 3.1e12)], ["$500M", "$2.0B", "$3.1T"])
