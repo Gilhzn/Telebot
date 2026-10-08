@@ -1722,3 +1722,25 @@ class JumpModelTest(unittest.TestCase):
         p.write_text(json.dumps(self.MODEL), encoding="utf-8")
         self.assertEqual(bot.load_jump_model(p)["vocab_set"], {"contract"})
         self.assertIsNone(bot.load_jump_model(Path(tmp.name) / "missing.json"))
+
+
+class TakeoverTargetTest(unittest.TestCase):
+    def test_acquirer_release_alerts_on_the_target(self) -> None:
+        async def scenario() -> None:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            async with base_world().client() as client:
+                radar = bot.Radar(make_cfg(Path(tmp.name)), client)
+                await radar.refresh_tickers()
+                c = bot.Candidate(source="wire", source_label="PR Newswire", ticker="TEVA", company="Teva",
+                                  title="Teva Agrees To Acquire Oklo Inc., Advancing Its Energy Strategy",
+                                  link="https://www.prnewswire.com/x", published_ts=None, watch=False)
+                t = radar.takeover_target(c)
+                assert t is not None
+                self.assertEqual((t.ticker, t.link), ("OKLO", c.link))
+                self.assertGreaterEqual(bot.rule_score(t.title, t.company, strong_text=t.title, title=t.title).score, 5)
+                self.assertIsNone(radar.takeover_target(t))                       # no loop
+                for title in ("Teva to Acquire Assets of Oklo Inc.", "Teva Reports Results"):
+                    self.assertIsNone(radar.takeover_target(bot.Candidate(**{**c.__dict__, "title": title})))
+
+        run(scenario())

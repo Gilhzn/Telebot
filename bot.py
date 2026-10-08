@@ -946,6 +946,8 @@ def format_guru_changes(guru: tuple[int, str, str], filing: dict[str, str], cur:
 # ---------------------------------------------------------------------------
 
 YAHOO_SPARK_URL = "https://query1.finance.yahoo.com/v8/finance/spark?symbols={symbols}&range={range}&interval=1d"
+TAKEOVER_RE = re.compile(r"\b(?:to acquire|agrees? to acquire|will acquire|to buy|completes? (?:the )?acquisition of|"
+                         r"enters? into (?:a )?definitive (?:merger )?agreement to acquire)\s+(.{3,80})", re.I)
 YAHOO_NEWS_URL = "https://query1.finance.yahoo.com/v1/finance/search?q={symbol}&newsCount={count}&quotesCount=0"
 RESEARCH_HEADERS = {"User-Agent": "StockNewsRadar/1.0 (+https://github.com/Gilhzn/Telebot)",
                     "Accept": "application/json"}
@@ -2330,8 +2332,22 @@ class Radar:
         return JumpOdds(jump_probability(weights, feats), float(model.get("base_rate", 0.05)),
                         explain_features(weights, feats))
 
+    def takeover_target(self, c: Candidate) -> Candidate | None:
+        """"Viatris Agrees To Acquire Pacira BioSciences": the jump is in the target, whose ticker the
+        acquirer's release is not filed under. The same item, re-addressed to the listed target."""
+        m = TAKEOVER_RE.search(c.title) if c.source == "wire" and c.title else None
+        target = self.tickers.match_title(m.group(1)) if m else None
+        found = self.tickers.lookup(target) if target else None
+        if not found or target == c.ticker:
+            return None
+        return Candidate(**{**c.__dict__, "ticker": target, "company": found[1], "watch": False})
+
     async def process(self, c: Candidate) -> None:
         self.stats["candidates"] += 1
+        target = self.takeover_target(c)
+        if target:
+            log.info("Takeover: %s's news names target %s", c.ticker, target.ticker)
+            self.spawn(self.process(target))
         score: int | None = None
         reason = ""
         if self.cfg.positive_only or not c.watch:
