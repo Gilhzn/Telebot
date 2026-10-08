@@ -1,4 +1,5 @@
-# Latency probe: which public channel lists new press releases first (RSS vs newsroom pages).
+# Latency probes: which public channel lists new press releases first (RSS vs newsroom pages).
+# .github/probe-request: "race SECONDS" runs tools/source_race.py, anything else tools/latency_probe.py.
 # Separate from radar.yml so it never blocks the bot's own runs. Trigger: change
 # .github/probe-request and push, or Run workflow.
 name: probe
@@ -11,10 +12,18 @@ permissions:
 jobs:
   latency:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 40
+    env:
+      SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with: {python-version: "3.12", cache: pip}
       - run: pip install -r requirements.txt
-      - run: python tools/latency_probe.py 200
+      - name: run
+        run: |
+          set -- $(awk 'NF {print; exit}' .github/probe-request)
+          case "${1:-}" in
+            race) python tools/source_race.py "${2:-1200}" ;;   # every channel, halts included
+            *) python tools/latency_probe.py 200 ;;
+          esac
