@@ -13,9 +13,9 @@ import bot  # noqa: E402
 
 UA = {"User-Agent": "StockNewsRadar/1.0 (+https://github.com/Gilhzn/Telebot)", "Accept": "application/json, text/html"}
 URLS = [
-    "https://query1.finance.yahoo.com/v8/finance/spark?symbols=AAPL,SXTC,TSLA,NVDA,AMD,INTC,GRAB,NU,BULL,SMCI,CAT,BSP,APLD,HESM,PENG,BRZE,BKV,NWE,BKH,ALEC,EVH,CCOI,CNXC,ADCT,SSTK,LPCN,BIYA,GIPR,NIVF,SBFM,TOPP,OKLO,KOD,NVTS,IOVA,IVVD,LHX,RTX,BA,VZ,HII,SUGP,VNDA,TEVA,SCYX,LAR,MGLD,CCB,PAAC,ROC&range=5d&interval=1d",
-    "https://feeds.finance.yahoo.com/rss/2.0/headline?s=SXTC,IOVA&region=US&lang=en-US",
-    "https://query1.finance.yahoo.com/v1/finance/search?q=IOVA&newsCount=10&quotesCount=0",
+    "https://query1.finance.yahoo.com/v8/finance/spark?symbols=AAPL,TSLA,NVDA,SXTC,GRAB&range=1d&interval=5m&includePrePost=true",
+    "https://query1.finance.yahoo.com/v8/finance/spark?symbols=AAPL,TSLA,NVDA,SXTC,GRAB&range=1d&interval=1m&includePrePost=true",
+    "https://query1.finance.yahoo.com/v8/finance/chart/TSLA?interval=1m&range=1d&includePrePost=true",
 ]
 for url in URLS:
     t = time.time()
@@ -25,7 +25,18 @@ for url in URLS:
         print(f"\n=== {r.status_code} {len(body)}B {time.time() - t:.1f}s {url} -> {r.url}")
         if "spark" in url:
             data = r.json() if r.status_code == 200 else {}
-            print("symbols returned:", len(data), sorted(data)[:60])
+            print("symbols returned:", len(data))
+            for sym, d in data.items():
+                ts = d.get("timestamp") or []
+                cl = d.get("close") or []
+                print(f"   {sym}: prev={d.get('chartPreviousClose')} bars={len(ts)} last_ts={ts[-1] if ts else None} "
+                      f"({time.strftime('%H:%M', time.gmtime(ts[-1] - 4 * 3600)) if ts else ''} ET) last={cl[-1] if cl else None}")
+        elif "/chart/" in url:
+            res = (r.json().get("chart", {}).get("result") or [{}])[0]
+            ts = res.get("timestamp") or []
+            m = res.get("meta", {})
+            print("chart:", len(ts), "bars; last", time.strftime('%H:%M', time.gmtime(ts[-1] - 4 * 3600)) if ts else None,
+                  "ET; prev", m.get("chartPreviousClose"), "regularMarketPrice", m.get("regularMarketPrice"))
         elif "rss" in url or "search" in url:
             print(re.sub(r"\s+", " ", body[:2500]))
         else:
