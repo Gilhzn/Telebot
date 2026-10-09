@@ -1996,3 +1996,22 @@ class DeployedJumpModelTest(unittest.TestCase):
              "headline": "Declares Quarterly Cash Dividend"}, model["vocab_set"]))
         self.assertGreater(good, model["base_rate"])
         self.assertLess(dull, model["mute_below"])
+
+
+class CompanyNamedTest(unittest.TestCase):
+    def test_benzinga_tag_must_be_the_headline_company(self) -> None:
+        async def scenario() -> list[str]:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = base_world()
+            async with w.client() as client:
+                radar = bot.Radar(make_cfg(Path(tmp.name)), client)
+                await radar.refresh_tickers()
+                self.assertTrue(radar.tickers.names_company("OKLO", "Oklo Awarded $450 Million Contract"))
+                self.assertFalse(radar.tickers.names_company("TEVA", "Oklo Awarded $450 Million Contract"))
+                radar.handle_alpaca_news({**AlpacaNewsTest.MSG, "id": 1, "symbols": ["TEVA"]})   # wrong tag
+                radar.handle_alpaca_news({**AlpacaNewsTest.MSG, "id": 2,
+                                          "headline": "Full Transcript: Oklo Q3 2026 Earnings Call"})
+                await radar.drain(5)
+            return [m["text"] for m in w.sent]
+        self.assertEqual(run(scenario()), [])

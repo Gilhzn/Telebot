@@ -60,7 +60,9 @@ MOVERS_RECHECK_SECONDS = 180
 # Benzinga's own write-ups about moves that already happened, not news.
 BENZINGA_SKIP_RE = re.compile(r"stocks? moving|movers|here are|price target|analyst|shares are trading|"
                               r"why .{1,40} (?:shares|stock) (?:is|are)|trading (?:higher|lower)|"
-                              r"options activity|short interest|earnings preview|what's going on", re.I)
+                              r"options activity|short interest|earnings preview|what's going on|transcript|"
+                              r"earnings call|conference call|\bexpects?\b|\bsays\b|\bsees\b|reportedly|"
+                              r"according to|invested in|would be worth|\bwhat to know\b", re.I)
 PRN_LIST_URL = "https://www.prnewswire.com/news-releases/news-releases-list/?page=1&pagesize=25"
 DEFAULT_WIRE_FEEDS = ",".join([
     PRN_LIST_URL,                 # the newsroom page lists every release ~20-80s before the RSS feed
@@ -1786,6 +1788,17 @@ class TickerMap:
     def lookup(self, ticker: str) -> tuple[int, str] | None:
         return self.by_ticker.get(normalize_ticker(ticker))
 
+    def names_company(self, ticker: str, text: str) -> bool:
+        """Whether the text names the ticker's company (its first distinctive name word), e.g.
+        "Transocean Receives ..." names RIG (Transocean Ltd.) but not EQNR (Equinor ASA)."""
+        found = self.lookup(ticker)
+        if not found:
+            return False
+        words = [w for w in normalize_company(found[1]).split() if w not in GENERIC_NAMES]
+        if not words or len(words[0]) < 3:
+            return True    # nothing distinctive to look for
+        return re.search(rf"\b{re.escape(words[0])}", text, I) is not None or ticker in text
+
     def tickers_for_cik(self, cik: int) -> list[str]:
         return self.by_cik.get(cik, [])
 
@@ -2335,9 +2348,9 @@ class Radar:
             self.state.mark_seen(k)
         self._source_ok(ALPACA_SOURCE)
         self.stats["checked"] += 1
-        listed = [t for t in it.tickers if self.tickers.lookup(t)]
+        listed = [t for t in it.tickers if self.tickers.lookup(t) and self.tickers.names_company(t, it.title)]
         if not listed:
-            return
+            return    # Benzinga tags stories with related tickers; the alert must be about the company itself
         cand = self.wire_candidate(WireItem(it.key, it.title, it.link, it.summary[:500], it.published_ts, listed),
                                    ALPACA_SOURCE)
         if cand is None:
@@ -2353,9 +2366,10 @@ class Radar:
         except Exception as exc:  # noqa: BLE001
             log.info("%s: release page %s unavailable: %s", source_name, it.link, describe_error(exc))
             return
-        tickers = extract_tickers(body[:4000])
+        tickers = [t for t in extract_tickers(body[:4000])
+                   if self.tickers.names_company(t, f"{it.title}\n{body[:600]}")]
         if not tickers:
-            return  # no US exchange ticker: private or non-US company
+            return  # no US exchange ticker of the releasing company: private or non-US company
         cand = self.wire_candidate(WireItem(it.key, it.title, it.link, it.summary, it.published_ts, tickers),
                                    source_name)
         if cand is None:
