@@ -2015,3 +2015,41 @@ class CompanyNamedTest(unittest.TestCase):
                 await radar.drain(5)
             return [m["text"] for m in w.sent]
         self.assertEqual(run(scenario()), [])
+
+
+class PremarketLargeCapTest(unittest.TestCase):
+    def test_snapshot_reference_close(self) -> None:
+        d = __import__("datetime")
+        data = {"OKLO": {"latestTrade": {"p": 55.0}, "dailyBar": {"t": "2026-10-08T04:00:00Z", "c": 50.0},
+                         "prevDailyBar": {"t": "2026-10-07T04:00:00Z", "c": 40.0}},
+                "TEVA": {"latestTrade": {"p": 22.0}, "dailyBar": {"t": "2026-10-09T04:00:00Z", "c": 21.0},
+                         "prevDailyBar": {"t": "2026-10-08T04:00:00Z", "c": 20.0}}}
+        moves = bot.snapshot_moves(data, d.date(2026, 10, 9))
+        self.assertAlmostEqual(moves["OKLO"], 10.0)    # pre-market: vs yesterday's close
+        self.assertAlmostEqual(moves["TEVA"], 10.0)    # today's bar exists: vs the day before
+
+    def test_large_caps_built_and_scanned(self) -> None:
+        d = __import__("datetime")
+
+        async def scenario() -> list[str]:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = base_world()
+            w.routes["https://query1.finance.yahoo.com/v8/finance/spark?*"] = (200, {
+                "OKLO": {"close": [48.0, 50.0]}, "TEVA": {"close": [19.0, 20.0]}})
+            w.routes["https://data.sec.gov/api/xbrl/frames/*"] = (200, {"data": [
+                {"cik": 1849056, "end": "2026-06-30", "val": 40_000_000},     # $2.0B
+                {"cik": 4444444, "end": "2026-06-30", "val": 10_000_000}]})   # $200M
+            w.routes["https://data.alpaca.markets/v2/stocks/snapshots?*"] = (200, {
+                "OKLO": {"latestTrade": {"p": 56.0}, "dailyBar": {"t": "2026-10-08T04:00:00Z", "c": 50.0},
+                         "prevDailyBar": {"c": 48.0}}})
+            async with w.client() as client:
+                radar = bot.Radar(make_cfg(Path(tmp.name), min_market_cap=1e9, alpaca_key_id="k",
+                                           alpaca_secret="s"), client)
+                await radar.refresh_tickers()
+                with mock.patch.object(bot, "SEC_MIN_INTERVAL", 0.0), \
+                        mock.patch.object(bot.asyncio, "sleep", new=mock.AsyncMock()):
+                    await radar.refresh_runners(d.date(2026, 10, 9))
+                self.assertEqual(radar.state.runners["large"], ["OKLO"])
+                return await radar.premarket_large_movers(d.date(2026, 10, 9))
+        self.assertEqual(run(scenario()), ["OKLO"])
