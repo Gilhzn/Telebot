@@ -61,6 +61,8 @@ ALPACA_SNAPSHOTS_URL = "https://data.alpaca.markets/v2/stocks/snapshots?symbols=
 SNAPSHOT_BATCH = 200
 PREMARKET_SCAN_SECONDS = 300      # $1B+ companies before the open / after the close (15-minute delayed prices)
 PREMARKET_CANDIDATE_PCT = 8.0     # then confirmed live (Yahoo, 1-minute bars) at MOMENTUM_PCT
+LIVE_SCAN_SECONDS = 60            # regular session: $1B+ companies every minute (Alpaca, live IEX trades)
+LARGE_GAINER_PCT = 10.0           # the daily study's threshold for $1B+ companies (20%+ is rare for them)
 # Benzinga's own write-ups about moves that already happened, not news.
 BENZINGA_SKIP_RE = re.compile(r"stocks? moving|movers|here are|price target|analyst|shares are trading|"
                               r"why .{1,40} (?:shares|stock) (?:is|are)|trading (?:higher|lower)|"
@@ -1144,7 +1146,15 @@ def learning_summary(log_entries: list[dict[str, Any]]) -> str:
     with_ours = [e for e in log_entries if e.get("news_src") and e.get("seen")]
     elsewhere = [e for e in log_entries if e.get("news_src") and not e.get("seen")]
     none = [e for e in log_entries if not e.get("news_src")]
-    lines = [f"📚 <b>מה למדתי עד עכשיו</b> ({len(days)} ימי מסחר, {n} מניות שעלו {GAINERS_MIN_PCT:.0f}%+)",
+    big = [e for e in log_entries if e.get("large")]
+    if big:      # alerts are for $1B+ companies: learn from those
+        log_entries, n = big, len(big)
+        days = sorted({e["date"] for e in log_entries})
+        with_ours = [e for e in log_entries if e.get("news_src") and e.get("seen")]
+        elsewhere = [e for e in log_entries if e.get("news_src") and not e.get("seen")]
+        none = [e for e in log_entries if not e.get("news_src")]
+    what = (f"חברות של מיליארד ומעלה שעלו {LARGE_GAINER_PCT:.0f}%+" if big else f"מניות שעלו {GAINERS_MIN_PCT:.0f}%+")
+    lines = [f"📚 <b>מה למדתי עד עכשיו</b> ({len(days)} ימי מסחר, {n} {what})",
              f"• עם חדשות שהבוט ראה: {len(with_ours)} ({len(with_ours) * 100 // n}%)",
              f"• חדשות שהבוט לא ראה (מקור שלא במעקב או שפורסם קודם במקום אחר): {len(elsewhere)} "
              f"({len(elsewhere) * 100 // n}%)",
@@ -1178,7 +1188,11 @@ def learning_summary(log_entries: list[dict[str, Any]]) -> str:
         lines.append(f"• התריע לפני תחילת הזינוק: {len(before)}" +
                      (f" (חציון {_median([e['bot_lead_min'] for e in before]):.0f} דק' לפני)" if before else ""))
         lines.append(f"• התריע אחרי שהזינוק התחיל: {len(after)}")
-        lines.append(f"• לא התריע (ציון נמוך או נפסל): {len(missed)}")
+        unseen = [e for e in missed if not e.get("seen")]
+        if unseen:
+            lines.append(f"• לא התריע כי הידיעה לא הגיעה למקורות של הבוט: {len(unseen)}")
+        if len(missed) > len(unseen):
+            lines.append(f"• לא התריע למרות שראה את הידיעה (ציון נמוך או נפסל): {len(missed) - len(unseen)}")
     sess: dict[str, int] = {}
     for e in log_entries:
         if e.get("start"):
@@ -1655,6 +1669,21 @@ def snapshot_moves(data: dict[str, Any], today: dt.date) -> dict[str, float]:
         ref = prev.get("c") if day_date == today else day.get("c")
         if trade.get("p") and ref:
             out[normalize_ticker(sym)] = (float(trade["p"]) / float(ref) - 1) * 100
+    return out
+
+
+def snapshot_day_moves(data: dict[str, Any], today: dt.date) -> dict[str, tuple[float, float, float, float]]:
+    """symbol -> (% change, close, previous close, volume) of today's session from Alpaca snapshots."""
+    out = {}
+    for sym, snap in (data or {}).items():
+        day, prev = ((snap or {}).get(k) or {} for k in ("dailyBar", "prevDailyBar"))
+        try:
+            day_date = dt.datetime.fromisoformat(str(day.get("t", "")).replace("Z", "+00:00")).astimezone(
+                eastern_tz()).date()
+        except ValueError:
+            continue
+        if day_date == today and day.get("c") and prev.get("c"):
+            out[normalize_ticker(sym)] = ((day["c"] / prev["c"] - 1) * 100, day["c"], prev["c"], day.get("v") or 0)
     return out
 
 
@@ -2892,9 +2921,14 @@ class Radar:
         if not self.state.news_log_since or self.state.news_log_since > day_start:
             log.info("Gainers study: news log started mid-day, first study tomorrow")
             return
-        candidates = await self.todays_movers(today)
+        large = set(self.state.runners.get("large") or [])
+        if self.cfg.min_market_cap > 0 and large:
+            # The alerts cover $1B+ companies only, so the study learns from those (10%+ is a big day for them).
+            candidates = [g for g in await self.todays_movers(today, min_pct=LARGE_GAINER_PCT) if g["ticker"] in large]
+        else:
+            candidates = await self.todays_movers(today)
         if not candidates:
-            log.info("Gainers study: no stock up %s%%+ today", GAINERS_MIN_PCT)
+            log.info("Gainers study: no stock up enough today")
             return
         studied = []
         for g in candidates[:GAINERS_TOP * 2]:
@@ -2906,6 +2940,7 @@ class Radar:
                 log.info("Gainers study for %s failed: %s", g["ticker"], describe_error(exc))
                 continue
             if row and row["volume"] >= GAINERS_MIN_VOLUME:
+                row["large"] = g["ticker"] in large
                 studied.append(row)
             await asyncio.sleep(0.3)
         if not studied:
@@ -2926,6 +2961,11 @@ class Radar:
         """Every listed common share's change today (Yahoo spark, 20 symbols per request)."""
         universe = research_universe(self.tickers) if self.tickers.loaded else []
         moves: dict[str, tuple[float, float, float]] = {}
+        snaps = await self.alpaca_snapshots(universe, "delayed_sip") if universe else {}
+        if snaps:
+            moves = {t: m[:3] for t, m in snapshot_day_moves(snaps, today).items()}
+            universe = []      # Alpaca priced the market in ~35 requests; no need for Yahoo's ~350
+        failed = 0
         for i in range(0, len(universe), SPARK_BATCH):
             batch = ",".join(universe[i:i + SPARK_BATCH])
             try:
@@ -2933,13 +2973,17 @@ class Radar:
                                              headers=RESEARCH_HEADERS, timeout=20)
                 if resp.status_code == 200:
                     moves.update(spark_moves(resp.json(), today))
-                elif resp.status_code == 429:
-                    await asyncio.sleep(10)
+                else:
+                    failed += 1
+                    if resp.status_code == 429:
+                        await asyncio.sleep(10)
             except Exception as exc:  # noqa: BLE001
+                failed += 1
                 log.info("Spark batch failed: %s", describe_error(exc))
             await asyncio.sleep(0.25)
-        log.info("Gainers study: %d symbols priced, %d up %s%%+", len(moves),
-                 sum(1 for m in moves.values() if m[0] >= GAINERS_MIN_PCT), GAINERS_MIN_PCT)
+        log.info("Market moves: %d symbols priced (%s), %d up %s%%+%s", len(moves), "Alpaca" if snaps else "Yahoo",
+                 sum(1 for m in moves.values() if m[0] >= min_pct), min_pct,
+                 f", {failed} Yahoo batches failed" if failed else "")
         return sorted(({"ticker": t, "pct": pct, "price": close, "prev": prev}
                        for t, (pct, close, prev) in moves.items()
                        if pct >= min_pct and close >= GAINERS_MIN_PRICE), key=lambda g: -g["pct"])
@@ -2957,7 +3001,11 @@ class Radar:
             return None
         start = prof.get("start")
         anchor = start or dt.datetime.combine(today, dt.time(16, 0), tzinfo=tz).timestamp()
-        window = (anchor - 24 * 3600, anchor + 15 * 60)
+        # The trigger is news shortly before the move: since the previous close for a move that starts
+        # by 10:00, otherwise the 3 hours before it (an article from the evening before does not
+        # explain a jump at 13:00).
+        early = dt.datetime.fromtimestamp(anchor, tz).time() <= dt.time(10, 0)
+        window = (anchor - (18 * 3600 if early else 3 * 3600), anchor + 15 * 60)
         ours = [{**n, "seen": True} for n in self.state.news_log.get(sym, [])
                 if window[0] <= (n.get("pub") or n["t"]) <= window[1]]
         theirs: list[dict[str, Any]] = []
@@ -2994,7 +3042,10 @@ class Radar:
     def gainers_text(self, studied: list[dict[str, Any]], today: dt.date) -> str:
         tz = eastern_tz()
         hm = lambda t: dt.datetime.fromtimestamp(t, tz).strftime("%H:%M") if t else "—"  # noqa: E731
-        lines = [f"🔥 <b>המזנקות של היום ולמה</b> ({today:%d.%m}, עלייה של {GAINERS_MIN_PCT:.0f}%+, שעון ניו יורק)"]
+        big = any(e.get("large") for e in studied)
+        lines = [f"🔥 <b>המזנקות של היום ולמה</b> ({today:%d.%m}, "
+                 + (f"חברות של מיליארד ומעלה, עלייה של {LARGE_GAINER_PCT:.0f}%+" if big else
+                    f"עלייה של {GAINERS_MIN_PCT:.0f}%+") + ", שעון ניו יורק)"]
         for e in studied:
             head = f"\n<b>{esc(e['ticker'])}</b> {e['pct']:+.0f}%"
             if e.get("peak_pct") is not None:
@@ -3084,11 +3135,16 @@ class Radar:
             if t not in due and t not in self.state.momentum["tickers"] \
                     and now - self.momentum_checked.get(t, 0) >= MOVERS_RECHECK_SECONDS:
                 due.append(t)
-        if session_of(now) == "regular" and now - self.momentum_scan_at >= MOMENTUM_SCAN_SECONDS:
+        live_large = bool(self.cfg.alpaca_key_id and self.state.runners.get("large") and self.cfg.min_market_cap > 0)
+        every = LIVE_SCAN_SECONDS if live_large else MOMENTUM_SCAN_SECONDS
+        if session_of(now) == "regular" and now - self.momentum_scan_at >= every:
             self.momentum_scan_at = now
-            movers = await self.todays_movers(et.date(), min_pct=MOMENTUM_PCT)
-            due += [m["ticker"] for m in movers if m["ticker"] not in due
-                    and m["ticker"] not in self.state.momentum["tickers"]][:50]
+            if live_large:
+                found = await self.large_movers(et.date(), "iex")
+            else:
+                found = [m["ticker"] for m in await self.todays_movers(et.date(), min_pct=MOMENTUM_PCT)]
+            due += [t for t in found if t not in due and t not in self.state.momentum["tickers"]
+                    and now - self.momentum_checked.get(t, 0) >= MOVERS_RECHECK_SECONDS][:50]
         for ticker in due:
             self.momentum_checked[ticker] = now
             await self.check_breakout(ticker, et.date())
@@ -3222,24 +3278,38 @@ class Radar:
     async def premarket_large_movers(self, today: dt.date) -> list[str]:
         """$1B+ companies up PREMARKET_CANDIDATE_PCT+ outside the regular session, from Alpaca's
         15-minute delayed full-market prices (the free plan's live feed has no pre-market)."""
+        return await self.large_movers(today, "delayed_sip")
+
+    async def large_movers(self, today: dt.date, feed: str) -> list[str]:
+        """$1B+ companies up PREMARKET_CANDIDATE_PCT+ since the last close, from Alpaca snapshots
+        ("iex" = live but IEX trades only, "delayed_sip" = every trade, 15 minutes late)."""
         large = self.state.runners.get("large") or []
         if not (self.cfg.alpaca_key_id and self.cfg.alpaca_secret) or not large:
             return []
-        headers = {"APCA-API-KEY-ID": self.cfg.alpaca_key_id, "APCA-API-SECRET-KEY": self.cfg.alpaca_secret}
-        moves: dict[str, float] = {}
-        for i in range(0, len(large), SNAPSHOT_BATCH):
-            symbols = ",".join(t.replace("-", ".") for t in large[i:i + SNAPSHOT_BATCH])
-            try:
-                resp = await self.client.get(ALPACA_SNAPSHOTS_URL.format(symbols=symbols), headers=headers, timeout=15)
-                resp.raise_for_status()
-                moves.update(snapshot_moves(resp.json(), today))
-            except Exception as exc:  # noqa: BLE001
-                log.info("Alpaca snapshots failed: %s", describe_error(exc))
-                return []
+        snaps = await self.alpaca_snapshots(large, feed)
+        moves = snapshot_moves(snaps, today)
         hot = sorted((t for t, pct in moves.items() if pct >= PREMARKET_CANDIDATE_PCT), key=lambda t: -moves[t])
         if hot:
-            log.info("Pre-market $1B+ movers (15-min delayed): %s", ", ".join(f"{t} {moves[t]:+.0f}%" for t in hot[:10]))
+            log.info("$1B+ movers (%s): %s", feed, ", ".join(f"{t} {moves[t]:+.0f}%" for t in hot[:10]))
         return hot
+
+    async def alpaca_snapshots(self, symbols: list[str], feed: str) -> dict[str, Any]:
+        """Alpaca snapshots for many symbols, 200 per request; {} without keys or on failure."""
+        if not (self.cfg.alpaca_key_id and self.cfg.alpaca_secret):
+            return {}
+        headers = {"APCA-API-KEY-ID": self.cfg.alpaca_key_id, "APCA-API-SECRET-KEY": self.cfg.alpaca_secret}
+        out: dict[str, Any] = {}
+        for i in range(0, len(symbols), SNAPSHOT_BATCH):
+            batch = ",".join(t.replace("-", ".") for t in symbols[i:i + SNAPSHOT_BATCH])
+            url = ALPACA_SNAPSHOTS_URL.replace("feed=delayed_sip", f"feed={feed}").format(symbols=batch)
+            try:
+                resp = await self.client.get(url, headers=headers, timeout=15)
+                resp.raise_for_status()
+                out.update(resp.json())
+            except Exception as exc:  # noqa: BLE001
+                log.info("Alpaca snapshots (%s) failed: %s", feed, describe_error(exc))
+                return {}
+        return out
 
     async def check_breakout(self, ticker: str, today: dt.date, note: str = "") -> None:
         known = self.mcaps.get(ticker)

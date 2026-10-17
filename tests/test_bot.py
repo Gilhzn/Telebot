@@ -2053,3 +2053,25 @@ class PremarketLargeCapTest(unittest.TestCase):
                 self.assertEqual(radar.state.runners["large"], ["OKLO"])
                 return await radar.premarket_large_movers(d.date(2026, 10, 9))
         self.assertEqual(run(scenario()), ["OKLO"])
+
+
+class StudyAlignmentTest(unittest.TestCase):
+    def test_day_moves_from_snapshots(self) -> None:
+        d = __import__("datetime")
+        data = {"OKLO": {"dailyBar": {"t": "2026-10-16T04:00:00Z", "c": 55.0, "v": 1e6}, "prevDailyBar": {"c": 50.0}},
+                "OLD": {"dailyBar": {"t": "2026-10-15T04:00:00Z", "c": 9.0}, "prevDailyBar": {"c": 5.0}}}
+        moves = bot.snapshot_day_moves(data, d.date(2026, 10, 16))
+        self.assertEqual(set(moves), {"OKLO"})
+        self.assertAlmostEqual(moves["OKLO"][0], 10.0)
+
+    def test_summary_learns_from_large_caps_and_splits_misses(self) -> None:
+        base = {"date": "2026-10-16", "pct": 12.0, "peak_pct": 15.0, "start": 1792170000.0, "price": 40.0,
+                "cat": "דוחות / תחזית", "lead_min": 20, "bot_lead_min": None}
+        log_ = [{**base, "ticker": "AAA", "large": True, "news_src": "Barrons.com", "seen": False},
+                {**base, "ticker": "BBB", "large": True, "news_src": "PR Newswire", "seen": True},
+                {**base, "ticker": "TINY", "large": False, "news_src": "", "seen": False, "pct": 80.0}]
+        text = bot.learning_summary(log_)
+        self.assertIn("2 חברות של מיליארד ומעלה שעלו 10%+", text)
+        self.assertIn("לא התריע כי הידיעה לא הגיעה למקורות של הבוט: 1", text)
+        self.assertIn("לא התריע למרות שראה את הידיעה (ציון נמוך או נפסל): 1", text)
+        self.assertNotIn("TINY", text)
