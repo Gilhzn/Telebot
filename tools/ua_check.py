@@ -13,7 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import bot  # noqa: E402
 
 GLOBE = next(u for u in bot._split(bot.DEFAULT_WIRE_FEEDS) if "orgclass" in u)
-URLS = [GLOBE, "https://www.globenewswire.com/RssFeed/industry/9576-Semiconductors/feedTitle/x",
+URLS = [GLOBE, "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeGVtRWA==",
+        "https://www.prnewswire.com/rss/news-releases-list.rss", "https://www.globenewswire.com/RssFeed/industry/9576-Semiconductors/feedTitle/x",
         "https://www.globenewswire.com/newsroom", bot.PRN_LIST_URL,
         "https://query1.finance.yahoo.com/v8/finance/spark?symbols=AAPL,MSFT,NVDA,TSLA,AMD&range=5d&interval=1d"]
 AGENTS = {
@@ -48,7 +49,7 @@ for i in range(40):
         st[r.status_code] = st.get(r.status_code, 0) + 1
         if r.status_code == 200 and i == 0:
             print("\nspark symbols returned:", len(r.json()))
-    except Exception as exc:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
         st[0] = st.get(0, 0) + 1
     time.sleep(0.25)
 print("spark statuses over 40 quick batches:", st)

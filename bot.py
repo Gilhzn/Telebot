@@ -96,7 +96,8 @@ DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 
 # An honest RSS-reader identity. Wire sites' bot protection drops requests that claim
 # to be a browser without behaving like one (seen from GitHub Actions: timeouts / 503).
-WIRE_USER_AGENT = "StockNewsRadar/1.0 (personal RSS reader; +https://github.com/Gilhzn/Telebot)"
+# An honest name, without a link: GlobeNewswire's Akamai refuses agents that carry a URL (403).
+WIRE_USER_AGENT = "StockNewsRadar-RSS/1.0"
 WIRE_HEADERS = {
     "Accept": "application/rss+xml, application/xml;q=0.9, text/html;q=0.8, */*;q=0.7",
     "Accept-Language": "en-US,en;q=0.9",

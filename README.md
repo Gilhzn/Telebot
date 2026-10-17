@@ -105,7 +105,7 @@ python bot.py               # הרצה רציפה
 | `EDGAR_POLL_SECONDS` | `2` | תדירות דגימת EDGAR |
 | `WIRE_POLL_SECONDS` | `10` | תדירות דגימת הוואיירים |
 | `WIRE_FEEDS` | 16 פידים: PR Newswire (כללי + 7 תחומים), GlobeNewswire (חברות ציבוריות + Health Care, Biotechnology, Pharmaceuticals, Semiconductors, Defense, Aerospace), Business Wire | כתובות RSS מופרדות בפסיקים. כל פיד מחזיק רק כ-20 פריטים, ופידים לפי תחום שומרים יותר היסטוריה בין דגימה לדגימה. ב-Business Wire הטיקר כמעט לא מופיע בפיד, ולכן הבוט מזהה אותו לפי שם החברה בתחילת הכותרת (התאמה מדויקת לשם ברשימת ה-SEC) |
-| `WIRE_USER_AGENT` | `StockNewsRadar/1.0 (...)` | הזיהוי מול אתרי הוואיירים. אתרים חוסמים זיהוי מזויף של דפדפן |
+| `WIRE_USER_AGENT` | `StockNewsRadar-RSS/1.0` | הזיהוי מול אתרי הוואיירים: שם אמיתי של הבוט, בלי קישור. GlobeNewswire חוסם זיהוי שמכיל כתובת אתר, ואתרים חוסמים גם זיהוי מזויף של דפדפן |
 | `DEDUP_HOURS` | `6` | חלון מניעת כפילות לטיקר |
 | `MAX_ALERTS_PER_CYCLE` | `15` | תקרת מועמדים למחזור לכל מקור |
 | `STATE_FILE` | `state.json` | נתיב קובץ המצב |
