@@ -2075,3 +2075,20 @@ class StudyAlignmentTest(unittest.TestCase):
         self.assertIn("לא התריע כי הידיעה לא הגיעה למקורות של הבוט: 1", text)
         self.assertIn("לא התריע למרות שראה את הידיעה (ציון נמוך או נפסל): 1", text)
         self.assertNotIn("TINY", text)
+
+
+class TakeoverTalksTest(unittest.TestCase):
+    def test_offer_or_talks_for_the_company(self) -> None:
+        t = "Legendary Revives Lionsgate Takeover Talks, Submits Offer"
+        self.assertGreaterEqual(bot.rule_score(t, "Lions Gate Entertainment Corp", strong_text=t, title=t).score, 4)
+        t = "Paramount Receives Unsolicited Takeover Offer From Skydance"
+        self.assertGreaterEqual(bot.rule_score(t, "Paramount Global", strong_text=t, title=t).score, 4)
+        t = "Lionsgate Reports Quarterly Results"
+        self.assertEqual(bot.rule_score(t, "Lions Gate Entertainment Corp", strong_text=t, title=t).score, 0)
+
+    def test_etfs_are_not_in_the_universe(self) -> None:
+        tm = bot.TickerMap()
+        tm.load({"fields": ["cik", "name", "ticker", "exchange"], "data": [
+            [1, "ProShares Ultra VIX Short-Term Futures ETF", "UVXY", "CBOE"], [2, "Roper Technologies", "ROP", "Nasdaq"],
+            [3, "Northern Trust Corp", "NTRS", "Nasdaq"], [4, "Ultra Clean Holdings", "UCTT", "Nasdaq"]]})
+        self.assertEqual(bot.research_universe(tm), ["NTRS", "ROP", "UCTT"])

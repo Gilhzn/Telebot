@@ -587,6 +587,16 @@ def rule_score(text: str, company: str = "", strong_text: str | None = None,
     if target and len(name_key) >= 3 and re.search(rf"\b{re.escape(name_key)}\b", target.group(1), I):
         score += 5
         labels.append("החברה נרכשת")
+    elif len(name_key) >= 3 and (
+            re.search(rf"\b{re.escape(name_key)}\w*(?:'s)?\s+(?:\w+\s+){{0,2}}(?:takeover|buyout|acquisition)\s+"
+                      r"(?:talks|offer|bid|approach|proposal)", strong_text, I)
+            or re.search(rf"\b(?:offer|bid|proposal|approach)\s+(?:for|to (?:acquire|buy|take over))\s+"
+                         rf"(?:\w+\s+){{0,2}}{re.escape(name_key)}", strong_text, I)
+            or re.search(rf"\b{re.escape(name_key)}\w*\s+(?:\w+\s+){{0,3}}(?:receives?|rejects?|weighs?|explores?)\s+"
+                         r"(?:an?\s+)?(?:unsolicited\s+|takeover\s+|buyout\s+|acquisition\s+)?"
+                         r"(?:offer|bid|proposal|approach|sale)", strong_text, I)):
+        score += 4      # Lionsgate +14% within minutes of "Legendary Revives Lionsgate Takeover Talks, Submits Offer"
+        labels.append("הצעת רכש / מגעים להשתלטות על החברה")
     if score > 0:
         company_l = company.lower()
         for m in MEGA_RE.finditer(text):
@@ -992,7 +1002,7 @@ MOVE_START_PCT = 0.10             # the move starts at the first minute 10% abov
 NEWS_LOG_HOURS = 72
 GAINERS_LOG_MAX = 4_000
 LEARNING_READY_DAYS = 10          # trading days of data before the "ready" summary
-SPLIT_ARTIFACT_PCT = 15.0         # a "gain" whose 1-minute bars never rose 15% is a reverse split, not a move
+SPLIT_ARTIFACT_PCT = 15.0         # a "gain" its 1-minute bars never come close to (under 15% / 60% of it) is a reverse split
 MOMENTUM_PCT = 10.0               # "breakout starting": up 10%+ on the previous close (the move's start)
 MOMENTUM_DOLLAR_VOLUME = 100_000  # with at least $100K traded today (no illiquid ticks)
 MOMENTUM_NEWS_HOURS = 18          # watch tickers that had wire news in the last 18 hours
@@ -1043,10 +1053,16 @@ def _pct_number(raw: Any) -> float | None:
         return None
 
 
+ETF_NAME_RE = re.compile(r"\b(?:ETF|ETN|ETFs|Fund|ProShares|Direxion|iShares|SPDR|Invesco(?! Ltd)|VanEck|Grayscale|"
+                         r"GraniteShares|Tradr|Defiance|Leverage Shares|2X|3X|-1X)\b", I)
+
+
 def research_universe(tickers: "TickerMap") -> list[str]:
-    """Exchange-listed common shares: no warrants, units or rights (5-letter symbols ending W/U/R)."""
-    return sorted(t for t in tickers.by_ticker
-                  if re.fullmatch(r"[A-Z]{1,5}(?:-[A-Z])?", t) and not (len(t) == 5 and t[-1] in "WUR"))
+    """Exchange-listed operating companies' common shares: no warrants, units or rights (5-letter
+    symbols ending W/U/R) and no ETFs / leveraged products (a 3x VIX fund's +15% is not news)."""
+    return sorted(t for t, (_, name) in tickers.by_ticker.items()
+                  if re.fullmatch(r"[A-Z]{1,5}(?:-[A-Z])?", t) and not (len(t) == 5 and t[-1] in "WUR")
+                  and not ETF_NAME_RE.search(name))
 
 
 def spark_moves(data: dict[str, Any], day: dt.date) -> dict[str, tuple[float, float, float]]:
@@ -2996,7 +3012,7 @@ class Radar:
                                                             interval=1), headers=RESEARCH_HEADERS, timeout=20)
         bars = parse_yahoo_chart(resp.json()) if resp.status_code == 200 else []
         prof = move_profile([(b[0], b[2]) for b in bars], g["prev"])
-        if bars and (prof.get("peak_pct") or 0) < SPLIT_ARTIFACT_PCT:
+        if bars and (prof.get("peak_pct") or 0) < min(SPLIT_ARTIFACT_PCT, g["pct"] * 0.6):
             log.info("Gainers study: %s +%.0f%% is not a real move (reverse split?)", sym, g["pct"])
             return None
         start = prof.get("start")
