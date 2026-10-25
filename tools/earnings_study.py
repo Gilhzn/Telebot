@@ -36,54 +36,12 @@ from catalysts import outcome  # noqa: E402
 OUT = Path("backtest-out/earnings")
 DATA = "https://data.alpaca.markets"
 KEEP_RE = re.compile(r"\bEPS\b|\bSales\b.*\bEst|\bGuidance\b|\bOutlook\b|\bSees\b|\bRaises\b|\bLowers\b|\bCuts\b", re.I)
-NUM = r"\(?-?\$?\(?-?[\d,]*\.?\d+\)?"
-EPS_RE = re.compile(rf"\bEPS\s+(?P<a>{NUM})\s+(?P<v>Beats|Misses|In-Line|Up|Down|Vs\.?)\s*(?:With\s+)?(?P<e>{NUM})?", re.I)
-SALES_RE = re.compile(rf"\b(?:Sales|Revenue)\s+(?P<a>{NUM})\s*(?P<au>[KMB])?\s+(?P<v>Beat|Beats|Miss|Misses|In-Line|Up|Down|Vs\.?)"
-                      rf"\s*(?:With\s+)?(?P<e>{NUM})?\s*(?P<eu>[KMB])?", re.I)
-GUIDE_UP_RE = re.compile(r"\b(?:Raises|Boosts|Lifts|Increases|Ups)\b.{0,40}\b(?:Guidance|Outlook|Forecast|Sees)|"
-                         r"\bSees\b.{0,80}\b(?:Above|Ahead of|Vs)\b.{0,40}\bEst", re.I)
-GUIDE_DOWN_RE = re.compile(r"\b(?:Lowers|Cuts|Reduces|Trims|Withdraws)\b.{0,40}\b(?:Guidance|Outlook|Forecast)|"
-                           r"\bSees\b.{0,80}\bBelow\b", re.I)
-
-
 def log(msg: str) -> None:
     print(f"{time.strftime('%H:%M:%S')} {msg}", flush=True)
 
 
-def money(s: str | None) -> float | None:
-    if not s:
-        return None
-    neg = "(" in s or s.strip().startswith("-") or "$-" in s
-    try:
-        v = float(re.sub(r"[^\d.]", "", s))
-    except ValueError:
-        return None
-    return -v if neg else v
-
-
-def parse_headlines(heads: list[str]) -> dict[str, Any]:
-    """EPS / sales surprise and guidance direction from one company's results headlines."""
-    out: dict[str, Any] = {}
-    for h in heads:
-        m = EPS_RE.search(h)
-        if m and "eps_a" not in out:
-            a, e = money(m.group("a")), money(m.group("e"))
-            out["eps_a"], out["eps_e"] = a, e
-            if a is not None and e is not None:
-                out["eps_s"] = (a - e) / max(abs(e), 0.05)
-        m = SALES_RE.search(h)
-        if m and "sales_a" not in out:
-            unit = {"K": 1e3, "M": 1e6, "B": 1e9}
-            a, e = money(m.group("a")), money(m.group("e"))
-            if a is not None and e:
-                a *= unit.get((m.group("au") or "").upper(), 1)
-                e *= unit.get((m.group("eu") or m.group("au") or "").upper(), 1)
-                out["sales_s"] = a / e - 1 if e else None
-        if GUIDE_UP_RE.search(h):
-            out["guide"] = "up" if out.get("guide") in (None, "up") else "mixed"
-        if GUIDE_DOWN_RE.search(h):
-            out["guide"] = "down" if out.get("guide") in (None, "down") else "mixed"
-    return out
+parse_headlines = bot.earnings_signal     # the bot's own parser, so the study measures what the bot sees
+EPS_RE, SALES_RE = bot.EPS_HEAD_RE, bot.SALES_HEAD_RE
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +175,8 @@ def down(r: dict[str, Any]) -> bool:
 
 
 def report(rows: list[dict[str, Any]]) -> None:
-    big = [r for r in rows if (r.get("mcap") or 0) >= 1e9]
+    big = [{**r, **{k: None for k in ("eps_s", "sales_s", "guide")}, **parse_headlines(r["heads"])}
+           for r in rows if (r.get("mcap") or 0) >= 1e9]
     lines = [f"# Earnings headlines and the reaction, $1B+ companies ({len(big)} results days)", "",
              "up = +10% high within two days and +5% at the reaction day's close; down = -5% close", "",
              "| group | n | up | down | median close |", "|---|---|---|---|---|"]

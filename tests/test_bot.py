@@ -2100,3 +2100,38 @@ class EarningsRulesTest(unittest.TestCase):
         self.assertLess(bot.rule_score(t, "Acme Inc", strong_text=t, title=t).score, 4)
         t = "Acme Reports Third Quarter 2026 Results and Raises Full-Year Guidance"
         self.assertGreaterEqual(bot.rule_score(t, "Acme Inc", strong_text=t, title=t).score, 4)
+
+
+class EarningsSurpriseTest(unittest.TestCase):
+    def test_table(self) -> None:
+        beat = bot.earnings_signal(["Acme Q3 Adj. EPS $0.30 Beats $0.25 Estimate, Sales $1.050B Beat $1.000B Estimate"])
+        self.assertEqual(bot.earnings_score(beat)[0], 4)
+        both = bot.earnings_signal(["Acme Q3 Adj. EPS $0.30 Beats $0.25 Estimate, Sales $1.050B Beat $1.000B Estimate",
+                                    "Acme Raises FY2026 Adj EPS Guidance from $1.10-$1.12 to $1.20-$1.25 vs $1.11 Est"])
+        score, reason = bot.earnings_score(both)
+        self.assertEqual(score, 5)
+        self.assertIn("44%", reason)
+        weak = bot.earnings_signal(["Acme Lowers FY2026 Sales Guidance from $4B-$4.2B to $3.8B-$3.9B vs $4.1B Est"])
+        self.assertLess(bot.earnings_score(weak)[0], 0)
+        self.assertIsNone(bot.earnings_score(bot.earnings_signal(["Wells Fargo Maintains Overweight on Acme, "
+                                                                  "Raises Price Target to $50"])))
+
+    def test_benzinga_results_alert_combines_guidance(self) -> None:
+        async def scenario() -> list[str]:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = base_world()
+            async with w.client() as client:
+                radar = bot.Radar(make_cfg(Path(tmp.name)), client)
+                await radar.refresh_tickers()
+                msg = {**AlpacaNewsTest.MSG, "content": "", "summary": ""}
+                radar.handle_alpaca_news({**msg, "id": 10, "headline":
+                                          "Oklo Sees FY2026 Sales $500M-$520M vs $450M Est"})          # guidance first
+                await radar.drain(5)
+                radar.handle_alpaca_news({**msg, "id": 11, "headline":
+                                          "Oklo Q3 EPS $0.40 Beats $0.30 Estimate, Sales $130M Beat $120M Estimate"})
+                await radar.drain(5)
+            return [m["text"] for m in w.sent]
+        texts = run(scenario())
+        self.assertEqual(len(texts), 1, texts)       # one alert per ticker (dedup), the first one already strong
+        self.assertIn("תחזית", texts[0])

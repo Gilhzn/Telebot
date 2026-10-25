@@ -1229,6 +1229,99 @@ def learning_summary(log_entries: list[dict[str, Any]]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Earnings surprise: Benzinga's results headlines ("Acme Q3 Adj. EPS $0.28 Beats $0.19 Estimate,
+# Sales $5.6B Miss $5.7B Estimate", "Acme Raises FY26 EPS Guidance ... vs $1.11 Est") arrive within
+# seconds of the release. tools/earnings_study.py measured a year of them for $1B+ companies.
+# ---------------------------------------------------------------------------
+
+_NUM = r"\(?-?\$?\(?-?[\d,]*\.?\d+\)?"
+EPS_HEAD_RE = re.compile(rf"\bEPS\s+(?P<a>{_NUM})\s+(?P<v>Beats|Misses|In-Line|Up|Down|Vs\.?)\s*(?:With\s+)?(?P<e>{_NUM})?", I)
+SALES_HEAD_RE = re.compile(rf"\b(?:Sales|Revenue)\s+(?P<a>{_NUM})\s*(?P<au>[KMB])?\s+(?P<v>Beat|Beats|Miss|Misses|In-Line|Up|Down|Vs\.?)"
+                           rf"\s*(?:With\s+)?(?P<e>{_NUM})?\s*(?P<eu>[KMB])?", I)
+ANALYST_RE = re.compile(r"\b(?:Price Target|Maintains|Reiterates|Upgrades|Downgrades|Initiates|Analyst)\b", I)
+GUIDE_RANGE_RE = re.compile(rf"\b(?:Sees|Guidance|Outlook|Expects|Forecasts?)\b[^;]*?(?:to\s+)?(?P<lo>{_NUM})\s*(?P<lu>[KMB])?"
+                            rf"(?:\s*-\s*(?P<hi>{_NUM})\s*(?P<hu>[KMB])?)?\s+vs\.?\s+(?P<e>{_NUM})\s*(?P<eu>[KMB])?\s+Est", I)
+GUIDE_WORD_UP_RE = re.compile(r"\b(?:Raises|Boosts|Lifts|Increases|Ups)\b[^;]{0,40}\b(?:Guidance|Outlook|Forecast)", I)
+GUIDE_WORD_DOWN_RE = re.compile(r"\b(?:Lowers|Cuts|Reduces|Trims|Withdraws|Suspends)\b[^;]{0,40}\b(?:Guidance|Outlook|Forecast)", I)
+_UNITS = {"K": 1e3, "M": 1e6, "B": 1e9}
+
+
+def _earn_money(s: str | None, unit: str | None = None) -> float | None:
+    if not s:
+        return None
+    neg = "(" in s or s.strip().lstrip("$").startswith("-")
+    try:
+        v = float(re.sub(r"[^\d.]", "", s))
+    except ValueError:
+        return None
+    return (-v if neg else v) * _UNITS.get((unit or "").upper(), 1)
+
+
+def earnings_score(sig: dict[str, Any]) -> tuple[int, str] | None:
+    """Score and Hebrew reason for a results surprise, from a year of $1B+ companies' results
+    (tools/earnings_study.py; up = +10% that holds +5% at the close, down = -5% close; all results
+    days: 17% up, 22% down). None when the headlines carry no surprise."""
+    eps, sales, guide = sig.get("eps_s"), sig.get("sales_s"), sig.get("guide")
+    if eps is None and sales is None and guide is None:
+        return None
+    parts = []
+    if eps is not None:
+        parts.append(f"EPS {sig['eps_a']:.2f} מול צפי {sig['eps_e']:.2f} ({eps * 100:+.0f}%)")
+    if sales is not None:
+        parts.append(f"מכירות {sales * 100:+.1f}% מהצפי")
+    parts.append({"up": "תחזית הועלתה / מעל הצפי", "down": "תחזית הורדה / מתחת לצפי", "mixed": "תחזית מעורבת",
+                  "inline": "תחזית בקו הצפי"}.get(guide, "בלי תחזית"))
+    e, sl = eps if eps is not None else -9, sales if sales is not None else -9
+    if guide == "down" or (eps is not None and eps < 0 and sales is not None and sales < 0):
+        return -3, "דוח חלש: " + ", ".join(parts) + " · בשנה האחרונה 39%–40% ירדו 5%+"
+    if e >= 0.10 and sl >= 0.02 and guide == "up":
+        return 5, "דוח מכה + תחזית הועלתה: " + ", ".join(parts) + " · בשנה האחרונה 44% עלו 10%+, 15% ירדו"
+    if e >= 0.10 and sl >= 0.02 and guide not in ("mixed",):
+        return 4, "דוח מכה צפי: " + ", ".join(parts) + " · בשנה האחרונה 32% עלו 10%+, 14% ירדו"
+    if guide == "up" and e >= 0 and sl >= 0:
+        return 4, "תחזית הועלתה: " + ", ".join(parts) + " · בשנה האחרונה 34% עלו 10%+, 17% ירדו"
+    return 1, "דוח בלי הפתעה ברורה: " + ", ".join(parts)
+
+
+def earnings_signal(headlines: list[str]) -> dict[str, Any]:
+    """EPS and sales surprise (fractions) and guidance direction from a company's results headlines."""
+    out: dict[str, Any] = {}
+    for h in headlines:
+        if ANALYST_RE.search(h):
+            continue
+        m = EPS_HEAD_RE.search(h)
+        if m and "eps_s" not in out:
+            a, e = _earn_money(m.group("a")), _earn_money(m.group("e"))
+            if a is not None and e is not None:
+                out.update(eps_a=a, eps_e=e, eps_s=(a - e) / max(abs(e), 0.05))
+        m = SALES_HEAD_RE.search(h)
+        if m and "sales_s" not in out:
+            a = _earn_money(m.group("a"), m.group("au"))
+            e = _earn_money(m.group("e"), m.group("eu") or m.group("au"))
+            if a is not None and e:
+                out["sales_s"] = a / e - 1
+        for part in h.split(";"):
+            direction = None
+            m = GUIDE_RANGE_RE.search(part)
+            if m:
+                lo = _earn_money(m.group("lo"), m.group("lu") or m.group("hu"))
+                hi = _earn_money(m.group("hi"), m.group("hu")) if m.group("hi") else lo
+                est = _earn_money(m.group("e"), m.group("eu") or m.group("hu") or m.group("lu"))
+                if lo is not None and hi is not None and est:
+                    gap = ((lo + hi) / 2 - est) / abs(est)
+                    direction = "up" if gap >= 0.02 else "down" if gap <= -0.02 else "inline"
+            if GUIDE_WORD_DOWN_RE.search(part):
+                direction = "down"
+            elif GUIDE_WORD_UP_RE.search(part) and direction != "down":
+                direction = "up"
+            if direction:
+                prev = out.get("guide")
+                out["guide"] = direction if prev in (None, "inline", direction) else (
+                    "mixed" if direction != "inline" else prev)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Jump model: how often news like this made the stock jump 20%+ in the past year.
 # Learned by tools/catalysts.py from every 8-K/6-K press release and its price reaction;
 # the features here are shared by the study and the live bot so both see the same thing.
@@ -1713,8 +1806,11 @@ def snapshot_day_moves(data: dict[str, Any], today: dt.date) -> dict[str, tuple[
 
 def alpaca_news_item(m: dict[str, Any]) -> WireItem | None:
     """A message from Alpaca's news stream as a wire item; None for Benzinga's market commentary."""
-    if m.get("T") != "n" or not m.get("headline") or BENZINGA_SKIP_RE.search(m["headline"]):
-        return None
+    head = m.get("headline") or ""
+    results = bool(EPS_HEAD_RE.search(head) or SALES_HEAD_RE.search(head) or GUIDE_RANGE_RE.search(head)
+                   or GUIDE_WORD_UP_RE.search(head) or GUIDE_WORD_DOWN_RE.search(head)) and not ANALYST_RE.search(head)
+    if m.get("T") != "n" or not head or (BENZINGA_SKIP_RE.search(head) and not results):
+        return None    # Benzinga's commentary; its results and guidance headlines ("Sees ... vs ... Est") stay
     symbols = [normalize_ticker(x) for x in m.get("symbols") or []]
     if not symbols or len(symbols) > 3:
         return None    # roundups name many stocks
@@ -2095,6 +2191,7 @@ class Candidate:
     items: list[str] = field(default_factory=list)
     summary: str = ""
     text: str | None = None     # fetched text, cached between steps
+    earnings: bool = False      # scored by the earnings-surprise table (not muted by the jump model)
 
     @property
     def dedup_key(self) -> str:
@@ -2573,6 +2670,11 @@ class Radar:
         if rules.score < 4:  # a strong item is the result itself, not an announcement of one
             catalyst = find_catalyst(f"{c.title}\n{body[:LEAD_CHARS]}", us_eastern_now().date())
         score, reason = rules.score, rules.reason_he
+        earned = self.earnings_view(c)
+        if earned is not None:
+            score, reason = earned
+            c.earnings = True
+            return score, reason, None, catalyst
         if 2 <= score < self.cfg.min_score and c.ticker and not self.cfg.anthropic_key:
             price = await self.last_price(c.ticker)
             if price is not None and price < SMALL_CAP_PRICE:
@@ -2587,6 +2689,17 @@ class Radar:
                 if not c.ticker and ai["ticker"]:
                     c.ticker = normalize_ticker(ai["ticker"])
         return score, reason, None, catalyst
+
+    def earnings_view(self, c: Candidate) -> tuple[int, str] | None:
+        """For a Benzinga results / guidance headline: the earnings table's score, combining it with
+        the company's other Benzinga headlines of the last 3 hours (guidance often comes separately)."""
+        if c.source_label != ALPACA_SOURCE or not c.ticker or not (
+                EPS_HEAD_RE.search(c.title) or SALES_HEAD_RE.search(c.title) or GUIDE_RANGE_RE.search(c.title)
+                or GUIDE_WORD_UP_RE.search(c.title) or GUIDE_WORD_DOWN_RE.search(c.title)) or ANALYST_RE.search(c.title):
+            return None
+        recent = [n["title"] for n in self.state.news_log.get(c.ticker, [])
+                  if n["src"] == ALPACA_SOURCE and time.time() - n["t"] <= 3 * 3600 and n["title"] != c.title]
+        return earnings_score(earnings_signal([c.title] + recent))
 
     async def last_price(self, ticker: str) -> float | None:
         quote_ = await self.daily_quote(ticker)
@@ -2731,7 +2844,7 @@ class Radar:
             return
         risk = await self.pump_risk(c) if self.cfg.pump_check and score is not None else None
         odds = await self.jump_odds(c, score, risk) if self.jump_model and score is not None else None
-        if score is not None and not self.should_alert(score, odds):
+        if score is not None and not (score >= self.cfg.min_score if c.earnings else self.should_alert(score, odds)):
             log.info("Below threshold %s (%s, jump odds %s): %s", c.ticker, score,
                      f"{odds.probability:.0%}" if odds else "—", c.title or c.items)
             return
