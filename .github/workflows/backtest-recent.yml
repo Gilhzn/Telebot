@@ -49,6 +49,7 @@ jobs:
             probe) python tools/backtest_probe.py ;;
             feeds) python tools/probe_feeds.py "$@" ;;
             guru) python tools/guru_probe.py "$@" ;;
+            earndemo) python tools/earnings_demo.py ;;            # one sample earnings alert to Telegram
             gprobe) python tools/gainers_probe.py ;;
             uaprobe) python tools/ua_probe.py ;;
             gainers) python tools/gainers.py "$@" ;;
