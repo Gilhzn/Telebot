@@ -2092,3 +2092,11 @@ class TakeoverTalksTest(unittest.TestCase):
             [1, "ProShares Ultra VIX Short-Term Futures ETF", "UVXY", "CBOE"], [2, "Roper Technologies", "ROP", "Nasdaq"],
             [3, "Northern Trust Corp", "NTRS", "Nasdaq"], [4, "Ultra Clean Holdings", "UCTT", "Nasdaq"]]})
         self.assertEqual(bot.research_universe(tm), ["NTRS", "ROP", "UCTT"])
+
+
+class EarningsRulesTest(unittest.TestCase):
+    def test_record_revenue_alone_is_not_strong_in_a_results_release(self) -> None:
+        t = "Acme Reports Third Quarter 2026 Results; Record Revenue of $1.2 Billion"
+        self.assertLess(bot.rule_score(t, "Acme Inc", strong_text=t, title=t).score, 4)
+        t = "Acme Reports Third Quarter 2026 Results and Raises Full-Year Guidance"
+        self.assertGreaterEqual(bot.rule_score(t, "Acme Inc", strong_text=t, title=t).score, 4)

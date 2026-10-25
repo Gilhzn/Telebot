@@ -207,6 +207,8 @@ NEGATIVE_RULES: list[tuple[str, re.Pattern[str]]] = [
 ]
 
 # (points, Hebrew label, pattern). Every hit adds points; total is capped at 5.
+EARNINGS_RE = re.compile(r"\b(?:quarter|fiscal|annual|full[- ]year|q[1-4])\b.{0,40}\b(?:results|earnings)\b|"
+                         r"\bresults for (?:the )?(?:first|second|third|fourth)\b", I)
 POSITIVE_RULES: list[tuple[int, str, re.Pattern[str]]] = [
     (5, "החברה נרכשת", re.compile(
         r"\b(?:to be acquired by|agreed to be acquired|agreement to be acquired|"
@@ -605,11 +607,17 @@ def rule_score(text: str, company: str = "", strong_text: str | None = None,
                 score += 2
                 labels.append(f"חברת ענק ({name})")
                 break
+        earnings = EARNINGS_RE.search(strong_text) is not None
         for m in AMOUNT_RE.finditer(text):
+            if earnings:
+                break   # in a results release the $ figures are just revenue: no signal
             if _amount_usd(m.group(1), m.group(2)) >= 100e6:
                 score += 1
                 labels.append("סכום של 100 מיליון דולר ומעלה")
                 break
+        if earnings and "הכנסות שיא" in labels and "העלאת תחזית" not in labels:
+            # A year of $1B+ results: record revenue alone rose 30% / fell 32% of the time; a raised outlook 30% / 13%.
+            score -= 2
     score = min(score, 5)
     return RuleResult(score, labels, ", ".join(labels[:4]))
 
