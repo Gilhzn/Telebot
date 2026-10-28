@@ -29,6 +29,7 @@ jobs:
             race) python tools/source_race.py "${2:-1200}" ;;   # every channel, halts included
             html) python tools/html_probe.py ;;                  # newsroom page structure
             ua) python tools/ua_check.py ;;                      # why a source refuses the bot
+            eps) python tools/eps_check.py ;;                    # Benzinga results-number headlines of the last 30h
             alpaca) pip install -q "websockets>=12,<16" && python tools/alpaca_probe.py "${2:-900}" ;;
             *) python tools/latency_probe.py 200 ;;
           esac
