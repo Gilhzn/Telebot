@@ -226,6 +226,9 @@ POSITIVE_RULES: list[tuple[int, str, re.Pattern[str]]] = [
     (4, "עמידה ביעד הראשי בניסוי", re.compile(
         r"\b(?:met|meets|achieved|achieves) (?:its |the )?(?:primary|co-primary) endpoints?\b", I)),
     (4, "תוצאות topline חיוביות", re.compile(r"\bpositive (?:topline|top-line)\b", I)),
+    # "BridgeBio Reports Positive Phase 3 Topline Results": a year of $1B+ data, 35% up 10%+ / 10% down
+    (4, "תוצאות חיוביות בניסוי", re.compile(
+        r"\bpositive\b(?:[^.\n]|\.\d){0,60}\b(?:phase|trial|study|studies|pivotal)\b", I)),
     (4, "הצטרפות למדד S&P 500", re.compile(
         r"\b(?:join|joins|joining|added to|to join|set to join)(?: the)? S&P 500\b", I)),
     (3, "זכייה בחוזה", re.compile(r"\bawarded\b", I)),
@@ -267,7 +270,8 @@ POSITIVE_RULES: list[tuple[int, str, re.Pattern[str]]] = [
 
 # Overlapping phrases count once, at the higher score.
 RULE_GROUPS = {"הזמנת רכש": "orders", "הזמנות / הזמנה חוזרת": "orders",
-               "שותפות אסטרטגית": "partner", "שותפות": "partner"}
+               "שותפות אסטרטגית": "partner", "שותפות": "partner",
+               "תוצאות topline חיוביות": "trial", "תוצאות חיוביות בניסוי": "trial", "עמידה ביעד הראשי בניסוי": "trial"}
 
 MEGA_COMPANIES = [
     "NVIDIA", "Nvidia", "Microsoft", "Amazon", "AWS", "Google", "Alphabet", "Apple",

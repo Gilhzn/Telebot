@@ -2217,3 +2217,11 @@ class SlowSectorTest(unittest.TestCase):
     def test_utility_needs_score_5_or_a_takeover(self) -> None:
         self.assertEqual(self.alerts("Oklo Receives FDA Breakthrough Device Designation"), [])           # 4, utility
         self.assertEqual(len(self.alerts("Oklo to Be Acquired by Constellation for $60 Per Share in Cash")), 1)
+
+
+class PositiveTrialTest(unittest.TestCase):
+    def test_positive_phase_3_in_any_order(self) -> None:
+        t = "BridgeBio Reports Positive Phase 3 Topline Results for Encaleret"
+        r = bot.rule_score(t, "BridgeBio Pharma", strong_text=t, title=t)
+        self.assertEqual(r.score, 4)
+        self.assertEqual(r.labels.count("תוצאות חיוביות בניסוי") + r.labels.count("תוצאות topline חיוביות"), 1)
