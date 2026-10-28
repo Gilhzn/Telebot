@@ -1030,8 +1030,10 @@ MOMENTUM_PCT = 10.0               # "breakout starting": up 10%+ on the previous
 MOMENTUM_DOLLAR_VOLUME = 100_000  # with at least $100K traded today (no illiquid ticks)
 MOMENTUM_NEWS_HOURS = 18          # watch tickers that had wire news in the last 18 hours
 MOMENTUM_SCAN_SECONDS = 300       # full-market scan (regular session only: Yahoo spark has no pre-market)
-MEGA_CAP = 50e9                   # news rarely moves a $50B+ company: only score-5 items alert
+MEGA_CAP = 50e9                   # news rarely moves a $50B+ company: only takeovers and score-5 results
 MEGA_CAP_MIN_SCORE = 5
+SLOW_SECTORS = {"אנרגיה / תשתיות", "נפט וגז", "תחבורה / תקשורת"}   # score-4 news there: 1 in 19 rose 10%
+TAKEOVER_LABELS = ("החברה נרכשת", "הצעת רכש / מגעים להשתלטות על החברה", "הצעה במזומן למניה")
 SMALL_CONTRACT_RATIO = 0.01       # a contract under 1% of the company's value: a year of $1B+ data says noise
 RUNNER_PCT = 30.0                 # "runner": a 30%+ day in the last month; these tend to run again
 RUNNER_MAX_PRICE = 10.0           # and still a small, cheap stock
@@ -2811,6 +2813,14 @@ class Radar:
         self.mcaps[ticker] = (time.time(), mcap)
         return mcap
 
+    async def sector(self, ticker: str | None) -> str:
+        found = self.tickers.lookup(ticker) if ticker else None
+        subs = await self.sec_json(SEC_SUBMISSIONS_URL.format(cik=found[0])) if found else None
+        try:
+            return sector_of(int((subs or {}).get("sic") or 0))
+        except ValueError:
+            return sector_of(0)
+
     async def big_enough(self, ticker: str | None, price: float | None = None) -> tuple[bool, float | None]:
         """(passes MIN_MARKET_CAP, market cap). Unknown size does not pass while a minimum is set."""
         if not ticker:
@@ -2895,9 +2905,14 @@ class Radar:
                      c.title or c.items)
             return
         if score is not None and mcap and not c.watch:
-            if mcap >= MEGA_CAP and score < MEGA_CAP_MIN_SCORE:
-                log.info("Mega cap %s (%s) needs score %d, has %s: %s", c.ticker, fmt_money(mcap),
-                         MEGA_CAP_MIN_SCORE, score, c.title or c.items)
+            takeover = any(lbl in reason for lbl in TAKEOVER_LABELS)
+            if mcap >= MEGA_CAP and not takeover and not (c.earnings and score >= MEGA_CAP_MIN_SCORE):
+                # A year of $1B+ data: score-4/5 news of $50B+ companies rose 10%+ 1 time in 10.
+                log.info("Mega cap %s (%s), not a takeover or a strong results surprise: %s", c.ticker,
+                         fmt_money(mcap), c.title or c.items)
+                return
+            if score < 5 and not takeover and await self.sector(c.ticker) in SLOW_SECTORS:
+                log.info("Slow sector for %s (score %s): %s", c.ticker, score, c.title or c.items)
                 return
             share = contract_share(f"{c.title}\n{strip_boilerplate(c.text or c.summary)[:LEAD_CHARS]}", mcap)
             if share is not None and share < SMALL_CONTRACT_RATIO:

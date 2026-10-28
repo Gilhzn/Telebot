@@ -2197,3 +2197,23 @@ class AlpacaNewsPollTest(unittest.TestCase):
         self.assertEqual(len(texts), 1, texts)            # the 2-hour-old item is not news at start-up
         self.assertIn("<b>OKLO</b>", texts[0])
         self.assertIn("דוח מכה צפי", texts[0])
+
+
+class SlowSectorTest(unittest.TestCase):
+    def alerts(self, title: str) -> list[str]:
+        async def scenario() -> list[str]:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = MarketCapTest().world(40e6)                                   # $2B
+            w.set("https://data.sec.gov/submissions/CIK0001849056.json", {"sic": "4911", "filings": {"recent": {}}})
+            async with w.client() as client:
+                radar = bot.Radar(make_cfg(Path(tmp.name), min_market_cap=1e9), client)
+                await radar.refresh_tickers()
+                radar.handle_alpaca_news({**AlpacaNewsTest.MSG, "headline": title, "content": "", "summary": ""})
+                await radar.drain(5)
+            return [m["text"] for m in w.sent]
+        return run(scenario())
+
+    def test_utility_needs_score_5_or_a_takeover(self) -> None:
+        self.assertEqual(self.alerts("Oklo Receives FDA Breakthrough Device Designation"), [])           # 4, utility
+        self.assertEqual(len(self.alerts("Oklo to Be Acquired by Constellation for $60 Per Share in Cash")), 1)
