@@ -55,6 +55,8 @@ TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 _PRN = "https://www.prnewswire.com/rss/"
 ALPACA_NEWS_STREAM = "wss://stream.data.alpaca.markets/v1beta1/news"   # Benzinga's real-time feed, pushed
 ALPACA_SOURCE = "Benzinga"
+ALPACA_NEWS_URL = "https://data.alpaca.markets/v1beta1/news?limit=50&sort=desc&include_content=true"
+ALPACA_NEWS_POLL_SECONDS = 10     # the stream skips Benzinga Newsdesk's results headlines ("Q3 EPS $X Beats $Y")
 ALPACA_MOVERS_URL = "https://data.alpaca.markets/v1beta1/screener/stocks/movers?top=50"   # market-wide, real time
 MOVERS_RECHECK_SECONDS = 180
 ALPACA_SNAPSHOTS_URL = "https://data.alpaca.markets/v2/stocks/snapshots?symbols={symbols}&feed=delayed_sip"
@@ -2536,6 +2538,35 @@ class Radar:
                 await self._sleep(backoff)
                 backoff = min(backoff * 2, 120.0)
 
+    async def alpaca_news_poll_loop(self) -> None:
+        """Alpaca's news REST feed, every 10 seconds: it carries Benzinga Newsdesk's results-number
+        headlines, which the real-time stream does not deliver. Items seen on both are handled once."""
+        if not (self.cfg.alpaca_key_id and self.cfg.alpaca_secret):
+            return
+        headers = {"APCA-API-KEY-ID": self.cfg.alpaca_key_id, "APCA-API-SECRET-KEY": self.cfg.alpaca_secret}
+        first = True
+        while not self.stop_event.is_set():
+            try:
+                resp = await self.client.get(ALPACA_NEWS_URL, headers=headers, timeout=10)
+                resp.raise_for_status()
+                news = resp.json().get("news") or []
+                for m in reversed(news):
+                    m = {**m, "T": "n"}
+                    if first:
+                        try:
+                            age = time.time() - dt.datetime.fromisoformat(
+                                str(m.get("created_at", "")).replace("Z", "+00:00")).timestamp()
+                        except ValueError:
+                            age = 1e9
+                        if age > 180:      # at start-up only the last 3 minutes are news
+                            self.state.mark_seen(f"wire:bz:{m.get('id')}")
+                            continue
+                    self.handle_alpaca_news(m)
+                first = False
+            except Exception as exc:  # noqa: BLE001
+                log.info("Alpaca news poll failed: %s", describe_error(exc))
+            await self._sleep(ALPACA_NEWS_POLL_SECONDS)
+
     def handle_alpaca_news(self, m: dict[str, Any]) -> None:
         it = alpaca_news_item(m)
         if it is None:
@@ -3899,7 +3930,7 @@ class Radar:
             log.warning("TELEGRAM_CHAT_ID is empty — open the bot in Telegram and press Start")
         loops = [self.edgar_loop(), self.wire_loop(), self.command_loop(),
                  self.ticker_refresh_loop(), self.save_loop(), self.catalyst_loop(), self.momentum_loop(),
-                 self.halts_loop(), self.alpaca_news_loop()]
+                 self.halts_loop(), self.alpaca_news_loop(), self.alpaca_news_poll_loop()]
         tasks = [asyncio.create_task(c) for c in loops]
         try:
             await self.stop_event.wait()

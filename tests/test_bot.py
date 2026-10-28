@@ -2164,3 +2164,36 @@ class SizeGatesTest(unittest.TestCase):
         self.assertEqual(self.mcap_alerts(2e9, "Oklo Receives FDA Breakthrough Device Designation"), [])   # 4 < 5
         self.assertEqual(self.mcap_alerts(40e6, "Oklo Awarded $5 Million Contract by U.S. Department of Defense"), [])
         self.assertEqual(len(self.mcap_alerts(40e6, "Oklo Awarded $450 Million Contract by U.S. Department of Defense")), 1)
+
+
+class AlpacaNewsPollTest(unittest.TestCase):
+    def test_rest_feed_brings_newsdesk_results_headlines(self) -> None:
+        d = __import__("datetime")
+
+        async def scenario() -> list[str]:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = base_world()
+            now = d.datetime.now(d.timezone.utc)
+            iso = lambda t: t.strftime("%Y-%m-%dT%H:%M:%SZ")  # noqa: E731
+            w.set(bot.ALPACA_NEWS_URL, {"news": [
+                {"id": 2, "created_at": iso(now), "symbols": ["OKLO"], "source": "benzinga", "url": "https://x",
+                 "headline": "Oklo Q3 Adj. EPS $0.42 Beats $0.30 Estimate, Sales $130M Beat $120M Estimate",
+                 "summary": "", "content": ""},
+                {"id": 1, "created_at": iso(now - d.timedelta(hours=2)), "symbols": ["TEVA"], "source": "benzinga",
+                 "url": "https://y", "headline": "Teva Q3 Adj. EPS $0.90 Beats $0.60 Estimate, Sales $5B Beat $4B Estimate",
+                 "summary": "", "content": ""}]})
+            async with w.client() as client:
+                radar = bot.Radar(make_cfg(Path(tmp.name), alpaca_key_id="k", alpaca_secret="s"), client)
+                await radar.refresh_tickers()
+
+                async def stop_after(_: float) -> None:
+                    radar.stop_event.set()
+                with mock.patch.object(radar, "_sleep", new=stop_after):
+                    await radar.alpaca_news_poll_loop()
+                await radar.drain(5)
+            return [m["text"] for m in w.sent]
+        texts = run(scenario())
+        self.assertEqual(len(texts), 1, texts)            # the 2-hour-old item is not news at start-up
+        self.assertIn("<b>OKLO</b>", texts[0])
+        self.assertIn("דוח מכה צפי", texts[0])
