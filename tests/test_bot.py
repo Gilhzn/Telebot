@@ -1236,7 +1236,10 @@ class PerformanceTest(unittest.TestCase):
     def test_alert_is_logged_and_daily_report_measures_it(self) -> None:
         dtm = __import__("datetime")
         tz = bot.eastern_tz()
-        alert_ts = dtm.datetime(2026, 9, 28, 10, 0, tzinfo=tz).timestamp()
+        day = dtm.datetime.now(tz).date() - dtm.timedelta(days=2)
+        while day.weekday() >= 5:
+            day -= dtm.timedelta(days=1)                 # a recent weekday (minute bars are kept 28 days)
+        alert_ts = dtm.datetime(day.year, day.month, day.day, 10, 0, tzinfo=tz).timestamp()
         bars_from = alert_ts - 600
         # flat until 10:05, then +0.5% per minute
         prices = [10.0] * 10 + [10.0 * (1 + 0.005 * i) for i in range(1, 360)]
@@ -1253,14 +1256,14 @@ class PerformanceTest(unittest.TestCase):
                 await radar.process(c)
                 self.assertEqual(len(radar.state.alert_log), 1)
                 self.assertEqual(radar.state.alert_log[0]["ticker"], "OKLO")
-                radar.state.alert_log[0]["t"] = alert_ts   # pretend it went out on Monday 10:00
+                radar.state.alert_log[0]["t"] = alert_ts   # pretend it went out at 10:00 that day
                 radar.state.alert_log[0]["score"] = 5
                 w.sent.clear()
-                before = dtm.datetime(2026, 9, 28, 19, 0, tzinfo=tz)
+                before = dtm.datetime(day.year, day.month, day.day, 19, 0, tzinfo=tz)
                 with mock.patch.object(bot, "us_eastern_now", return_value=before):
                     await radar.check_performance_report()
                 self.assertEqual(w.sent, [])                 # not before 20:10
-                after = dtm.datetime(2026, 9, 28, 20, 15, tzinfo=tz)
+                after = dtm.datetime(day.year, day.month, day.day, 20, 15, tzinfo=tz)
                 with mock.patch.object(bot, "us_eastern_now", return_value=after):
                     await radar.check_performance_report()
                     await radar.check_performance_report()   # once a day
@@ -2135,3 +2138,29 @@ class EarningsSurpriseTest(unittest.TestCase):
         texts = run(scenario())
         self.assertEqual(len(texts), 1, texts)       # one alert per ticker (dedup), the first one already strong
         self.assertIn("תחזית", texts[0])
+
+
+class SizeGatesTest(unittest.TestCase):
+    def test_contract_share(self) -> None:
+        t = "Teledyne Awarded $48 Million U.S. Army Contract"
+        self.assertAlmostEqual(bot.contract_share(t, 30e9), 0.0016, places=4)
+        self.assertIsNone(bot.contract_share("Acme Reports Third Quarter Results", 30e9))
+
+    def mcap_alerts(self, shares: float, title: str) -> list[str]:
+        async def scenario() -> list[str]:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = MarketCapTest().world(shares)
+            async with w.client() as client:
+                radar = bot.Radar(make_cfg(Path(tmp.name), min_market_cap=1e9), client)
+                await radar.refresh_tickers()
+                radar.handle_alpaca_news({**AlpacaNewsTest.MSG, "headline": title, "content": "", "summary": ""})
+                await radar.drain(5)
+            return [m["text"] for m in w.sent]
+        return run(scenario())
+
+    def test_mega_cap_needs_score_5_and_small_contracts_are_skipped(self) -> None:
+        # $50 price: 2B shares = $100B (mega cap), 40M shares = $2B
+        self.assertEqual(self.mcap_alerts(2e9, "Oklo Receives FDA Breakthrough Device Designation"), [])   # 4 < 5
+        self.assertEqual(self.mcap_alerts(40e6, "Oklo Awarded $5 Million Contract by U.S. Department of Defense"), [])
+        self.assertEqual(len(self.mcap_alerts(40e6, "Oklo Awarded $450 Million Contract by U.S. Department of Defense")), 1)

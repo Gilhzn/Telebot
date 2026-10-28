@@ -278,7 +278,7 @@ async def yahoo_bars(http: Http, symbol: str, start: float, end: float) -> list[
     while t < end:
         t2 = min(end, t + 7 * 86400)
         url = bot.YAHOO_CHART_URL.format(symbol=symbol, p1=int(t), p2=int(t2), interval=interval)
-        r = await http.get(url, headers={"User-Agent": "Mozilla/5.0"}, sec=False)
+        r = await http.get(url, headers=bot.RESEARCH_HEADERS, sec=False)
         if r.status_code == 200:
             bars += bot.parse_yahoo_chart(r.json())
         t = t2
@@ -480,7 +480,7 @@ async def live(prices: Http, state_path: Path) -> None:
             continue
         url = bot.YAHOO_CHART_URL.format(symbol=e["ticker"], p1=int(e["t"] - 7200),
                                          p2=int(min(now - 60, e["t"] + 4 * 86400)), interval=1)
-        r = await prices.get(url, headers={"User-Agent": "Mozilla/5.0"}, sec=False)
+        r = await prices.get(url, headers=bot.RESEARCH_HEADERS, sec=False)
         sim = bot.simulate_trade(bot.parse_yahoo_chart(r.json()), e["t"]) if r.status_code == 200 else None
         if sim is None:
             log(f"{e['ticker']}: no prices")

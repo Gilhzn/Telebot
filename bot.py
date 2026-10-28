@@ -496,6 +496,19 @@ def esc(text: str) -> str:
     return html.escape(text or "", quote=False)
 
 
+CONTRACT_RE = re.compile(r"\b(?:awarded|awards?|wins?|won|secures?|receives?|lands?)\b(?:[^.\n]|(?<=[^A-Za-z][A-Z])\.|\.(?=\w)){0,60}"
+                         r"\b(?:contracts?|task orders?|orders?|grants?|funding)\b", I)
+
+
+def contract_share(text: str, mcap: float) -> float | None:
+    """For a contract / order / award item: its largest $ amount as a share of the company's value
+    (None when the item is not a contract or names no amount)."""
+    if not CONTRACT_RE.search(text) or not mcap:
+        return None
+    amounts = [_amount_usd(m.group(1), m.group(2)) for m in AMOUNT_RE.finditer(text)]
+    return max(amounts) / mcap if amounts else None
+
+
 def fmt_money(v: float) -> str:
     return f"${v / 1e12:.1f}T" if v >= 1e12 else f"${v / 1e9:.1f}B" if v >= 1e9 else f"${v / 1e6:.0f}M"
 
@@ -1015,6 +1028,9 @@ MOMENTUM_PCT = 10.0               # "breakout starting": up 10%+ on the previous
 MOMENTUM_DOLLAR_VOLUME = 100_000  # with at least $100K traded today (no illiquid ticks)
 MOMENTUM_NEWS_HOURS = 18          # watch tickers that had wire news in the last 18 hours
 MOMENTUM_SCAN_SECONDS = 300       # full-market scan (regular session only: Yahoo spark has no pre-market)
+MEGA_CAP = 50e9                   # news rarely moves a $50B+ company: only score-5 items alert
+MEGA_CAP_MIN_SCORE = 5
+SMALL_CONTRACT_RATIO = 0.01       # a contract under 1% of the company's value: a year of $1B+ data says noise
 RUNNER_PCT = 30.0                 # "runner": a 30%+ day in the last month; these tend to run again
 RUNNER_MAX_PRICE = 10.0           # and still a small, cheap stock
 RUNNER_SECONDS = 180              # outside the regular session, runners are checked every 3 minutes
@@ -2670,6 +2686,11 @@ class Radar:
         if rules.score < 4:  # a strong item is the result itself, not an announcement of one
             catalyst = find_catalyst(f"{c.title}\n{body[:LEAD_CHARS]}", us_eastern_now().date())
         score, reason = rules.score, rules.reason_he
+        if (EARNINGS_RE.search(f"{c.title}\n{body[:LEAD_CHARS]}") or "2.02" in c.items) \
+                and "העלאת תחזית" not in rules.labels and score > 3:
+            # A year of $1B+ results releases: without a raised outlook score-4+ ones rose 18% / fell 21%
+            # of the time (with one: 31% / 12%). The numbers decide, from Benzinga's headline.
+            score, reason = 3, f"{reason} (דוח בלי העלאת תחזית: מחכה לכותרת המספרים)"
         earned = self.earnings_view(c)
         if earned is not None:
             score, reason = earned
@@ -2842,6 +2863,15 @@ class Radar:
             log.info("Too small %s (market cap %s): %s", c.ticker, fmt_money(mcap) if mcap else "unknown",
                      c.title or c.items)
             return
+        if score is not None and mcap and not c.watch:
+            if mcap >= MEGA_CAP and score < MEGA_CAP_MIN_SCORE:
+                log.info("Mega cap %s (%s) needs score %d, has %s: %s", c.ticker, fmt_money(mcap),
+                         MEGA_CAP_MIN_SCORE, score, c.title or c.items)
+                return
+            share = contract_share(f"{c.title}\n{strip_boilerplate(c.text or c.summary)[:LEAD_CHARS]}", mcap)
+            if share is not None and share < SMALL_CONTRACT_RATIO:
+                log.info("Small contract for %s (%s): %s", c.ticker, fmt_money(mcap), c.title)
+                return
         risk = await self.pump_risk(c) if self.cfg.pump_check and score is not None else None
         odds = await self.jump_odds(c, score, risk) if self.jump_model and score is not None else None
         if score is not None and not (score >= self.cfg.min_score if c.earnings else self.should_alert(score, odds)):
@@ -3589,7 +3619,7 @@ class Radar:
             url = YAHOO_CHART_URL.format(symbol=e["ticker"], p1=int(e["t"] - 7200),
                                          p2=int(min(now, e["t"] + 4 * 86400)), interval=1)
             try:
-                resp = await self.client.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+                resp = await self.client.get(url, headers=RESEARCH_HEADERS, timeout=15)
                 resp.raise_for_status()
                 sim = simulate_trade(parse_yahoo_chart(resp.json()), e["t"])
             except Exception as exc:  # noqa: BLE001

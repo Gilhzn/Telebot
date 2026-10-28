@@ -59,7 +59,7 @@ def main() -> int:
     report = []
     with httpx.Client(timeout=20, follow_redirects=True) as client:
         for name, kind, url in PROBES:
-            ua = SEC_UA if kind == "sec" else (bot.WIRE_USER_AGENT if kind == "wire" else "Mozilla/5.0")
+            ua = SEC_UA if kind == "sec" else (bot.WIRE_USER_AGENT if kind == "wire" else bot.RESEARCH_HEADERS["User-Agent"])
             headers = {"User-Agent": ua, **(bot.WIRE_HEADERS if kind == "wire" else {})}
             try:
                 r = client.get(url, headers=headers)
