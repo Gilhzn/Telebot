@@ -2107,7 +2107,7 @@ class EarningsRulesTest(unittest.TestCase):
 
 class EarningsSurpriseTest(unittest.TestCase):
     def test_table(self) -> None:
-        beat = bot.earnings_signal(["Acme Q3 Adj. EPS $0.30 Beats $0.25 Estimate, Sales $1.050B Beat $1.000B Estimate"])
+        beat = bot.earnings_signal(["Acme Q3 Adj. EPS $0.32 Beats $0.25 Estimate, Sales $1.050B Beat $1.000B Estimate"])
         self.assertEqual(bot.earnings_score(beat)[0], 4)
         both = bot.earnings_signal(["Acme Q3 Adj. EPS $0.30 Beats $0.25 Estimate, Sales $1.050B Beat $1.000B Estimate",
                                     "Acme Raises FY2026 Adj EPS Guidance from $1.10-$1.12 to $1.20-$1.25 vs $1.11 Est"])
@@ -2225,3 +2225,17 @@ class PositiveTrialTest(unittest.TestCase):
         r = bot.rule_score(t, "BridgeBio Pharma", strong_text=t, title=t)
         self.assertEqual(r.score, 4)
         self.assertEqual(r.labels.count("תוצאות חיוביות בניסוי") + r.labels.count("תוצאות topline חיוביות"), 1)
+
+
+class NoiseFiltersTest(unittest.TestCase):
+    def test_fluff_and_commentary(self) -> None:
+        t = "TD SYNNEX Wins Global and Regional Distributor of the Year Honors at Cisco Partner Summit"
+        self.assertEqual(bot.rule_score(t, "TD SYNNEX Corp", strong_text=t, title=t).score, 0)
+        self.assertIsNone(bot.alpaca_news_item({**AlpacaNewsTest.MSG, "headline":
+                                                "Flex Cashes In on AI Data Center Gold Rush, Stock Jumps 10%"}))
+        self.assertIsNotNone(bot.alpaca_news_item({**AlpacaNewsTest.MSG, "headline":
+                                                   "Oklo Q3 EPS $0.42 Beats $0.30 Estimate, Sales $130M Beat $120M Estimate"}))
+
+    def test_earnings_tier_4_needs_a_big_beat(self) -> None:
+        small = bot.earnings_signal(["Acme Q3 Adj. EPS $0.55 Beats $0.50 Estimate, Sales $1.03B Beat $1.00B Estimate"])
+        self.assertLess(bot.earnings_score(small)[0], 4)                   # EPS +10%: no longer an alert alone

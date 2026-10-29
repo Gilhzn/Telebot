@@ -70,7 +70,9 @@ BENZINGA_SKIP_RE = re.compile(r"stocks? moving|movers|here are|price target|anal
                               r"why .{1,40} (?:shares|stock) (?:is|are)|trading (?:higher|lower)|"
                               r"options activity|short interest|earnings preview|what's going on|transcript|"
                               r"earnings call|conference call|\bexpects?\b|\bsays\b|\bsees\b|reportedly|"
-                              r"according to|invested in|would be worth|\bwhat to know\b", re.I)
+                              r"according to|invested in|would be worth|\bwhat to know\b|"
+                              r"stock (?:jumps|soars|surges|rises|rallies|climbs|falls|slides|sinks|tumbles)|"
+                              r"shares (?:jump|soar|surge|rise|rally|climb|fall|slide|sink|tumble)|cashes in|\btargets\b", re.I)
 PRN_LIST_URL = "https://www.prnewswire.com/news-releases/news-releases-list/?page=1&pagesize=25"
 DEFAULT_WIRE_FEEDS = ",".join([
     PRN_LIST_URL,                 # the newsroom page lists every release ~20-80s before the RSS feed
@@ -209,6 +211,9 @@ NEGATIVE_RULES: list[tuple[str, re.Pattern[str]]] = [
 ]
 
 # (points, Hebrew label, pattern). Every hit adds points; total is capped at 5.
+FLUFF_RE = re.compile(r"\b(?:of the year|honou?rs?|honou?red|recogni[sz](?:ed|es|ing|tion)|celebrates?|celebrating|"
+                      r"badge|named (?:a |the |to )?(?:leader|winner|best|top|list)|ranked|ranks|"
+                      r"award(?:s|ed)? (?:for|at|in recognition)|wins? .{0,30}awards?\b|certification|certified)\b", I)
 EARNINGS_RE = re.compile(r"\b(?:quarter|fiscal|annual|full[- ]year|q[1-4])\b.{0,40}\b(?:results|earnings)\b|"
                          r"\bresults for (?:the )?(?:first|second|third|fourth)\b", I)
 POSITIVE_RULES: list[tuple[int, str, re.Pattern[str]]] = [
@@ -587,6 +592,10 @@ def rule_score(text: str, company: str = "", strong_text: str | None = None,
     "...following FDA approval of Genio..." is company background, not news."""
     score = 0
     labels: list[str] = []
+    if title and FLUFF_RE.search(title):
+        # "Wins Distributor of the Year Honors", "Celebrates ... Production Progress": a year of $1B+
+        # releases like these: 4 of 37 rose 10%, 4 fell 5%.
+        return RuleResult(0, ["פרס / הוקרה / חגיגה"], "פרס / הוקרה / חגיגה")
     if strong_text is None:
         strong_text = text
     if title and PERSONNEL_TITLE_RE.search(title):
@@ -1298,13 +1307,13 @@ def earnings_score(sig: dict[str, Any]) -> tuple[int, str] | None:
     e, sl = eps if eps is not None else -9, sales if sales is not None else -9
     if guide == "down" or (eps is not None and eps < 0 and sales is not None and sales < 0):
         return -3, "דוח חלש: " + ", ".join(parts) + " · בשנה האחרונה 39%–40% ירדו 5%+"
+    # Tiers chosen on the year (Oct 29 review): the earlier score-4 tiers (EPS +10% / any raise) gave
+    # 2,029 alerts a year at 30% up / 15% down; these give 980 at 38% / 13.5%.
     if e >= 0.10 and sl >= 0.02 and guide == "up":
         return 5, "דוח מכה + תחזית הועלתה: " + ", ".join(parts) + " · בשנה האחרונה 44% עלו 10%+, 15% ירדו"
-    if e >= 0.10 and sl >= 0.02 and guide not in ("mixed",):
-        return 4, "דוח מכה צפי: " + ", ".join(parts) + " · בשנה האחרונה 32% עלו 10%+, 14% ירדו"
-    if guide == "up" and e >= 0 and sl >= 0:
-        return 4, "תחזית הועלתה: " + ", ".join(parts) + " · בשנה האחרונה 34% עלו 10%+, 17% ירדו"
-    return 1, "דוח בלי הפתעה ברורה: " + ", ".join(parts)
+    if e >= 0.20 and sl >= 0.03 and guide not in ("mixed",):
+        return 4, "דוח מכה צפי בגדול: " + ", ".join(parts) + " · בשנה האחרונה 30% עלו 10%+, 12% ירדו"
+    return 1, "דוח בלי הפתעה גדולה מספיק: " + ", ".join(parts)
 
 
 def earnings_signal(headlines: list[str]) -> dict[str, Any]:
