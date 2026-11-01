@@ -2609,7 +2609,7 @@ class Radar:
                                    ALPACA_SOURCE)
         if cand is None:
             return
-        cand.text = f"{it.title}\n{it.summary}" if it.summary else None
+        cand.text = f"{it.title}\n{it.summary}"   # never fetch benzinga.com: it answers the bot 403
         self.state.log_news(cand.ticker or "", ALPACA_SOURCE, it.title, it.published_ts)
         self.spawn(self.process(cand))
 
@@ -2850,6 +2850,8 @@ class Radar:
         mcap = await self.market_cap(ticker, price)
         if self.cfg.min_market_cap <= 0:
             return True, mcap
+        if mcap is None and ticker in (self.state.runners.get("large") or []):
+            return True, None    # no cover-page share count (SEC 404), but the daily $1B+ list has it
         return mcap is not None and mcap >= self.cfg.min_market_cap, mcap
 
     async def jump_odds(self, c: Candidate, score: int | None, risk: PumpRisk | None) -> JumpOdds | None:
@@ -2887,6 +2889,9 @@ class Radar:
         """"Viatris Agrees To Acquire Pacira BioSciences": the jump is in the target, whose ticker the
         acquirer's release is not filed under. The same item, re-addressed to the listed target."""
         m = TAKEOVER_RE.search(c.title) if c.source == "wire" and c.title else None
+        if m and re.match(r"(?:\S+\s){0,4}?\S+'s\b.{0,50}\b(?:subsidiary|unit|business|division|assets|operations|stake|"
+                          r"portfolio|brand)", m.group(1), I):
+            return None    # "AIG to Acquire Everest Group's Chile Insurance Subsidiary": a unit, not the company
         target = self.tickers.match_title(m.group(1)) if m else None
         found = self.tickers.lookup(target) if target else None
         if not found or target == c.ticker:
@@ -3524,7 +3529,7 @@ class Radar:
             return []
         snaps = await self.alpaca_snapshots(large, feed)
         moves = snapshot_moves(snaps, today)
-        hot = sorted((t for t, pct in moves.items() if pct >= PREMARKET_CANDIDATE_PCT), key=lambda t: -moves[t])
+        hot = sorted((t for t, pct in moves.items() if PREMARKET_CANDIDATE_PCT <= pct <= 300), key=lambda t: -moves[t])
         if hot:
             log.info("$1B+ movers (%s): %s", feed, ", ".join(f"{t} {moves[t]:+.0f}%" for t in hot[:10]))
         return hot

@@ -2249,3 +2249,18 @@ class AcquirerSideTest(unittest.TestCase):
         self.assertEqual(bot.rule_score(t, "Ultralife Corp", strong_text=t, title=t).score, 5)
         self.assertIsNone(bot.alpaca_news_item({**AlpacaNewsTest.MSG, "headline":
                                                 "Archer Aviation Stock Moves Higher: What's Happening?"}))
+
+
+class TakeoverUnitTest(unittest.TestCase):
+    def test_selling_a_unit_is_not_a_takeover(self) -> None:
+        async def scenario() -> None:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            async with base_world().client() as client:
+                radar = bot.Radar(make_cfg(Path(tmp.name)), client)
+                await radar.refresh_tickers()
+                c = bot.Candidate(source="wire", source_label="Benzinga", ticker="TEVA", company="Teva",
+                                  title="Teva Agrees To Acquire Oklo Inc.'s European Fuel Subsidiary",
+                                  link="https://x", published_ts=None, watch=False)
+                self.assertIsNone(radar.takeover_target(c))
+        run(scenario())
