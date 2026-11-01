@@ -2239,3 +2239,13 @@ class NoiseFiltersTest(unittest.TestCase):
     def test_earnings_tier_4_needs_a_big_beat(self) -> None:
         small = bot.earnings_signal(["Acme Q3 Adj. EPS $0.55 Beats $0.50 Estimate, Sales $1.03B Beat $1.00B Estimate"])
         self.assertLess(bot.earnings_score(small)[0], 4)                   # EPS +10%: no longer an alert alone
+
+
+class AcquirerSideTest(unittest.TestCase):
+    def test_cash_per_share_counts_for_the_target_only(self) -> None:
+        t = "EnerSys Agrees to Acquire Ultralife for $15.00 Per Share in Cash"
+        self.assertEqual(bot.rule_score(t, "EnerSys", strong_text=t, title=t).score, 0)
+        t = "Ultralife to Be Acquired by EnerSys for $15.00 Per Share in Cash"
+        self.assertEqual(bot.rule_score(t, "Ultralife Corp", strong_text=t, title=t).score, 5)
+        self.assertIsNone(bot.alpaca_news_item({**AlpacaNewsTest.MSG, "headline":
+                                                "Archer Aviation Stock Moves Higher: What's Happening?"}))

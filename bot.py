@@ -72,7 +72,8 @@ BENZINGA_SKIP_RE = re.compile(r"stocks? moving|movers|here are|price target|anal
                               r"earnings call|conference call|\bexpects?\b|\bsays\b|\bsees\b|reportedly|"
                               r"according to|invested in|would be worth|\bwhat to know\b|"
                               r"stock (?:jumps|soars|surges|rises|rallies|climbs|falls|slides|sinks|tumbles)|"
-                              r"shares (?:jump|soar|surge|rise|rally|climb|fall|slide|sink|tumble)|cashes in|\btargets\b", re.I)
+                              r"shares (?:jump|soar|surge|rise|rally|climb|fall|slide|sink|tumble)|cashes in|\btargets\b|"
+                              r"moves (?:higher|lower)|what's happening|here's why|trading (?:up|down)", re.I)
 PRN_LIST_URL = "https://www.prnewswire.com/news-releases/news-releases-list/?page=1&pagesize=25"
 DEFAULT_WIRE_FEEDS = ",".join([
     PRN_LIST_URL,                 # the newsroom page lists every release ~20-80s before the RSS feed
@@ -627,6 +628,13 @@ def rule_score(text: str, company: str = "", strong_text: str | None = None,
                          r"(?:offer|bid|proposal|approach|sale)", strong_text, I)):
         score += 4      # Lionsgate +14% within minutes of "Legendary Revives Lionsgate Takeover Talks, Submits Offer"
         labels.append("הצעת רכש / מגעים להשתלטות על החברה")
+    if "הצעה במזומן למניה" in labels and len(name_key) >= 3 and re.search(
+            rf"\b{re.escape(name_key)}\w*\b(?:[^.\n]|(?<=[^A-Za-z][A-Z])\.){{0,60}}\b(?:to acquire|agrees? to acquire|proposes? to acquire|"
+            r"will acquire|acquires|to buy|agrees? to buy)\b|\b(?:after|as)\s+" + re.escape(name_key) + r"\w*\s+agrees?\b", strong_text, I):
+        # The buyer's release ("EnerSys Agrees to $320M Buyout" of Ultralife): the per-share cash is
+        # the target's premium, not news for the buyer.
+        score -= 4
+        labels.remove("הצעה במזומן למניה")
     if score > 0:
         company_l = company.lower()
         for m in MEGA_RE.finditer(text):
@@ -1095,7 +1103,7 @@ def _pct_number(raw: Any) -> float | None:
 
 
 ETF_NAME_RE = re.compile(r"\b(?:ETF|ETN|ETFs|Fund|ProShares|Direxion|iShares|SPDR|Invesco(?! Ltd)|VanEck|Grayscale|"
-                         r"GraniteShares|Tradr|Defiance|Leverage Shares|2X|3X|-1X)\b", I)
+                         r"GraniteShares|Tradr|Defiance|Leverage Shares|Volatility Shares|VIX|Futures|2X|3X|-1X)\b", I)
 
 
 def research_universe(tickers: "TickerMap") -> list[str]:
@@ -1851,7 +1859,8 @@ def alpaca_news_item(m: dict[str, Any]) -> WireItem | None:
         ts = dt.datetime.fromisoformat(str(m.get("created_at", "")).replace("Z", "+00:00")).timestamp()
     except ValueError:
         ts = None
-    body = html_to_text(m.get("content") or "") or html_to_text(m.get("summary") or "")
+    # The short summary, not the whole article: Benzinga's articles mention other companies' news.
+    body = html_to_text(m.get("summary") or "") or html_to_text(m.get("content") or "")[:600]
     return WireItem(f"bz:{m.get('id')}", html_to_text(m["headline"]), m.get("url") or "", body, ts, symbols)
 
 
@@ -3150,7 +3159,8 @@ class Radar:
         large = set(self.state.runners.get("large") or [])
         if self.cfg.min_market_cap > 0 and large:
             # The alerts cover $1B+ companies only, so the study learns from those (10%+ is a big day for them).
-            candidates = [g for g in await self.todays_movers(today, min_pct=LARGE_GAINER_PCT) if g["ticker"] in large]
+            candidates = [g for g in await self.todays_movers(today, min_pct=LARGE_GAINER_PCT)
+                          if g["ticker"] in large and g["pct"] <= 300]   # +3,900% is a reverse split, not a move
         else:
             candidates = await self.todays_movers(today)
         if not candidates:
