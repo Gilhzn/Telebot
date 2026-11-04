@@ -2928,12 +2928,13 @@ class Radar:
         if not self.chat_id:
             log.warning("No TELEGRAM_CHAT_ID yet — cannot send alert for %s", key)
             return
-        big, mcap = await self.big_enough(c.ticker) if not c.watch else (True, None)
+        trusted = c.watch and not self.cfg.predictions_only   # predictions only: the watchlist gets no free pass
+        big, mcap = await self.big_enough(c.ticker) if not trusted else (True, None)
         if not big:
             log.info("Too small %s (market cap %s): %s", c.ticker, fmt_money(mcap) if mcap else "unknown",
                      c.title or c.items)
             return
-        if score is not None and mcap and not c.watch:
+        if score is not None and mcap and not trusted:
             takeover = any(lbl in reason for lbl in TAKEOVER_LABELS)
             if mcap >= MEGA_CAP and not takeover and not (c.earnings and score >= MEGA_CAP_MIN_SCORE):
                 # A year of $1B+ data: score-4/5 news of $50B+ companies rose 10%+ 1 time in 10.
