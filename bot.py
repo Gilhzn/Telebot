@@ -358,6 +358,7 @@ class Config:
     pump_check: bool = True
     guru_alerts: bool = True
     jump_model: bool = True
+    predictions_only: bool = True    # push only the formula's rise alerts; reports, breakouts, halts stay silent
     gurus: list[tuple[int, str, str]] = field(default_factory=lambda: list(DEFAULT_GURUS))
     edgar_forms: list[str] = field(default_factory=lambda: ["8-K", "6-K"])
     edgar_poll: float = 2.0
@@ -389,6 +390,7 @@ class Config:
             pump_check=_env_bool("PUMP_CHECK", True),
             guru_alerts=_env_bool("GURU_ALERTS", True),
             jump_model=_env_bool("JUMP_MODEL", True),
+            predictions_only=_env_bool("PUSH_PREDICTIONS_ONLY", True),
             gurus=parse_gurus(_env("GURUS")) or list(DEFAULT_GURUS),
             edgar_forms=[f.upper() for f in _split(_env("EDGAR_FORMS", "8-K,6-K"))],
             edgar_poll=max(1.0, _env_float("EDGAR_POLL_SECONDS", 2.0)),
@@ -3001,7 +3003,7 @@ class Radar:
         key = f"{c.ticker}:{cat.date.isoformat()}"
         if key in self.state.catalysts:
             return
-        added = c.ticker not in self.state.watchlist
+        added = c.ticker not in self.state.watchlist and not self.cfg.predictions_only
         if added:
             self.state.watchlist.append(c.ticker)
         self.state.catalysts[key] = {
@@ -3022,7 +3024,7 @@ class Radar:
         lines.append(f"📰 {esc(c.source_label)}")
         lines.append(f'<a href="{html.escape(c.link, quote=True)}">למקור המלא</a>')
         log.info("CATALYST %s %s %s", c.ticker, cat.date, cat.label)
-        await self.reply("\n".join(lines))
+        await self.push_extra("\n".join(lines))
 
     async def check_catalyst_reminders(self) -> None:
         """On the catalyst day (from 04:00 New York, when pre-market opens) send one reminder."""
@@ -3043,7 +3045,7 @@ class Radar:
                 "המסחר המוקדם (pre-market) בניו יורק נפתח ב-04:00, והמסחר הרגיל ב-09:30 שעון ניו יורק.",
                 f'<a href="{html.escape(entry.get("link", ""), quote=True)}">ההודעה המקורית</a>',
             ]
-            await self.reply("\n".join(line for line in lines if line))
+            await self.push_extra("\n".join(line for line in lines if line))
 
     def catalysts_text(self) -> str:
         today = us_eastern_now().date()
@@ -3096,7 +3098,7 @@ class Radar:
         changes = diff_13f(before, cur)
         cusips = {h.cusip for rows in changes.values() for p, h, _ in rows[:GURU_LIST_MAX] for h in (p, h) if h}
         tickers = await self.cusip_tickers(cusips, cur, before)
-        await self.reply(format_guru_changes(guru, latest, cur, changes, tickers, first_report=known is None))
+        await self.push_extra(format_guru_changes(guru, latest, cur, changes, tickers, first_report=known is None))
         self.state.gurus[str(cik)] = latest["accessionNumber"]
         self.state.dirty = True
         log.info("13F %s %s: %s", guru[1], latest["reportDate"], {k: len(v) for k, v in changes.items()})
@@ -3188,11 +3190,11 @@ class Radar:
             return
         self.state.gainers_log.extend(studied)
         self.state.dirty = True
-        await self.send_long(self.gainers_text(studied, today))
+        await self.push_extra(self.gainers_text(studied, today), long=True)
         days = {e["date"] for e in self.state.gainers_log}
         if len(days) >= LEARNING_READY_DAYS and not self.state.learning_ready_sent:
             self.state.learning_ready_sent = True
-            await self.send_long(
+            await self.push_extra(long=True, text=
                 f"✅ <b>אני מוכן: סיימתי סבב למידה ראשון</b> ({len(days)} ימי מסחר)\n"
                 "למדתי מה מקפיץ מניות, מאיזה מקור החדשות מגיעות ראשונות, וכמה מוקדם הבוט תופס אותן. "
                 "הלמידה ממשיכה בכל יום, וההתראות מתעדכנות לפי מה שנמדד.\n\n"
@@ -3432,7 +3434,7 @@ class Radar:
                 if not big:
                     continue
                 found = self.tickers.lookup(h.ticker)
-                await self.reply(f"⏸ <b>עצירת מסחר: חדשות מהותיות בדרך</b>\n<b>{esc(h.ticker)}</b>"
+                await self.push_extra(f"⏸ <b>עצירת מסחר: חדשות מהותיות בדרך</b>\n<b>{esc(h.ticker)}</b>"
                                  + (f" | {esc(found[1])}" if found else "")
                                  + f"\nהבורסה עצרה את המסחר ב-{hm} (שעון ניו יורק, קוד T1). הידיעה צפויה להתפרסם "
                                    "בדקות הקרובות, לרוב מיזוג, רכישה, תוצאות ניסוי או החלטת רגולטור. "
@@ -3586,7 +3588,7 @@ class Radar:
         start = next((b[0] for b in bars if b[2] >= prev * (1 + MOVE_START_PCT)), bars[-1][0])
         self.state.momentum["tickers"].append(ticker)
         self.state.dirty = True
-        await self.reply(self.breakout_text(ticker, pct, price, dollars, start, await self.recent_headlines(ticker),
+        await self.push_extra(self.breakout_text(ticker, pct, price, dollars, start, await self.recent_headlines(ticker),
                                             note, mcap))
         log.info("BREAKOUT %s +%.0f%% ($%.0f traded)", ticker, pct, dollars)
 
@@ -3670,6 +3672,9 @@ class Radar:
                 continue
             lines.append(f"• {head}: כניסה ${r['entry']:.2f} אחרי {fmt_duration(r['entry_delay_s'])} · "
                          f"5 דק' {_pct(r['r_5m'])} · 30 דק' {_pct(r['r_30m'])} · סגירה {_pct(r['r_close'])}")
+        if self.cfg.predictions_only:
+            log.info("Performance report measured %d alerts (not pushed: predictions only)", len(fresh))
+            return
         chunk: list[str] = []
         for line in lines:  # Telegram caps a message at 4096 characters
             if chunk and sum(len(x) + 1 for x in chunk) + len(line) > 3500:
@@ -3774,6 +3779,15 @@ class Radar:
         if blocked > 0:
             lines.append(f"⛔ SEC חסום, חידוש בעוד {fmt_duration(blocked)}")
         return "\n".join(lines)
+
+    async def push_extra(self, text: str, long: bool = False) -> None:
+        """A message that is not a rise prediction (breakout, halt, catalyst heads-up, daily study,
+        performance report, guru change): silent while PUSH_PREDICTIONS_ONLY (the user's choice:
+        "push only what is going to rise"). The bot still records and learns from all of them."""
+        if self.cfg.predictions_only:
+            log.info("Not pushed (predictions only): %s", text.split("\n", 1)[0][:120])
+            return
+        await (self.send_long(text) if long else self.reply(text))
 
     async def reply(self, text: str) -> None:
         if self.chat_id:

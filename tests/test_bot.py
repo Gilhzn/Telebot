@@ -176,6 +176,7 @@ def make_cfg(tmp: Path, **overrides: Any) -> bot.Config:
     overrides.setdefault("guru_alerts", "gurus" in overrides)   # off unless a test sets gurus
     overrides.setdefault("jump_model", False)                  # tests set a model explicitly
     overrides.setdefault("min_market_cap", 0.0)                # size filter tested on its own
+    overrides.setdefault("predictions_only", False)            # the other pushes are tested too
     cfg = bot.Config(
         telegram_token="123:ABC",
         chat_id="42",
@@ -2264,3 +2265,37 @@ class TakeoverUnitTest(unittest.TestCase):
                                   link="https://x", published_ts=None, watch=False)
                 self.assertIsNone(radar.takeover_target(c))
         run(scenario())
+
+
+class PredictionsOnlyTest(unittest.TestCase):
+    def test_only_rise_predictions_are_pushed(self) -> None:
+        dtm = __import__("datetime")
+
+        async def scenario() -> tuple[list[str], list[str]]:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = base_world()
+            now = time.time()
+            w.set(bot.HALTS_URL, HaltsTest.feed([("OKLO", "T1", now - 60), ("TEVA", "LUDP", now - 30)]))
+            t0 = int(now) - 600
+            px = [20.0] * 5 + [24.0] * 5
+            w.routes["https://query1.finance.yahoo.com/v8/finance/chart/TEVA?*"] = (200, {"chart": {"result": [{
+                "meta": {"chartPreviousClose": 20.0}, "timestamp": [t0 + 60 * i for i in range(10)],
+                "indicators": {"quote": [{"open": px, "high": px, "low": px, "close": px, "volume": [50_000] * 10}]}}]}})
+            async with w.client() as client:
+                radar = bot.Radar(make_cfg(Path(tmp.name), predictions_only=True), client)
+                await radar.refresh_tickers()
+                et = dtm.datetime.now(bot.eastern_tz()).replace(hour=11)
+                while et.weekday() >= 5:
+                    et -= dtm.timedelta(days=1)
+                with mock.patch.object(bot, "us_eastern_now", return_value=et):
+                    await radar.check_halts()                         # T1 + limit-up breakout: silent
+                silent = [m["text"] for m in w.sent]
+                radar.handle_alpaca_news({**AlpacaNewsTest.MSG, "id": 77})   # a scored rise alert: pushed
+                await radar.drain(5)
+                self.assertEqual(radar.state.momentum["tickers"], ["TEVA"])  # still recorded for learning
+            return silent, [m["text"] for m in w.sent]
+        silent, sent = run(scenario())
+        self.assertEqual(silent, [])
+        self.assertEqual(len(sent), 1)
+        self.assertIn("<b>OKLO</b>", sent[0])
