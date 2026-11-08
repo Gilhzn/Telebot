@@ -1891,16 +1891,16 @@ class PrnListTest(unittest.TestCase):
 
 
 class AlpacaNewsTest(unittest.TestCase):
-    MSG = {"T": "n", "id": 4242, "headline": "Oklo Awarded $450 Million Contract by U.S. Department of Defense",
-           "summary": "", "content": "<p>Oklo Inc. (NYSE: OKLO) today announced it has been awarded a $450 million "
-           "contract by the U.S. Department of Defense.</p>", "created_at": "2026-10-08T12:00:01Z",
+    MSG = {"T": "n", "id": 4242, "headline": "Oklo Announces Positive Topline Results From Pivotal Phase 3 Trial",
+           "summary": "", "content": "<p>Oklo Inc. (NYSE: OKLO) today announced positive topline results from its "
+           "pivotal Phase 3 trial, which met its primary endpoint.</p>", "created_at": "2026-10-08T12:00:01Z",
            "symbols": ["OKLO"], "source": "benzinga", "url": "https://www.benzinga.com/x"}
 
     def test_item_and_commentary_filter(self) -> None:
         it = bot.alpaca_news_item(self.MSG)
         assert it is not None
         self.assertEqual((it.key, it.tickers), ("bz:4242", ["OKLO"]))
-        self.assertIn("$450 million", it.summary)
+        self.assertIn("primary endpoint", it.summary)
         for headline in ("12 Industrials Stocks Moving In Thursday's Pre-Market Session",
                          "Why Oklo Shares Are Trading Higher Today"):
             self.assertIsNone(bot.alpaca_news_item({**self.MSG, "headline": headline}))
@@ -2160,11 +2160,33 @@ class SizeGatesTest(unittest.TestCase):
             return [m["text"] for m in w.sent]
         return run(scenario())
 
+    def wire_alerts(self, shares: float, title: str) -> list[str]:
+        async def scenario() -> list[str]:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = MarketCapTest().world(shares)
+            async with w.client() as client:
+                radar = bot.Radar(make_cfg(Path(tmp.name), min_market_cap=1e9), client)
+                await radar.refresh_tickers()
+                c = bot.Candidate(source="wire", source_label="PR Newswire", ticker="OKLO", company="Oklo Inc.",
+                                  title=title, link="https://x", published_ts=None, watch=False, summary=title)
+                c.text = title
+                await radar.process(c)
+            return [m["text"] for m in w.sent]
+        return run(scenario())
+
     def test_mega_cap_needs_score_5_and_small_contracts_are_skipped(self) -> None:
         # $50 price: 2B shares = $100B (mega cap), 40M shares = $2B
         self.assertEqual(self.mcap_alerts(2e9, "Oklo Receives FDA Breakthrough Device Designation"), [])   # 4 < 5
-        self.assertEqual(self.mcap_alerts(40e6, "Oklo Awarded $5 Million Contract by U.S. Department of Defense"), [])
-        self.assertEqual(len(self.mcap_alerts(40e6, "Oklo Awarded $450 Million Contract by U.S. Department of Defense")), 1)
+        self.assertEqual(self.wire_alerts(40e6, "Oklo Awarded $5 Million Contract by U.S. Department of Defense"), [])
+        self.assertEqual(len(self.wire_alerts(40e6, "Oklo Awarded $450 Million Contract by U.S. Department of Defense")), 1)
+
+    def test_benzinga_stories_only_for_trials_and_takeovers_under_10b(self) -> None:
+        # the company's own release of a contract alerts (above); Benzinga's story of it does not
+        self.assertEqual(self.mcap_alerts(40e6, "Oklo Awarded $450 Million Contract by U.S. Department of Defense"), [])
+        self.assertEqual(len(self.mcap_alerts(40e6, "Oklo Announces Positive Topline Results From Phase 3 Trial")), 1)
+        self.assertEqual(len(self.mcap_alerts(40e6, "Oklo To Be Acquired By Acme For $42 Per Share In Cash")), 1)
+        self.assertEqual(self.mcap_alerts(400e6, "Oklo To Be Acquired By Acme For $42 Per Share In Cash"), [])  # $20B
 
 
 class AlpacaNewsPollTest(unittest.TestCase):

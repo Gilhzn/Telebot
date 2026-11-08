@@ -1073,6 +1073,12 @@ MEGA_CAP = 50e9                   # news rarely moves a $50B+ company: only take
 MEGA_CAP_MIN_SCORE = 5
 SLOW_SECTORS = {"אנרגיה / תשתיות", "נפט וגז", "תחבורה / תקשורת"}   # score-4 news there: 1 in 19 rose 10%
 TAKEOVER_LABELS = ("החברה נרכשת", "הצעת רכש / מגעים להשתלטות על החברה", "הצעה במזומן למניה")
+TRIAL_LABELS = ("עמידה ביעד הראשי בניסוי", "תוצאות topline חיוביות", "תוצאות חיוביות בניסוי")
+# Benzinga's own stories (not its results headlines): a year of the ones the rules score 4-5 at $1B+
+# rose 10%+ 20% of the time (911 a year). Trial results and takeovers of companies under $10B rose
+# 37% (172 a year); everything else (contracts, partnerships, an FDA approval in the summary, a giant's
+# name) 11%, the plain $1B+ base rate. Above $10B Benzinga's takeover stories are mostly about the buyer.
+BENZINGA_TAKEOVER_MAX_CAP = 10e9
 SMALL_CONTRACT_RATIO = 0.01       # a contract under 1% of the company's value: a year of $1B+ data says noise
 RUNNER_PCT = 30.0                 # "runner": a 30%+ day in the last month; these tend to run again
 RUNNER_MAX_PRICE = 10.0           # and still a small, cheap stock
@@ -2950,6 +2956,12 @@ class Radar:
             log.info("Too small %s (market cap %s): %s", c.ticker, fmt_money(mcap) if mcap else "unknown",
                      c.title or c.items)
             return
+        if score is not None and c.source_label == ALPACA_SOURCE and not c.earnings and not trusted:
+            takeover = any(lbl in reason for lbl in TAKEOVER_LABELS)
+            if not (any(lbl in reason for lbl in TRIAL_LABELS)
+                    or (takeover and (mcap or 0) < BENZINGA_TAKEOVER_MAX_CAP)):
+                log.info("Benzinga story, not a trial result or a takeover under $10B (score %s): %s", score, c.title)
+                return
         if score is not None and mcap and not trusted:
             takeover = any(lbl in reason for lbl in TAKEOVER_LABELS)
             if mcap >= MEGA_CAP and not takeover and not (c.earnings and score >= MEGA_CAP_MIN_SCORE):
