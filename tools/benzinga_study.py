@@ -83,9 +83,15 @@ async def collect(start: str, end: str) -> None:
         log(f"ticker map: {len(tickers.by_ticker)}")
 
         # 1. every Benzinga story the bot would score (not results headlines: the earnings study has those)
+        raw = OUT / f"stories-{start}-{end}.jsonl.gz"
         items: list[dict[str, Any]] = []
         token, pages, seen = None, 0, 0
-        while True:
+        if raw.exists():    # a rerun after a failure later on reuses the collected stories
+            with gzip.open(raw, "rt", encoding="utf-8") as f:
+                items = [json.loads(x) for x in f if x.strip()]
+            log(f"{len(items)} stories from {raw}")
+        crawl = not items
+        while crawl:
             params = {"start": f"{start}T00:00:00Z", "end": f"{end}T23:59:59Z", "limit": 50, "sort": "asc",
                       "include_content": "false"}
             if token:
@@ -115,13 +121,17 @@ async def collect(start: str, end: str) -> None:
             if not token:
                 break
             await asyncio.sleep(0.31)
-        log(f"{len(items)} scored stories (2+) out of {seen} news items")
+        if crawl:
+            log(f"{len(items)} scored stories (2+) out of {seen} news items")
+            with gzip.open(raw, "wt", encoding="utf-8") as f:
+                f.writelines(json.dumps(i) + "\n" for i in items)
 
         # 2. daily bars (split-adjusted) and 3. share counts, as in the earnings study
         symbols = sorted({i["symbol"] for i in items})
         bars: dict[str, list[tuple]] = {}
         d0 = (dt.date.fromisoformat(start) - dt.timedelta(days=15)).isoformat()
-        d1 = (dt.date.fromisoformat(end) + dt.timedelta(days=5)).isoformat()
+        # the free plan serves SIP bars up to 15 minutes ago: never ask for a later end
+        d1 = min(dt.date.fromisoformat(end) + dt.timedelta(days=5), dt.date.today() - dt.timedelta(days=1)).isoformat()
         for i in range(0, len(symbols), 100):
             alp = {s.replace("-", "."): s for s in symbols[i:i + 100]}
             token = None
