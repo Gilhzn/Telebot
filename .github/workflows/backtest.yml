@@ -40,6 +40,9 @@ jobs:
           echo "mode: $MODE args: $*"
           case "$MODE" in
             probe) python tools/backtest_probe.py ;;
+            live)   # weekly scorecard of the alerts really pushed: live <since YYYY-MM-DD>
+              git fetch --depth 1 origin state && git show FETCH_HEAD:state.json > "$RUNNER_TEMP/state.json"
+              python tools/live_review.py "$RUNNER_TEMP/state.json" "$1" ;;
             earnings) python tools/earnings_study.py collect "$1" "$2" ;;   # results headlines vs reaction
             catalysts)  # one-year catalyst study over every collected signal; optional START END to collect first
               if git fetch --depth 1 origin backtest-recent 2>/dev/null; then
