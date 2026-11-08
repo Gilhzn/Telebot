@@ -582,6 +582,14 @@ def _amount_usd(number: str, unit: str | None) -> float:
     return value
 
 
+ASSET_SELLER_RE = re.compile(r"\b(?:from|stakes? in|interests? in|assets? of|portfolio of)\b", I)
+DEAL_STEP_RE = re.compile(
+    r"\bextend(?:s|ed|ing)?\b.{0,30}\btender offer|\bmini-tender|\breported earlier\b|\blaw firms?\b|"
+    r"\binvestigat(?:es?|ing|ion)\b|\bshareholder alert\b|\bwithdraws?\b|"
+    r"\b(?:files?|filed|seeks?|receives?|received|obtains?|wins?|secures?)\b.{0,40}"
+    r"\b(?:merger control|antitrust|regulatory|shareholder|stockholder|competition)\b.{0,20}\b(?:approval|clearance)|"
+    r"\b(?:completes?|completed|closes?|closed|completion of|closing of)\b.{0,30}\b(?:acquisition|merger|sale|tender offer)\b|"
+    r"\b(?:shareholders|stockholders)\b.{0,20}\bapprov", I)
 STRONG_CHARS = 400  # strong phrases (4-5 points) must be in the headline or the opening
 PERSONNEL_TITLE_RE = re.compile(
     r"\b(?:appoints?|appointment|names?|named|welcomes|hires|promotes|elects?)\b.{0,80}?"
@@ -617,7 +625,11 @@ def rule_score(text: str, company: str = "", strong_text: str | None = None,
                 labels.append(label)
     target = re.search(r"\bto acquire\b(.{0,60})", strong_text, I)
     name_key = normalize_company(company).split(" ")[0] if company else ""
-    if target and len(name_key) >= 3 and re.search(rf"\b{re.escape(name_key)}\b", target.group(1), I):
+    named = re.search(rf"\b{re.escape(name_key)}\b", target.group(1), I) if target and len(name_key) >= 3 else None
+    if named and (ASSET_SELLER_RE.search(target.group(1)[:named.start()])
+                  or re.match(r"\w*\s*['’]s\b", target.group(1)[named.end():])):
+        named = None    # "to Acquire Refineries from Marathon", "Stakes In Comstock's Haynesville": assets, not the company
+    if named:
         score += 5
         labels.append("החברה נרכשת")
     elif len(name_key) >= 3 and (
@@ -656,6 +668,10 @@ def rule_score(text: str, company: str = "", strong_text: str | None = None,
         if earnings and "הכנסות שיא" in labels and "העלאת תחזית" not in labels:
             # A year of $1B+ results: record revenue alone rose 30% / fell 32% of the time; a raised outlook 30% / 13%.
             score -= 2
+    if title and DEAL_STEP_RE.search(title) and any(lbl in TAKEOVER_LABELS for lbl in labels):
+        # A step in a deal already announced ("Files for Merger Control Approval to Acquire", "Extends
+        # Tender Offer", law firms "investigating" the sale): the premium was priced in on the first day.
+        return RuleResult(0, ["שלב בעסקה שכבר פורסמה"], "שלב בעסקה שכבר פורסמה")
     score = min(score, 5)
     return RuleResult(score, labels, ", ".join(labels[:4]))
 

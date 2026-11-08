@@ -2267,6 +2267,28 @@ class TakeoverUnitTest(unittest.TestCase):
         run(scenario())
 
 
+class DealStepTest(unittest.TestCase):
+    def test_the_seller_of_assets_is_not_the_target(self) -> None:
+        for title, company in (("CVR Energy Nearing Deal to Acquire Refineries from Marathon Petroleum", "Marathon Petroleum"),
+                               ("SOCAR Signs Definitive Agreement To Acquire Stakes In Comstock’s Haynesville Assets",
+                                "Comstock Resources"),
+                               ("Gilat to Acquire Comtech's Satellite & Space Communications Segment", "Comtech")):
+            self.assertLess(bot.rule_score(title, company, title=title).score, 4, title)
+
+    def test_a_step_in_an_announced_deal_is_not_news(self) -> None:
+        for title, company in (("Tutanota LLC Extends Tender Offer for Palo Alto Networks Shares", "Palo Alto Networks"),
+                               ("Merck KGaA Files for Merger Control Approval to Acquire Silence Therapeutics",
+                                "Silence Therapeutics"),
+                               ("Victory Capital Withdraws Proposal to Acquire Janus Henderson", "Janus Henderson")):
+            self.assertEqual(bot.rule_score(title, company, title=title).score, 0, title)
+
+    def test_new_deals_still_count(self) -> None:
+        for title, company in (("Marvell Technology to Acquire Lumentum in $115 Billion All-Stock Transaction", "Lumentum"),
+                               ("AstraZeneca Makes $10 Billion Takeover Offer for Rhythm Pharmaceuticals", "Rhythm Pharmaceuticals"),
+                               ("Viatris Agrees To Acquire Pacira BioSciences For $42 Per Share In Cash", "Pacira BioSciences")):
+            self.assertGreaterEqual(bot.rule_score(title, company, title=title).score, 4, title)
+
+
 class PredictionsOnlyTest(unittest.TestCase):
     def test_only_rise_predictions_are_pushed(self) -> None:
         dtm = __import__("datetime")
