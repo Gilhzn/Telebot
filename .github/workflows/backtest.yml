@@ -44,6 +44,7 @@ jobs:
               git fetch --depth 1 origin state && git show FETCH_HEAD:state.json > "$RUNNER_TEMP/state.json"
               python tools/live_review.py "$RUNNER_TEMP/state.json" "$1" ;;
             earnings) python tools/earnings_study.py collect "$1" "$2" ;;   # results headlines vs reaction
+            benzinga) python tools/benzinga_study.py collect "$1" "$2" ;;   # Benzinga stories scored by the rules
             catalysts)  # one-year catalyst study over every collected signal; optional START END to collect first
               if git fetch --depth 1 origin backtest-recent 2>/dev/null; then
                 git archive FETCH_HEAD backtest-out/pilot | tar -x && echo "pilot signals restored"

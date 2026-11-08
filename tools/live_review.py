@@ -62,11 +62,37 @@ def down(o: dict[str, Any]) -> bool:
     return o["close_r"] <= -0.05
 
 
-async def daily_bars(symbols: list[str], start: str) -> dict[str, list[tuple]]:
+def auth() -> dict[str, str]:
     key, secret = os.environ.get("ALPACA_API_KEY_ID", ""), os.environ.get("ALPACA_API_SECRET_KEY", "")
     if not key:
         raise SystemExit("ALPACA_API_KEY_ID is not set")
-    auth = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
+    return {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
+
+
+async def benzinga_texts(alerts: list[dict[str, Any]]) -> dict[int, str]:
+    """The summary Benzinga sent with each alerted headline (the alert log keeps only the title), so the
+    review can see which words the rules scored."""
+    out: dict[int, str] = {}
+    async with httpx.AsyncClient(timeout=30) as client:
+        for i, a in enumerate(alerts):
+            if a.get("src") != bot.ALPACA_SOURCE:
+                continue
+            t0 = dt.datetime.fromtimestamp(a["t"] - 900, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            t1 = dt.datetime.fromtimestamp(a["t"] + 60, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            r = await client.get(f"{DATA}/v1beta1/news", headers=auth(), params={
+                "symbols": a["ticker"].replace("-", "."), "start": t0, "end": t1, "limit": 50, "include_content": "false"})
+            if r.status_code == 200:
+                head = (a.get("title") or "")[:60]
+                for n in r.json().get("news", []):
+                    if n.get("headline", "")[:60] == head:
+                        out[i] = n.get("summary") or ""
+                        break
+            await asyncio.sleep(0.35)
+    return out
+
+
+async def daily_bars(symbols: list[str], start: str) -> dict[str, list[tuple]]:
+    auth_ = auth()
     alp = {s: s.replace("-", ".") for s in symbols}
     back = {v: k for k, v in alp.items()}
     bars: dict[str, list[tuple]] = {}
@@ -78,7 +104,7 @@ async def daily_bars(symbols: list[str], start: str) -> dict[str, list[tuple]]:
                           "start": start, "adjustment": "split", "feed": "sip", "limit": 10000}
                 if token:
                     params["page_token"] = token
-                r = await client.get(f"{DATA}/v2/stocks/bars", params=params, headers=auth)
+                r = await client.get(f"{DATA}/v2/stocks/bars", params=params, headers=auth_)
                 if r.status_code != 200:
                     print(f"bars {r.status_code}: {r.text[:150]}")
                     break
@@ -118,13 +144,16 @@ def main() -> int:
     symbols = sorted({a["ticker"] for a in alerts} | {g["ticker"] for g in gainers})
     start = (dt.date.fromisoformat(sys.argv[2]) - dt.timedelta(days=12)).isoformat()
     bars = asyncio.run(daily_bars(symbols, start))
+    summaries = asyncio.run(benzinga_texts(alerts))
     OUT.mkdir(parents=True, exist_ok=True)
 
     rows = []
-    for a in alerts:
+    for i, a in enumerate(alerts):
         o = outcome(bars.get(a["ticker"], []), a["t"])
+        title, summary = a.get("title") or "", summaries.get(i, "")
+        rules = bot.rule_score(f"{title}\n{summary}", strong_text=f"{title}\n{summary[:bot.STRONG_CHARS]}", title=title)
         rows.append({**{k: a.get(k) for k in ("t", "ticker", "score", "src", "title", "jump", "pump")},
-                     "kind": kind(a), **({"o": o} if o else {})})
+                     "kind": kind(a), "summary": summary[:400], "labels": rules.labels, **({"o": o} if o else {})})
     (OUT / "alerts.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
     done = [r for r in rows if r.get("o")]
 
@@ -154,7 +183,7 @@ def main() -> int:
         o = r["o"]
         mark = "UP" if up(o) else "DOWN" if down(o) else ""
         lines.append(f"- {mark:4} {r['ticker']} s{r['score']} close {o['close_r'] * 100:+.1f}% high2 {o['high2'] * 100:+.1f}% "
-                     f"[{r['kind']}] {(r['title'] or '')[:90]}")
+                     f"[{r['kind']}] {(r['title'] or '')[:90]}" + (f" — rules: {', '.join(r['labels'][:3])}" if r.get("labels") else ""))
 
     # $1B+ gainers: did an alert come before the move?
     by_ticker = collections.defaultdict(list)
