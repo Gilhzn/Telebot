@@ -91,6 +91,27 @@ async def benzinga_texts(alerts: list[dict[str, Any]]) -> dict[int, str]:
     return out
 
 
+async def benzinga_heads(gainers: list[dict[str, Any]]) -> list[list[str]]:
+    """Benzinga's results / guidance headlines for each gainer in the 20 hours before its move began."""
+    out: list[list[str]] = []
+    async with httpx.AsyncClient(timeout=30) as client:
+        for g in gainers:
+            t0 = dt.datetime.fromtimestamp(g["start"] - 20 * 3600, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            t1 = dt.datetime.fromtimestamp(g["start"], dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            hs: list[str] = []
+            r = await client.get(f"{DATA}/v1beta1/news", headers=auth(), params={
+                "symbols": g["ticker"].replace("-", "."), "start": t0, "end": t1, "limit": 50, "include_content": "false"})
+            if r.status_code == 200:
+                for n in r.json().get("news", []):
+                    h = n.get("headline", "")
+                    if len(n.get("symbols") or []) <= 3 and (bot.EPS_HEAD_RE.search(h) or bot.SALES_HEAD_RE.search(h)
+                                                              or bot.GUIDE_RANGE_RE.search(h) or bot.GUIDE_WORD_UP_RE.search(h)):
+                        hs.append(h)
+            out.append(hs)
+            await asyncio.sleep(0.35)
+    return out
+
+
 async def daily_bars(symbols: list[str], start: str) -> dict[str, list[tuple]]:
     auth_ = auth()
     alp = {s: s.replace("-", ".") for s in symbols}
@@ -195,6 +216,16 @@ def main() -> int:
         near = [a for a in by_ticker.get(g["ticker"], []) if abs(start_t - a["t"]) < 86400]
         first = min(near, key=lambda a: a["t"]) if near else None
         g_rows.append({**g, "alert_lead_min": round((start_t - first["t"]) / 60) if first and start_t else None})
+    # for each gainer the bot did not alert: did Benzinga write a results headline before the move, and
+    # what did the earnings table make of it? (missed headline = source gap, low score = below the bar)
+    missed = [g for g in g_rows if g["alert_lead_min"] is None and g.get("start")]
+    heads = asyncio.run(benzinga_heads(missed))
+    for g, hs in zip(missed, heads):
+        sig = bot.earnings_signal(hs) if hs else {}
+        sc = bot.earnings_score(sig) if hs else None
+        g["bz_results"] = hs[:4]
+        g["bz_score"] = sc[0] if sc else None
+        g["bz_reason"] = sc[1] if sc else ""
     (OUT / "gainers.jsonl").write_text("".join(json.dumps(r) + "\n" for r in g_rows), encoding="utf-8")
     caught = [g for g in g_rows if g["alert_lead_min"] is not None]
     before = [g for g in caught if g["alert_lead_min"] >= 0]
@@ -209,6 +240,13 @@ def main() -> int:
                "no news" if not g.get("title") else "unseen" if g.get("missing_source") else f"low score {g.get('rule_score')}")
         lines.append(f"- {g['date']} {g['ticker']} +{g['pct']:.0f}% ({tag}) [{g.get('cat') or ''}] "
                      f"{(g.get('title') or '')[:90]}")
+        if g.get("bz_results"):
+            lines.append(f"    - Benzinga results headlines before the move (score {g['bz_score']}: {g['bz_reason'][:80]}): "
+                         + " | ".join(h[:80] for h in g["bz_results"][:2]))
+    with_heads = [g for g in g_rows if g.get("bz_results")]
+    lines += ["", f"missed gainers with a Benzinga results headline before the move: {len(with_heads)} "
+              f"(scored 4+ by the earnings table, i.e. the bot should have alerted: "
+              f"{sum(1 for g in with_heads if (g.get('bz_score') or 0) >= 4)})"]
     text = "\n".join(lines) + "\n"
     (OUT / "report.md").write_text(text, encoding="utf-8")
     print(text)
