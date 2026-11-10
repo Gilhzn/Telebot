@@ -57,6 +57,14 @@ ALPACA_NEWS_STREAM = "wss://stream.data.alpaca.markets/v1beta1/news"   # Benzing
 ALPACA_SOURCE = "Benzinga"
 ALPACA_NEWS_URL = "https://data.alpaca.markets/v1beta1/news?limit=50&sort=desc&include_content=true"
 ALPACA_NEWS_POLL_SECONDS = 10     # the stream skips Benzinga Newsdesk's results headlines ("Q3 EPS $X Beats $Y")
+# Items reach the REST feed 1-5 minutes after their own time, and in an earnings-season burst more than 50
+# newer ones are listed by then (TREX, XERS, MGNI, LASR: 'EPS Beats' headlines the table scores 5, never seen).
+# So every minute the last ALPACA_NEWS_LOOKBACK seconds are read in full, and at start-up items that recent
+# are still news (the persisted seen-list keeps the previous run's items out).
+ALPACA_NEWS_SWEEP_URL = "https://data.alpaca.markets/v1beta1/news"
+ALPACA_NEWS_SWEEP_SECONDS = 60
+ALPACA_NEWS_LOOKBACK = 20 * 60
+ALPACA_NEWS_SWEEP_PAGES = 8
 ALPACA_MOVERS_URL = "https://data.alpaca.markets/v1beta1/screener/stocks/movers?top=50"   # market-wide, real time
 MOVERS_RECHECK_SECONDS = 180
 ALPACA_SNAPSHOTS_URL = "https://data.alpaca.markets/v2/stocks/snapshots?symbols={symbols}&feed=delayed_sip"
@@ -2603,27 +2611,54 @@ class Radar:
             return
         headers = {"APCA-API-KEY-ID": self.cfg.alpaca_key_id, "APCA-API-SECRET-KEY": self.cfg.alpaca_secret}
         first = True
+        last_sweep = 0.0
         while not self.stop_event.is_set():
             try:
                 resp = await self.client.get(ALPACA_NEWS_URL, headers=headers, timeout=10)
                 resp.raise_for_status()
-                news = resp.json().get("news") or []
-                for m in reversed(news):
-                    m = {**m, "T": "n"}
-                    if first:
-                        try:
-                            age = time.time() - dt.datetime.fromisoformat(
-                                str(m.get("created_at", "")).replace("Z", "+00:00")).timestamp()
-                        except ValueError:
-                            age = 1e9
-                        if age > 180:      # at start-up only the last 3 minutes are news
-                            self.state.mark_seen(f"wire:bz:{m.get('id')}")
-                            continue
-                    self.handle_alpaca_news(m)
+                self.handle_alpaca_batch(resp.json().get("news") or [], first)
                 first = False
+                if time.time() - last_sweep >= ALPACA_NEWS_SWEEP_SECONDS:
+                    last_sweep = time.time()
+                    await self.alpaca_news_sweep(headers)
             except Exception as exc:  # noqa: BLE001
                 log.info("Alpaca news poll failed: %s", describe_error(exc))
             await self._sleep(ALPACA_NEWS_POLL_SECONDS)
+
+    def handle_alpaca_batch(self, news: list[dict[str, Any]], first: bool = False) -> None:
+        for m in reversed(news):
+            m = {**m, "T": "n"}
+            try:
+                age = time.time() - dt.datetime.fromisoformat(
+                    str(m.get("created_at", "")).replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                age = 1e9
+            if age > ALPACA_NEWS_LOOKBACK and first:
+                self.state.mark_seen(f"wire:bz:{m.get('id')}")     # older than the look-back: not news any more
+                continue
+            if age > ALPACA_NEWS_LOOKBACK:
+                continue
+            self.handle_alpaca_news(m)
+
+    async def alpaca_news_sweep(self, headers: dict[str, str]) -> None:
+        """Every item of the last ALPACA_NEWS_LOOKBACK seconds, newest first, page by page."""
+        start = dt.datetime.fromtimestamp(time.time() - ALPACA_NEWS_LOOKBACK, dt.timezone.utc)
+        params: dict[str, Any] = {"start": start.strftime("%Y-%m-%dT%H:%M:%SZ"), "limit": 50, "sort": "desc",
+                                  "include_content": "false"}
+        late = 0
+        for _ in range(ALPACA_NEWS_SWEEP_PAGES):
+            resp = await self.client.get(ALPACA_NEWS_SWEEP_URL, params=params, headers=headers, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            news = data.get("news") or []
+            late += sum(1 for m in news if not self.state.is_seen(f"wire:bz:{m.get('id')}")
+                        and is_results_headline(m.get("headline") or ""))
+            self.handle_alpaca_batch(news)
+            if not data.get("next_page_token"):
+                break
+            params["page_token"] = data["next_page_token"]
+        if late:
+            log.info("Alpaca news sweep: %d results headlines the 10-second poll had not listed", late)
 
     def handle_alpaca_news(self, m: dict[str, Any]) -> None:
         it = alpaca_news_item(m)

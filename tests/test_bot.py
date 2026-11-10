@@ -2222,6 +2222,36 @@ class AlpacaNewsPollTest(unittest.TestCase):
         self.assertIn("דוח מכה צפי", texts[0])
 
 
+class AlpacaNewsSweepTest(unittest.TestCase):
+    def test_a_headline_listed_late_is_found_by_the_sweep(self) -> None:
+        d = __import__("datetime")
+
+        async def scenario() -> list[str]:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = base_world()
+            now = d.datetime.now(d.timezone.utc)
+            iso = lambda t: t.strftime("%Y-%m-%dT%H:%M:%SZ")  # noqa: E731
+            eps = {"id": 7, "created_at": iso(now - d.timedelta(minutes=7)), "symbols": ["OKLO"], "source": "benzinga",
+                   "url": "https://x", "headline": "Oklo Q3 Adj. EPS $0.42 Beats $0.30 Estimate, Sales $130M Beat $120M Estimate",
+                   "summary": ""}
+            w.set(bot.ALPACA_NEWS_URL, {"news": []})                 # pushed off the newest 50 by the time it was listed
+            w.set(bot.ALPACA_NEWS_SWEEP_URL + "*", {"news": [eps]})
+            async with w.client() as client:
+                radar = bot.Radar(make_cfg(Path(tmp.name), alpaca_key_id="k", alpaca_secret="s"), client)
+                await radar.refresh_tickers()
+
+                async def stop_after(_: float) -> None:
+                    radar.stop_event.set()
+                with mock.patch.object(radar, "_sleep", new=stop_after):
+                    await radar.alpaca_news_poll_loop()
+                await radar.drain(5)
+            return [m["text"] for m in w.sent]
+        texts = run(scenario())
+        self.assertEqual(len(texts), 1, texts)
+        self.assertIn("<b>OKLO</b>", texts[0])
+
+
 class SlowSectorTest(unittest.TestCase):
     def alerts(self, title: str) -> list[str]:
         async def scenario() -> list[str]:
