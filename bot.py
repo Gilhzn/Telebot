@@ -1062,6 +1062,7 @@ GAINERS_MIN_VOLUME = 300_000
 GAINERS_TOP = 15
 MOVE_START_PCT = 0.10             # the move starts at the first minute 10% above the previous close
 NEWS_LOG_HOURS = 72
+RESULTS_TABLE_WAIT = 20 * 60      # how long a results release waits for Benzinga's numbers headline
 GAINERS_LOG_MAX = 4_000
 LEARNING_READY_DAYS = 10          # trading days of data before the "ready" summary
 SPLIT_ARTIFACT_PCT = 15.0         # a "gain" its 1-minute bars never come close to (under 15% / 60% of it) is a reverse split
@@ -1869,6 +1870,12 @@ def snapshot_day_moves(data: dict[str, Any], today: dt.date) -> dict[str, tuple[
     return out
 
 
+def is_results_headline(head: str) -> bool:
+    """Benzinga's results / guidance headline ("Q3 EPS $0.28 Beats $0.19 Estimate", "Raises FY26 ...")."""
+    return bool(EPS_HEAD_RE.search(head) or SALES_HEAD_RE.search(head) or GUIDE_RANGE_RE.search(head)
+                or GUIDE_WORD_UP_RE.search(head) or GUIDE_WORD_DOWN_RE.search(head)) and not ANALYST_RE.search(head)
+
+
 def alpaca_news_item(m: dict[str, Any]) -> WireItem | None:
     """A message from Alpaca's news stream as a wire item; None for Benzinga's market commentary."""
     head = m.get("headline") or ""
@@ -2258,6 +2265,8 @@ class Candidate:
     summary: str = ""
     text: str | None = None     # fetched text, cached between steps
     earnings: bool = False      # scored by the earnings-surprise table (not muted by the jump model)
+    await_table: bool = False   # a results release with a raised outlook, waiting for Benzinga's numbers
+    table_wait_done: bool = False
 
     @property
     def dedup_key(self) -> str:
@@ -2355,6 +2364,7 @@ class Radar:
         self.prices: dict[str, tuple[float, float, float]] = {}    # ticker -> (fetched at, price, 5-day change)
         self.sec_cache: dict[str, tuple[float, Any]] = {}
         self.mcaps: dict[str, tuple[float, float | None]] = {}     # ticker -> (computed at, market cap)
+        self.table_wait = RESULTS_TABLE_WAIT
         self.jump_model = load_jump_model() if cfg.jump_model else None
         self.momentum_checked: dict[str, float] = {}
         self.momentum_scan_at = 0.0
@@ -2770,6 +2780,13 @@ class Radar:
             # A year of $1B+ results releases: without a raised outlook score-4+ ones rose 18% / fell 21%
             # of the time (with one: 31% / 12%). The numbers decide, from Benzinga's headline.
             score, reason = 3, f"{reason} (דוח בלי העלאת תחזית: מחכה לכותרת המספרים)"
+        elif (EARNINGS_RE.search(f"{c.title}\n{body[:LEAD_CHARS]}") or "2.02" in c.items) and score > 3 \
+                and c.source_label != ALPACA_SOURCE and not c.table_wait_done:
+            # A year of $1B+ releases with a raised outlook: 35% rose 10%+. When Benzinga's numbers headline
+            # scored the same results 4-5, 60% rose; below 4 (two in three of them), 19%; with no Benzinga
+            # headline at all, 50%. So the numbers decide, and without them the release does after a wait.
+            score, reason = 3, f"{reason} (דוח עם העלאת תחזית: מחכה לכותרת המספרים)"
+            c.await_table = True
         earned = self.earnings_view(c)
         if earned is not None:
             score, reason = earned
@@ -2938,6 +2955,8 @@ class Radar:
                 log.info("Rejected %s (%s): %s", c.ticker, rejected, c.title or c.items)
                 return
             promotes = bool(self.jump_model) and float(self.jump_model.get("promote_at", 2.0)) <= 1.0
+            if c.await_table and c.ticker:
+                self.spawn(self.results_table_fallback(c))
             if score < self.cfg.min_score and not (promotes and score >= 0 and c.ticker):
                 log.info("Below threshold %s (%s): %s", c.ticker, score, c.title or c.items)
                 return
@@ -3001,6 +3020,19 @@ class Radar:
             if self.state.last_alert.get(key) == now:
                 del self.state.last_alert[key]
             log.error("Sending alert for %s failed: %s", key, exc)
+
+    async def results_table_fallback(self, c: Candidate) -> None:
+        """A results release with a raised outlook waits for Benzinga's numbers headline, which the
+        earnings table scores; if none comes within RESULTS_TABLE_WAIT the release is scored by itself."""
+        started = time.time()
+        await asyncio.sleep(self.table_wait)
+        heads = [n["title"] for n in self.state.news_log.get(c.ticker or "", [])
+                 if n["src"] == ALPACA_SOURCE and n["t"] >= started - 600 and is_results_headline(n["title"])]
+        if heads:
+            log.info("Results of %s scored by Benzinga's numbers headline: %s", c.ticker, heads[0])
+            return
+        log.info("No Benzinga numbers headline for %s within %ds: the release decides", c.ticker, self.table_wait)
+        await self.process(Candidate(**{**c.__dict__, "await_table": False, "table_wait_done": True}))
 
     def should_alert(self, score: int, odds: JumpOdds | None) -> bool:
         """Rules decide; the jump model, when present, adds golden news the rules scored low and

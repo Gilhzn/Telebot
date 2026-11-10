@@ -2311,6 +2311,41 @@ class DealStepTest(unittest.TestCase):
             self.assertGreaterEqual(bot.rule_score(title, company, title=title).score, 4, title)
 
 
+class ResultsTableWaitTest(unittest.TestCase):
+    TITLE = "Oklo Reports Third Quarter 2026 Results and Raises Full-Year Guidance"
+
+    def alerts(self, benzinga_head: str | None) -> tuple[list[str], int]:
+        async def scenario() -> tuple[list[str], int]:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = MarketCapTest().world(40e6)
+            async with w.client() as client:
+                radar = bot.Radar(make_cfg(Path(tmp.name), min_market_cap=1e9), client)
+                radar.table_wait = 0.05
+                await radar.refresh_tickers()
+                c = bot.Candidate(source="wire", source_label="GlobeNewswire", ticker="OKLO", company="Oklo Inc.",
+                                  title=self.TITLE, link="https://x", published_ts=None, watch=False, summary=self.TITLE)
+                c.text = self.TITLE
+                await radar.process(c)
+                sent_at_once = len(w.sent)
+                if benzinga_head:
+                    radar.state.log_news("OKLO", bot.ALPACA_SOURCE, benzinga_head, time.time())
+                await radar.drain(5)
+            return [m["text"] for m in w.sent], sent_at_once
+        return run(scenario())
+
+    def test_the_release_waits_for_the_numbers(self) -> None:
+        sent, at_once = self.alerts("Oklo Q3 Adj. EPS $0.31 Beats $0.30 Estimate, Sales $130M Beat $129M Estimate")
+        self.assertEqual(at_once, 0)
+        self.assertEqual(sent, [])            # Benzinga's numbers came: the earnings table decides, not the release
+
+    def test_without_numbers_the_release_decides(self) -> None:
+        sent, at_once = self.alerts(None)
+        self.assertEqual(at_once, 0)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("<b>OKLO</b>", sent[0])
+
+
 class PredictionsOnlyTest(unittest.TestCase):
     def test_only_rise_predictions_are_pushed(self) -> None:
         dtm = __import__("datetime")
