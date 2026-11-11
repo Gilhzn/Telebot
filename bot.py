@@ -1070,7 +1070,7 @@ GAINERS_MIN_VOLUME = 300_000
 GAINERS_TOP = 15
 MOVE_START_PCT = 0.10             # the move starts at the first minute 10% above the previous close
 NEWS_LOG_HOURS = 72
-RESULTS_TABLE_WAIT = 20 * 60      # how long a results release waits for Benzinga's numbers headline
+RESULTS_TABLE_WAIT = 8 * 60       # how long a results release waits for Benzinga's numbers headline (3-5 min typical)
 GAINERS_LOG_MAX = 4_000
 LEARNING_READY_DAYS = 10          # trading days of data before the "ready" summary
 SPLIT_ARTIFACT_PCT = 15.0         # a "gain" its 1-minute bars never come close to (under 15% / 60% of it) is a reverse split
@@ -2110,6 +2110,7 @@ class State:
         self.gainers_log: list[dict[str, Any]] = []      # daily study of the biggest gainers
         self.gainers_day = ""
         self.learning_ready_sent = False
+        self.pending_results: list[dict[str, Any]] = []   # results releases waiting for Benzinga's numbers
         self.news_log_since = 0.0                        # when news logging started (first full day only)
         self.momentum: dict[str, Any] = {"date": "", "tickers": []}  # breakout alerts sent today
         self.runners: dict[str, Any] = {"day": "", "tickers": []}   # recent runners, watched before the open
@@ -2145,6 +2146,7 @@ class State:
         st.gainers_log = data.get("gainers_log", [])
         st.gainers_day = data.get("gainers_day", "")
         st.learning_ready_sent = bool(data.get("learning_ready_sent", False))
+        st.pending_results = [e for e in data.get("pending_results", []) if isinstance(e, dict) and "c" in e]
         st.news_log_since = float(data.get("news_log_since", 0.0))
         st.momentum = data.get("momentum", {"date": "", "tickers": []})
         st.runners = data.get("runners", {"day": "", "tickers": []})
@@ -2202,6 +2204,7 @@ class State:
             "gainers_log": self.gainers_log[-GAINERS_LOG_MAX:],
             "gainers_day": self.gainers_day,
             "learning_ready_sent": self.learning_ready_sent,
+            "pending_results": self.pending_results[-50:],
             "news_log_since": self.news_log_since,
             "momentum": self.momentum,
             "runners": self.runners,
@@ -2392,6 +2395,7 @@ class Radar:
         self.sec_cache: dict[str, tuple[float, Any]] = {}
         self.mcaps: dict[str, tuple[float, float | None]] = {}     # ticker -> (computed at, market cap)
         self.table_wait = RESULTS_TABLE_WAIT
+        self.waits: set[asyncio.Task[Any]] = set()
         self.fact_shares: dict[int, tuple[float, float | None]] = {}   # CIK -> (fetched at, statement share count)
         self.jump_model = load_jump_model() if cfg.jump_model else None
         self.momentum_checked: dict[str, float] = {}
@@ -3029,7 +3033,7 @@ class Radar:
                 return
             promotes = bool(self.jump_model) and float(self.jump_model.get("promote_at", 2.0)) <= 1.0
             if c.await_table and c.ticker:
-                self.spawn(self.results_table_fallback(c))
+                self.queue_results_wait(c)
             if score < self.cfg.min_score and not (promotes and score >= 0 and c.ticker):
                 log.info("Below threshold %s (%s): %s", c.ticker, score, c.title or c.items)
                 return
@@ -3094,18 +3098,43 @@ class Radar:
                 del self.state.last_alert[key]
             log.error("Sending alert for %s failed: %s", key, exc)
 
-    async def results_table_fallback(self, c: Candidate) -> None:
-        """A results release with a raised outlook waits for Benzinga's numbers headline, which the
-        earnings table scores; if none comes within RESULTS_TABLE_WAIT the release is scored by itself."""
-        started = time.time()
-        await asyncio.sleep(self.table_wait)
+    def queue_results_wait(self, c: Candidate) -> None:
+        """Hold a results release with a raised outlook until Benzinga's numbers headline can decide. The
+        wait is kept in the state, so a run that ends meanwhile hands it to the next one."""
+        fields = {k: v for k, v in c.__dict__.items() if k not in ("await_table", "table_wait_done")}
+        fields["text"] = (c.text or "")[:6000]
+        entry = {"started": time.time(), "due": time.time() + self.table_wait, "c": fields}
+        self.state.pending_results.append(entry)
+        self.state.dirty = True
+        self.start_results_wait(entry)
+
+    def start_results_wait(self, entry: dict[str, Any]) -> None:
+        task = asyncio.create_task(self.results_table_fallback(entry))   # not in self.tasks: drain() must not wait for it
+        self.waits.add(task)
+        task.add_done_callback(self.waits.discard)
+
+    def resume_results_waits(self) -> None:
+        for entry in list(self.state.pending_results):
+            if time.time() - entry.get("due", 0) > 3600:
+                self.state.pending_results.remove(entry)     # a stale wait from a run long ago
+            else:
+                self.start_results_wait(entry)
+
+    async def results_table_fallback(self, entry: dict[str, Any]) -> None:
+        """If no Benzinga numbers headline came while the release waited, the release is scored by itself."""
+        await asyncio.sleep(max(0.0, entry["due"] - time.time()))
+        if entry not in self.state.pending_results:
+            return
+        self.state.pending_results.remove(entry)
+        self.state.dirty = True
+        c = Candidate(**{**entry["c"], "table_wait_done": True})
         heads = [n["title"] for n in self.state.news_log.get(c.ticker or "", [])
-                 if n["src"] == ALPACA_SOURCE and n["t"] >= started - 600 and is_results_headline(n["title"])]
+                 if n["src"] == ALPACA_SOURCE and n["t"] >= entry["started"] - 600 and is_results_headline(n["title"])]
         if heads:
             log.info("Results of %s scored by Benzinga's numbers headline: %s", c.ticker, heads[0])
             return
-        log.info("No Benzinga numbers headline for %s within %ds: the release decides", c.ticker, self.table_wait)
-        await self.process(Candidate(**{**c.__dict__, "await_table": False, "table_wait_done": True}))
+        log.info("No Benzinga numbers headline for %s while the release waited: the release decides", c.ticker)
+        await self.process(c)
 
     def should_alert(self, score: int, odds: JumpOdds | None) -> bool:
         """Rules decide; the jump model, when present, adds golden news the rules scored low and
@@ -4119,6 +4148,7 @@ class Radar:
             await self.reply("🟢 <b>Stock News Radar פעיל</b>\n" + self.help_text())
         else:
             log.warning("TELEGRAM_CHAT_ID is empty — open the bot in Telegram and press Start")
+        self.resume_results_waits()
         loops = [self.edgar_loop(), self.wire_loop(), self.command_loop(),
                  self.ticker_refresh_loop(), self.save_loop(), self.catalyst_loop(), self.momentum_loop(),
                  self.halts_loop(), self.alpaca_news_loop(), self.alpaca_news_poll_loop()]
@@ -4126,7 +4156,7 @@ class Radar:
         try:
             await self.stop_event.wait()
         finally:
-            for t in tasks:
+            for t in tasks + list(self.waits):
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             await self.drain(timeout=10)

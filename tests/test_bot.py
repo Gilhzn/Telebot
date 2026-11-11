@@ -2388,14 +2388,38 @@ class ResultsTableWaitTest(unittest.TestCase):
                 sent_at_once = len(w.sent)
                 if benzinga_head:
                     radar.state.log_news("OKLO", bot.ALPACA_SOURCE, benzinga_head, time.time())
+                await asyncio.gather(*radar.waits)
                 await radar.drain(5)
+                self.pending = list(radar.state.pending_results)
             return [m["text"] for m in w.sent], sent_at_once
         return run(scenario())
+
+    def test_a_wait_left_by_the_last_run_is_resumed(self) -> None:
+        async def scenario() -> list[str]:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = MarketCapTest().world(40e6)
+            async with w.client() as client:
+                radar = bot.Radar(make_cfg(Path(tmp.name), min_market_cap=1e9), client)
+                await radar.refresh_tickers()
+                fields = {"source": "wire", "source_label": "GlobeNewswire", "ticker": "OKLO", "company": "Oklo Inc.",
+                          "title": self.TITLE, "link": "https://x", "published_ts": None, "watch": False,
+                          "summary": self.TITLE, "text": self.TITLE, "items": [], "form": "", "earnings": False}
+                radar.state.pending_results = [json.loads(json.dumps(
+                    {"started": time.time() - 600, "due": time.time() - 60, "c": fields}))]   # through the state file
+                radar.resume_results_waits()
+                await asyncio.gather(*radar.waits)
+                await radar.drain(5)
+                self.assertEqual(radar.state.pending_results, [])
+            return [m["text"] for m in w.sent]
+        sent = run(scenario())
+        self.assertEqual(len(sent), 1)
 
     def test_the_release_waits_for_the_numbers(self) -> None:
         sent, at_once = self.alerts("Oklo Q3 Adj. EPS $0.31 Beats $0.30 Estimate, Sales $130M Beat $129M Estimate")
         self.assertEqual(at_once, 0)
         self.assertEqual(sent, [])            # Benzinga's numbers came: the earnings table decides, not the release
+        self.assertEqual(self.pending, [])
 
     def test_without_numbers_the_release_decides(self) -> None:
         sent, at_once = self.alerts(None)
