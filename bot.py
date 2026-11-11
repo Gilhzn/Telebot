@@ -1404,6 +1404,12 @@ def earnings_signal(headlines: list[str]) -> dict[str, Any]:
 JUMP_MODEL_FILE = Path(__file__).resolve().parent / "data" / "jump_model.json"
 SEC_FRAMES_URL = "https://data.sec.gov/api/xbrl/frames/dei/EntityCommonStockSharesOutstanding/shares/{period}.json"
 SEC_SHARES_URL = "https://data.sec.gov/api/xbrl/companyconcept/CIK{cik:010d}/dei/EntityCommonStockSharesOutstanding.json"
+# When the cover-page count is missing (dual-class companies report it per class, which the concept API
+# leaves out; some foreign filers never tag it), the company's own financial statements still have one:
+# CoreWeave (539M shares, ~$50B) was skipped as "too small (market cap unknown)" on 10.11.
+SEC_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
+FALLBACK_SHARE_FACTS = ("CommonStockSharesOutstanding", "WeightedAverageNumberOfSharesOutstandingBasic",
+                        "WeightedAverageNumberOfDilutedSharesOutstanding")
 YAHOO_DAILY_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=10d&interval=1d"
 _MONTH_NAMES_RE = (r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|June?|July?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|"
            r"Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)")
@@ -1876,6 +1882,19 @@ def snapshot_day_moves(data: dict[str, Any], today: dt.date) -> dict[str, tuple[
         if day_date == today and day.get("c") and prev.get("c"):
             out[normalize_ticker(sym)] = ((day["c"] / prev["c"] - 1) * 100, day["c"], prev["c"], day.get("v") or 0)
     return out
+
+
+def shares_from_facts(facts: dict[str, Any], today: dt.date) -> float | None:
+    """The latest share count in SEC companyfacts (us-gaap shares outstanding, else the weighted average),
+    ignoring counts older than 15 months."""
+    gaap = (facts.get("facts") or {}).get("us-gaap") or {}
+    oldest = (today - dt.timedelta(days=460)).isoformat()
+    for name in FALLBACK_SHARE_FACTS:
+        units = [u for u in ((gaap.get(name) or {}).get("units") or {}).get("shares") or []
+                 if (u.get("val") or 0) > 1000 and u.get("end", "") >= oldest]
+        if units:
+            return float(max(units, key=lambda u: (u.get("end", ""), u.get("filed", "")))["val"])
+    return None
 
 
 def is_results_headline(head: str) -> bool:
@@ -2373,6 +2392,7 @@ class Radar:
         self.sec_cache: dict[str, tuple[float, Any]] = {}
         self.mcaps: dict[str, tuple[float, float | None]] = {}     # ticker -> (computed at, market cap)
         self.table_wait = RESULTS_TABLE_WAIT
+        self.fact_shares: dict[int, tuple[float, float | None]] = {}   # CIK -> (fetched at, statement share count)
         self.jump_model = load_jump_model() if cfg.jump_model else None
         self.momentum_checked: dict[str, float] = {}
         self.momentum_scan_at = 0.0
@@ -2904,12 +2924,30 @@ class Radar:
         facts = await self.sec_json(SEC_SHARES_URL.format(cik=found[0]), max_age=86400)
         units = ((facts or {}).get("units") or {}).get("shares") or []
         shares = float(max(units, key=lambda u: u.get("end", ""))["val"]) if units else None
+        if not shares:
+            shares = await self.statement_shares(found[0])
         if price is None:
             quote_ = await self.daily_quote(ticker)
             price = quote_[0] if quote_ else None
         mcap = price * shares if price and shares else None
         self.mcaps[ticker] = (time.time(), mcap)
         return mcap
+
+    async def statement_shares(self, cik: int) -> float | None:
+        """Share count from the company's financial statements (SEC companyfacts), cached a day. Only the
+        number is kept: the document itself can be megabytes."""
+        cached = self.fact_shares.get(cik)
+        if cached and time.time() - cached[0] < 86400:
+            return cached[1]
+        shares = None
+        try:
+            resp = await self.fetcher.get(SEC_FACTS_URL.format(cik=cik), timeout=8.0)
+            if resp is not None and resp.status_code == 200:
+                shares = shares_from_facts(resp.json(), us_eastern_now().date())
+        except Exception as exc:  # noqa: BLE001
+            log.info("SEC companyfacts for CIK %s unavailable: %s", cik, describe_error(exc))
+        self.fact_shares[cik] = (time.time(), shares)
+        return shares
 
     async def sector(self, ticker: str | None) -> str:
         found = self.tickers.lookup(ticker) if ticker else None

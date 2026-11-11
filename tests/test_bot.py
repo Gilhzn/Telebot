@@ -1947,6 +1947,34 @@ class MarketCapTest(unittest.TestCase):
             return [m["text"] for m in w.sent]
         return run(scenario())
 
+    def test_statement_share_count_when_the_cover_page_count_is_missing(self) -> None:
+        # dual-class companies (CoreWeave) have no cover-page count in the concept API: the 10-Q's is used
+        async def scenario() -> list[str]:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = self.world(40e6)
+            w.set(bot.SEC_SHARES_URL.format(cik=1849056), {}, status=404)
+            w.set(bot.SEC_FACTS_URL.format(cik=1849056), {"facts": {"us-gaap": {
+                "WeightedAverageNumberOfSharesOutstandingBasic": {"units": {"shares": [
+                    {"end": "2020-06-30", "val": 1_000_000, "filed": "2020-08-01"},
+                    {"end": bot.us_eastern_now().date().isoformat(), "val": 40_000_000, "filed": "2026-08-12"}]}}}}})
+            async with w.client() as client:
+                radar = bot.Radar(make_cfg(Path(tmp.name), min_market_cap=1e9), client)
+                await radar.refresh_tickers()
+                radar.handle_alpaca_news(AlpacaNewsTest.MSG)
+                await radar.drain(5)
+            return [m["text"] for m in w.sent]
+        texts = run(scenario())
+        self.assertEqual(len(texts), 1, texts)
+        self.assertIn("שווי $2.0B", texts[0])
+
+    def test_shares_from_facts_ignores_stale_counts(self) -> None:
+        d = __import__("datetime")
+        facts = {"facts": {"us-gaap": {"CommonStockSharesOutstanding": {"units": {"shares": [
+            {"end": "2023-12-31", "val": 5_000_000}]}}}}}
+        self.assertIsNone(bot.shares_from_facts(facts, d.date(2026, 11, 11)))
+        self.assertEqual(bot.shares_from_facts(facts, d.date(2024, 6, 1)), 5_000_000)
+
     def test_large_company_alerts_with_its_size(self) -> None:
         texts = self.alerts(40_000_000)                     # 40M x $50 = $2.0B
         self.assertEqual(len(texts), 1, texts)
