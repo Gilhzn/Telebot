@@ -50,6 +50,9 @@ jobs:
             feeds) python tools/probe_feeds.py "$@" ;;
             guru) python tools/guru_probe.py "$@" ;;
             earndemo) python tools/earnings_demo.py ;;            # one sample earnings alert to Telegram
+            pushcheck)   # one test message to Telegram with the last day's alerts
+              git fetch --depth 1 origin state && git show FETCH_HEAD:state.json > "$RUNNER_TEMP/state.json"
+              python tools/push_check.py "$RUNNER_TEMP/state.json" ;;
             gprobe) python tools/gainers_probe.py ;;
             uaprobe) python tools/ua_probe.py ;;
             gainers) python tools/gainers.py "$@" ;;
