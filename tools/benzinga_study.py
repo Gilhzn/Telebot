@@ -112,7 +112,8 @@ async def collect(start: str, end: str) -> None:
                 sc = score_item(it.title, it.summary[:500], company)
                 if sc["score"] >= 2 or sc["title_score"] >= 2:
                     items.append({"symbol": listed[0], "company": company, "ts": it.published_ts, "title": it.title,
-                                  "summary": it.summary[:500], **sc})
+                                  "summary": it.summary[:500], "id": n.get("id"), "author": n.get("author") or "",
+                                  "source": n.get("source") or "", **sc})
             pages += 1
             token = data.get("next_page_token")
             if pages % 500 == 0:
@@ -214,6 +215,10 @@ def report(rows: list[dict[str, Any]]) -> None:
     for s in (5, 4, 3, 2):
         row(f"title alone {s}", [r for r in first if r["title_score"] == s])
     alert = [r for r in first if r["score"] >= 4]
+    if any("author" in r for r in first):
+        # Benzinga republishes the wires' press releases with no author; its own newsroom stories have one
+        row("alerted, press releases (no author)", [r for r in alert if not r.get("author")])
+        row("alerted, Benzinga newsroom (author)", [r for r in alert if r.get("author")])
     row("alerted (4+), title alone 4+", [r for r in alert if r["title_score"] >= 4])
     row("alerted (4+), title alone below 4", [r for r in alert if r["title_score"] < 4])
     for lo, hi, nm in ((1e9, 2e9, "1-2B"), (2e9, 10e9, "2-10B"), (10e9, 50e9, "10-50B"), (50e9, 1e16, "50B+")):
