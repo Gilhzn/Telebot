@@ -439,7 +439,7 @@ class PipelineTest(unittest.TestCase):
         w.set(f"{base}/1111111/x/ex99.htm", OFFERING_PR)
         # Same OKLO news on the wire (should be de-duplicated), plus a neutral PR.
         w.set(PRN, rss_feed([
-            rss_item("prn-2", "Oklo Awarded $450 Million Contract by U.S. Department of Defense",
+            rss_item("prn-2", "Oklo Announces Positive Topline Results From Pivotal Phase 3 Trial",
                      "Oklo Inc. (NYSE: OKLO) today announced", "https://www.prnewswire.com/oklo.html"),
             rss_item("prn-3", "Target Bio to Present at Jefferies Conference",
                      "Target Bio Inc. (NASDAQ: TBIO) will present", "https://www.prnewswire.com/tbio.html"),
@@ -877,7 +877,7 @@ class RobustnessTest(unittest.TestCase):
                     for u in (PRN, bio):
                         await radar.poll_wire(u)
                     item = rss_item("https://www.prnewswire.com/oklo.html",
-                                    "Oklo Awarded $450 Million Contract by U.S. Department of Defense",
+                                    "Oklo Announces Positive Topline Results From Pivotal Phase 3 Trial",
                                     "Oklo Inc. (NYSE: OKLO) today announced", "https://www.prnewswire.com/oklo.html")
                     world.set(PRN, rss_feed([item]))
                     world.set(bio, rss_feed([item]))
@@ -918,7 +918,7 @@ class RobustnessTest(unittest.TestCase):
                     await radar.refresh_tickers()
                     await radar.poll_wire(bw)
                     world.set(bw, rss_feed([rss_item(
-                        "bw-1", "Oklo Inc. Awarded $450 Million Contract by U.S. Department of Defense",
+                        "bw-1", "Oklo Inc. Announces Positive Topline Results From Pivotal Phase 3 Trial",
                         "No ticker in this summary", "https://www.businesswire.com/news/home/oklo")]))
                     await radar.poll_wire(bw)
                     await radar.drain()
@@ -1201,7 +1201,7 @@ class ContinuousRunTest(unittest.TestCase):
                     async def news_arrives() -> None:
                         await asyncio.sleep(0.3)
                         w.set(PRN, rss_feed([
-                            rss_item("prn-2", "Oklo Awarded $450 Million Contract by U.S. Department of Defense",
+                            rss_item("prn-2", "Oklo Announces Positive Topline Results From Pivotal Phase 3 Trial",
                                      "Oklo Inc. (NYSE: OKLO) today announced",
                                      "https://www.prnewswire.com/oklo.html"),
                             rss_item("old-1", "Old news", "Oklo Inc. (NYSE: OKLO) old",
@@ -1845,7 +1845,7 @@ class HaltsTest(unittest.TestCase):
 
 PRN_LIST_PAGE = """<div class="row newsCards" lang="en-US"> <div role="group" aria-label="News Release" class="card col-view">
 <a class="newsreleaseconsolidatelink display-outline w-100" href="/news-releases/oklo-awarded-450-million-contract-302902476.html">
-<div class="col-sm-8 col-lg-9 pull-left card"> <h3> <small>11:19 ET</small> Oklo Awarded $450 Million Contract by U.S. Department of Defense </h3>
+<div class="col-sm-8 col-lg-9 pull-left card"> <h3> <small>11:19 ET</small> Oklo Announces Positive Topline Results From Pivotal Phase 3 Trial </h3>
 <p class="remove-outline">The contract covers the deployment of microreactors ...</p> </div> </a> </div> </div>
 <div class="row newsCards"><div class="card col-view"><a class="newsreleaseconsolidatelink display-outline w-100" href="/news-releases/old-news-302800001.html">
 <div class="card"><h3><small>Oct 07, 2026, 18:00 ET</small> Old news </h3><p class="remove-outline">x</p></div></a></div></div>"""
@@ -1856,7 +1856,7 @@ class PrnListTest(unittest.TestCase):
         now = __import__("datetime").datetime(2026, 10, 8, 11, 20)
         items = bot.parse_prn_list(PRN_LIST_PAGE, now)
         self.assertEqual([i.title for i in items],
-                         ["Oklo Awarded $450 Million Contract by U.S. Department of Defense", "Old news"])
+                         ["Oklo Announces Positive Topline Results From Pivotal Phase 3 Trial", "Old news"])
         self.assertEqual(items[0].link, "https://www.prnewswire.com/news-releases/oklo-awarded-450-million-contract-302902476.html")
         et = __import__("datetime").datetime.fromtimestamp(items[0].published_ts, bot.eastern_tz())
         self.assertEqual((et.day, et.hour, et.minute), (8, 11, 19))
@@ -2426,6 +2426,46 @@ class ResultsTableWaitTest(unittest.TestCase):
         self.assertEqual(at_once, 0)
         self.assertEqual(len(sent), 1)
         self.assertIn("<b>OKLO</b>", sent[0])
+
+
+class PressReleaseGateTest(unittest.TestCase):
+    def alerts(self, title: str, press_release: bool = True) -> list[str]:
+        async def scenario() -> list[str]:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = MarketCapTest().world(40e6)                                   # $2B
+            async with w.client() as client:
+                radar = bot.Radar(make_cfg(Path(tmp.name), min_market_cap=1e9), client)
+                await radar.refresh_tickers()
+                c = bot.Candidate(source="wire", source_label="PR Newswire", ticker="OKLO", company="Oklo Inc.",
+                                  title=title, link="https://x", published_ts=None, watch=False, summary=title,
+                                  press_release=press_release)
+                c.text = title
+                await radar.process(c)
+            return [m["text"] for m in w.sent]
+        return run(scenario())
+
+    def test_only_trial_readouts_and_small_takeovers(self) -> None:
+        self.assertEqual(self.alerts("Oklo Awarded $450 Million Contract by U.S. Department of Defense"), [])
+        self.assertEqual(self.alerts("Oklo Partners With NVIDIA To Accelerate AI Reactors"), [])
+        self.assertEqual(self.alerts("Oklo to Present Positive Phase 2 Results at ASH 2026"), [])
+        self.assertEqual(len(self.alerts("Oklo Announces Positive Topline Results From Pivotal Phase 3 Trial")), 1)
+        self.assertEqual(len(self.alerts("Oklo To Be Acquired By Acme For $42 Per Share In Cash")), 1)
+
+    def test_the_wire_candidate_is_marked_as_a_press_release(self) -> None:
+        async def scenario() -> tuple[bool, bool]:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            async with base_world().client() as client:
+                radar = bot.Radar(make_cfg(Path(tmp.name)), client)
+                await radar.refresh_tickers()
+                it = bot.WireItem("k", "Oklo Announces Something", "https://x", "", None, ["OKLO"])
+                wire = radar.wire_candidate(it, "GlobeNewswire")
+                bz = radar.wire_candidate(it, bot.ALPACA_SOURCE)
+            return wire.press_release, bz.press_release
+        self.assertEqual(run(scenario()), (True, False))
+        it = bot.alpaca_news_item({**AlpacaNewsTest.MSG, "author": ""})
+        self.assertEqual(it.author, "")
 
 
 class PredictionsOnlyTest(unittest.TestCase):

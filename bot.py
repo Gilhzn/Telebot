@@ -1088,6 +1088,12 @@ TRIAL_LABELS = ("עמידה ביעד הראשי בניסוי", "תוצאות top
 # 37% (172 a year); everything else (contracts, partnerships, an FDA approval in the summary, a giant's
 # name) 11%, the plain $1B+ base rate. Above $10B Benzinga's takeover stories are mostly about the buyer.
 BENZINGA_TAKEOVER_MAX_CAP = 10e9
+# The wires' press releases (PR Newswire, GlobeNewswire, Business Wire, and Benzinga's copies of them): a year
+# of the ones the rules score 4+ at $1B+ that are not results (1,179) rose 10%+ 9.5% of the time, under the
+# base rate; contracts 5%, partnerships 8%, government customers 5%, FDA approvals 6%. Takeovers under $10B
+# and trial readouts whose headline says topline / primary endpoint / phase 3 / pivotal: 175, 25.7% up, 7.4%
+# down. Results releases go to the earnings table (RESULTS_TABLE_WAIT); SEC filings are not gated here.
+STRONG_TRIAL_RE = re.compile(r"\b(?:topline|top-line|primary endpoint|phase (?:3|iii)\b|pivotal)", re.I)
 SMALL_CONTRACT_RATIO = 0.01       # a contract under 1% of the company's value: a year of $1B+ data says noise
 RUNNER_PCT = 30.0                 # "runner": a 30%+ day in the last month; these tend to run again
 RUNNER_MAX_PRICE = 10.0           # and still a small, cheap stock
@@ -1789,6 +1795,7 @@ class WireItem:
     summary: str
     published_ts: float | None
     tickers: list[str]
+    author: str = ""           # Alpaca: Benzinga's reporter; empty for the wires' press releases it republishes
 
 
 def parse_wire_feed(content: bytes | str) -> list[WireItem]:
@@ -1919,7 +1926,8 @@ def alpaca_news_item(m: dict[str, Any]) -> WireItem | None:
         ts = None
     # The short summary, not the whole article: Benzinga's articles mention other companies' news.
     body = html_to_text(m.get("summary") or "") or html_to_text(m.get("content") or "")[:600]
-    return WireItem(f"bz:{m.get('id')}", html_to_text(m["headline"]), m.get("url") or "", body, ts, symbols)
+    return WireItem(f"bz:{m.get('id')}", html_to_text(m["headline"]), m.get("url") or "", body, ts, symbols,
+                    str(m.get("author") or ""))
 
 
 def wire_item_ids(it: WireItem) -> list[str]:
@@ -2296,6 +2304,8 @@ class Candidate:
     text: str | None = None     # fetched text, cached between steps
     earnings: bool = False      # scored by the earnings-surprise table (not muted by the jump model)
     await_table: bool = False   # a results release with a raised outlook, waiting for Benzinga's numbers
+    press_release: bool = False  # a company's own release from a wire (PR Newswire, GlobeNewswire, Business Wire)
+    labels: list[str] = field(default_factory=list)   # the rules' labels, whatever engine set the score
     table_wait_done: bool = False
 
     @property
@@ -2704,6 +2714,7 @@ class Radar:
                                    ALPACA_SOURCE)
         if cand is None:
             return
+        cand.press_release = not it.author     # a wire's release republished, not Benzinga's own story
         cand.text = f"{it.title}\n{it.summary}"   # never fetch benzinga.com: it answers the bot 403
         self.state.log_news(cand.ticker or "", ALPACA_SOURCE, it.title, it.published_ts)
         self.spawn(self.process(cand))
@@ -2741,6 +2752,7 @@ class Radar:
             source="wire", source_label=source_name, ticker=ticker,
             company=found[1] if found else "", title=it.title, link=it.link,
             published_ts=it.published_ts, watch=watch, summary=it.summary,
+            press_release=source_name != ALPACA_SOURCE,
         )
 
     # ----- candidate pipeline ---------------------------------------------
@@ -2836,6 +2848,7 @@ class Radar:
         if rules.score < 4:  # a strong item is the result itself, not an announcement of one
             catalyst = find_catalyst(f"{c.title}\n{body[:LEAD_CHARS]}", us_eastern_now().date())
         score, reason = rules.score, rules.reason_he
+        c.labels = list(rules.labels)
         if (EARNINGS_RE.search(f"{c.title}\n{body[:LEAD_CHARS]}") or "2.02" in c.items) \
                 and "העלאת תחזית" not in rules.labels and score > 3:
             # A year of $1B+ results releases: without a raised outlook score-4+ ones rose 18% / fell 21%
@@ -3054,11 +3067,15 @@ class Radar:
             log.info("Too small %s (market cap %s): %s", c.ticker, fmt_money(mcap) if mcap else "unknown",
                      c.title or c.items)
             return
-        if score is not None and c.source_label == ALPACA_SOURCE and not c.earnings and not trusted:
-            takeover = any(lbl in reason for lbl in TAKEOVER_LABELS)
-            if not (any(lbl in reason for lbl in TRIAL_LABELS)
-                    or (takeover and (mcap or 0) < BENZINGA_TAKEOVER_MAX_CAP)):
-                log.info("Benzinga story, not a trial result or a takeover under $10B (score %s): %s", score, c.title)
+        if score is not None and (c.source_label == ALPACA_SOURCE or c.press_release) and not c.earnings \
+                and not c.table_wait_done and not trusted:
+            takeover = any(lbl in TAKEOVER_LABELS for lbl in c.labels)
+            trial = any(lbl in TRIAL_LABELS for lbl in c.labels)
+            if trial and c.press_release and not STRONG_TRIAL_RE.search(c.title):
+                trial = False    # a release "presenting data" at a conference, not the readout itself
+            if not (trial or (takeover and (mcap or 0) < BENZINGA_TAKEOVER_MAX_CAP)):
+                log.info("%s, not a trial readout or a takeover under $10B (score %s): %s",
+                         "Press release" if c.press_release else "Benzinga story", score, c.title)
                 return
         if score is not None and mcap and not trusted:
             takeover = any(lbl in reason for lbl in TAKEOVER_LABELS)
