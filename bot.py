@@ -406,7 +406,7 @@ class Config:
             wire_feeds=_split(_env("WIRE_FEEDS", DEFAULT_WIRE_FEEDS)),
             wire_user_agent=_env("WIRE_USER_AGENT", WIRE_USER_AGENT),
             dedup_hours=_env_float("DEDUP_HOURS", 6.0),
-            max_per_cycle=max(1, _env_int("MAX_ALERTS_PER_CYCLE", 15)),
+            max_per_cycle=max(1, _env_int("MAX_ALERTS_PER_CYCLE", 60)),
             state_file=Path(_env("STATE_FILE", "state.json")),
             env_file=Path(_env("ENV_FILE", ".env")),
         )
@@ -2678,6 +2678,8 @@ class Radar:
             late += sum(1 for m in news if not self.state.is_seen(f"wire:bz:{m.get('id')}")
                         and is_results_headline(m.get("headline") or ""))
             self.handle_alpaca_batch(news)
+            for m in news:      # also the ones handle_alpaca_news drops, so the next sweep does not count them again
+                self.state.mark_seen(f"wire:bz:{m.get('id')}")
             if not data.get("next_page_token"):
                 break
             params["page_token"] = data["next_page_token"]

@@ -111,7 +111,7 @@ python bot.py               # הרצה רציפה
 | `WIRE_FEEDS` | 16 פידים: PR Newswire (כללי + 7 תחומים), GlobeNewswire (חברות ציבוריות + Health Care, Biotechnology, Pharmaceuticals, Semiconductors, Defense, Aerospace), Business Wire | כתובות RSS מופרדות בפסיקים. כל פיד מחזיק רק כ-20 פריטים, ופידים לפי תחום שומרים יותר היסטוריה בין דגימה לדגימה. ב-Business Wire הטיקר כמעט לא מופיע בפיד, ולכן הבוט מזהה אותו לפי שם החברה בתחילת הכותרת (התאמה מדויקת לשם ברשימת ה-SEC) |
 | `WIRE_USER_AGENT` | `StockNewsRadar-RSS/1.0` | הזיהוי מול אתרי הוואיירים: שם אמיתי של הבוט, בלי קישור. GlobeNewswire חוסם זיהוי שמכיל כתובת אתר, ואתרים חוסמים גם זיהוי מזויף של דפדפן |
 | `DEDUP_HOURS` | `6` | חלון מניעת כפילות לטיקר |
-| `MAX_ALERTS_PER_CYCLE` | `15` | תקרת מועמדים למחזור לכל מקור |
+| `MAX_ALERTS_PER_CYCLE` | `60` | תקרת מועמדים למחזור לכל מקור (מועמדים, לא פושים: רובם נעצרים בשערים. 15 הפילו הודעות דוח בשעות העומס) |
 | `STATE_FILE` | `state.json` | נתיב קובץ המצב |
 
 ## פריסה
