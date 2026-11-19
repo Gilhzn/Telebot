@@ -367,6 +367,7 @@ class Config:
     guru_alerts: bool = True
     jump_model: bool = True
     predictions_only: bool = True    # push only the formula's rise alerts; reports, breakouts, halts stay silent
+    push_falls: bool = False         # push "likely to fall" results too (off: only rises are pushed)
     gurus: list[tuple[int, str, str]] = field(default_factory=lambda: list(DEFAULT_GURUS))
     edgar_forms: list[str] = field(default_factory=lambda: ["8-K", "6-K"])
     edgar_poll: float = 2.0
@@ -399,6 +400,7 @@ class Config:
             guru_alerts=_env_bool("GURU_ALERTS", True),
             jump_model=_env_bool("JUMP_MODEL", True),
             predictions_only=_env_bool("PUSH_PREDICTIONS_ONLY", True),
+            push_falls=_env_bool("PUSH_FALL_PREDICTIONS", False),
             gurus=parse_gurus(_env("GURUS")) or list(DEFAULT_GURUS),
             edgar_forms=[f.upper() for f in _split(_env("EDGAR_FORMS", "8-K,6-K"))],
             edgar_poll=max(1.0, _env_float("EDGAR_POLL_SECONDS", 2.0)),
@@ -1070,6 +1072,11 @@ GAINERS_MIN_VOLUME = 300_000
 GAINERS_TOP = 15
 MOVE_START_PCT = 0.10             # the move starts at the first minute 10% above the previous close
 NEWS_LOG_HOURS = 72
+# The other side of the earnings table: guidance cut or a miss on both lines (score -3). A year of $1B+
+# results, trained on Oct-May and checked on Jun-Oct: 39% / 36% fell 5%+ (base 22% / 20%), 21% / 19% fell
+# 10%+, under $10B 43% / 40%. Recorded (and pushed with PUSH_FALL_PREDICTIONS=true), measured weekly.
+FALL_SCORE = -3
+FALL_LOG_MAX = 400
 RESULTS_TABLE_WAIT = 8 * 60       # how long a results release waits for Benzinga's numbers headline (3-5 min typical)
 GAINERS_LOG_MAX = 4_000
 LEARNING_READY_DAYS = 10          # trading days of data before the "ready" summary
@@ -2119,6 +2126,7 @@ class State:
         self.gainers_day = ""
         self.learning_ready_sent = False
         self.pending_results: list[dict[str, Any]] = []   # results releases waiting for Benzinga's numbers
+        self.fall_log: list[dict[str, Any]] = []          # results the earnings table expects to fall
         self.news_log_since = 0.0                        # when news logging started (first full day only)
         self.momentum: dict[str, Any] = {"date": "", "tickers": []}  # breakout alerts sent today
         self.runners: dict[str, Any] = {"day": "", "tickers": []}   # recent runners, watched before the open
@@ -2155,6 +2163,7 @@ class State:
         st.gainers_day = data.get("gainers_day", "")
         st.learning_ready_sent = bool(data.get("learning_ready_sent", False))
         st.pending_results = [e for e in data.get("pending_results", []) if isinstance(e, dict) and "c" in e]
+        st.fall_log = [e for e in data.get("fall_log", []) if isinstance(e, dict)]
         st.news_log_since = float(data.get("news_log_since", 0.0))
         st.momentum = data.get("momentum", {"date": "", "tickers": []})
         st.runners = data.get("runners", {"day": "", "tickers": []})
@@ -2213,6 +2222,7 @@ class State:
             "gainers_day": self.gainers_day,
             "learning_ready_sent": self.learning_ready_sent,
             "pending_results": self.pending_results[-50:],
+            "fall_log": self.fall_log[-FALL_LOG_MAX:],
             "news_log_since": self.news_log_since,
             "momentum": self.momentum,
             "runners": self.runners,
@@ -2406,6 +2416,7 @@ class Radar:
         self.mcaps: dict[str, tuple[float, float | None]] = {}     # ticker -> (computed at, market cap)
         self.table_wait = RESULTS_TABLE_WAIT
         self.waits: set[asyncio.Task[Any]] = set()
+        self.fall_seen: set[tuple[str, str]] = set()
         self.fact_shares: dict[int, tuple[float, float | None]] = {}   # CIK -> (fetched at, statement share count)
         self.jump_model = load_jump_model() if cfg.jump_model else None
         self.momentum_checked: dict[str, float] = {}
@@ -3049,6 +3060,8 @@ class Radar:
             promotes = bool(self.jump_model) and float(self.jump_model.get("promote_at", 2.0)) <= 1.0
             if c.await_table and c.ticker:
                 self.queue_results_wait(c)
+            if c.earnings and score <= FALL_SCORE and c.ticker:
+                await self.record_fall(c, score, reason)
             if score < self.cfg.min_score and not (promotes and score >= 0 and c.ticker):
                 log.info("Below threshold %s (%s): %s", c.ticker, score, c.title or c.items)
                 return
@@ -3116,6 +3129,41 @@ class Radar:
             if self.state.last_alert.get(key) == now:
                 del self.state.last_alert[key]
             log.error("Sending alert for %s failed: %s", key, exc)
+
+    async def record_fall(self, c: Candidate, score: int, reason: str) -> None:
+        """A $1B+ company whose results the earnings table expects to fall: logged for /down and the weekly
+        review, pushed only with PUSH_FALL_PREDICTIONS."""
+        day = us_eastern_now().date().isoformat()
+        if (c.ticker, day) in self.fall_seen or any(e["ticker"] == c.ticker and e.get("day") == day
+                                                     for e in self.state.fall_log):
+            return
+        self.fall_seen.add((c.ticker, day))      # before the await: the next headline of the same results waits on it
+        big, mcap = await self.big_enough(c.ticker)
+        if not big:
+            return
+        self.state.fall_log.append({"t": time.time(), "day": day, "ticker": c.ticker, "score": score,
+                                    "mcap": mcap, "title": c.title[:140], "reason": reason[:200]})
+        self.state.dirty = True
+        log.info("FALL %s score=%s %s", c.ticker, score, c.title)
+        if self.cfg.push_falls and self.chat_id:
+            rate = "40%" if mcap and mcap < 10e9 else "36%"
+            await self.tg.send(self.chat_id, (
+                f"📉 <b>{esc(c.ticker)}</b> צפויה לרדת (דוח חלש)\n{esc(c.title)}\n{esc(reason)}\n"
+                f"בשנה האחרונה {rate} מדוחות כאלה ירדו 5%+ באותו יום (בממוצע: 20%). "
+                + (f"שווי {fmt_money(mcap)}. " if mcap else "") + "לא ייעוץ השקעות."))
+
+    def falls_text(self) -> str:
+        cutoff = time.time() - 3 * 86400
+        recent = [e for e in self.state.fall_log if e["t"] >= cutoff]
+        if not recent:
+            return "📉 אין דוחות חלשים של חברות של מיליארד ומעלה ב-3 הימים האחרונים."
+        lines = [f"📉 <b>צפויות לרדת</b> (דוח עם הורדת תחזית או החטאה כפולה, 3 ימים, {len(recent)}):",
+                 "בשנה האחרונה 36%–40% מדוחות כאלה ירדו 5%+ באותו יום, מול 20% בממוצע."]
+        for e in sorted(recent, key=lambda e: -e["t"])[:25]:
+            when = dt.datetime.fromtimestamp(e["t"], eastern_tz()).strftime("%d.%m %H:%M")
+            lines.append(f"• {when} <b>{esc(e['ticker'])}</b>"
+                         + (f" ({fmt_money(e['mcap'])})" if e.get("mcap") else "") + f": {esc(e['title'][:90])}")
+        return "\n".join(lines)
 
     def queue_results_wait(self, c: Candidate) -> None:
         """Hold a results release with a raised outlook until Benzinga's numbers headline can decide. The
@@ -3915,6 +3963,7 @@ class Radar:
             "/list — הצגת הרשימה\n"
             "/catalysts — קטליזטורים צפויים (תוצאות ניסויים, החלטות FDA)\n"
             "/perf — מה היה קורה אם היית קונה 3 דקות אחרי כל התראה\n"
+            "/down — מניות שהדוח שלהן צפוי להוריד אותן (הורדת תחזית, החטאה כפולה)\n"
             "/gurus — משקיעי-העל שבמעקב (קניות ומכירות מדיווחי 13F)\n"
             "/learn — מה למדתי על המניות שמזנקות (סוג חדשות, מקור, תזמון)\n"
             "🚀 התראת \"זינוק בתהליך\" נשלחת אוטומטית כשמניה עולה 15%+ עם מחזור אמיתי\n"
@@ -4015,6 +4064,8 @@ class Radar:
             await self.send_long(learning_summary(self.state.gainers_log))
         elif cmd in ("/gurus", "/guru"):
             await self.reply(self.gurus_text())
+        elif cmd in ("/down", "/falls"):
+            await self.reply(self.falls_text())
         elif cmd in ("/perf", "/performance"):
             await self.reply(perf_summary_text(self.state.alert_log))
         elif cmd == "/list":

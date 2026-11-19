@@ -2468,6 +2468,36 @@ class PressReleaseGateTest(unittest.TestCase):
         self.assertEqual(it.author, "")
 
 
+class FallPredictionTest(unittest.TestCase):
+    MISS = "Oklo Q3 Adj. EPS $0.20 Misses $0.30 Estimate, Sales $100M Miss $120M Estimate"
+
+    def run_miss(self, **cfg: Any) -> tuple[list[str], list[dict[str, Any]], str]:
+        async def scenario() -> tuple[list[str], list[dict[str, Any]], str]:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            w = MarketCapTest().world(40e6)                                   # $2B
+            async with w.client() as client:
+                radar = bot.Radar(make_cfg(Path(tmp.name), min_market_cap=1e9, **cfg), client)
+                await radar.refresh_tickers()
+                radar.handle_alpaca_news({**AlpacaNewsTest.MSG, "id": 99, "headline": self.MISS, "content": "", "summary": ""})
+                radar.handle_alpaca_news({**AlpacaNewsTest.MSG, "id": 98, "headline": self.MISS + " ", "content": "",
+                                          "summary": ""})          # once a day per company
+                await radar.drain(5)
+                return [m["text"] for m in w.sent], list(radar.state.fall_log), radar.falls_text()
+        return run(scenario())
+
+    def test_a_double_miss_is_logged_not_pushed(self) -> None:
+        sent, log_, text = self.run_miss()
+        self.assertEqual(sent, [])
+        self.assertEqual([e["ticker"] for e in log_], ["OKLO"])
+        self.assertIn("OKLO", text)
+
+    def test_pushed_when_asked(self) -> None:
+        sent, _, _ = self.run_miss(push_falls=True)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("צפויה לרדת", sent[0])
+
+
 class PredictionsOnlyTest(unittest.TestCase):
     def test_only_rise_predictions_are_pushed(self) -> None:
         dtm = __import__("datetime")

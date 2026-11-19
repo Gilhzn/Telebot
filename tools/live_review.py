@@ -162,7 +162,8 @@ def main() -> int:
         seen.add((a["ticker"], day))
         alerts.append(a)
     gainers = [g for g in state.get("gainers_log", []) if g.get("large") and g.get("date", "") >= sys.argv[2]]
-    symbols = sorted({a["ticker"] for a in alerts} | {g["ticker"] for g in gainers})
+    falls = [f for f in state.get("fall_log", []) if f.get("t", 0) >= since]
+    symbols = sorted({a["ticker"] for a in alerts} | {g["ticker"] for g in gainers} | {f["ticker"] for f in falls})
     start = (dt.date.fromisoformat(sys.argv[2]) - dt.timedelta(days=12)).isoformat()
     bars = asyncio.run(daily_bars(symbols, start))
     summaries = asyncio.run(benzinga_texts(alerts))
@@ -247,6 +248,20 @@ def main() -> int:
     lines += ["", f"missed gainers with a Benzinga results headline before the move: {len(with_heads)} "
               f"(scored 4+ by the earnings table, i.e. the bot should have alerted: "
               f"{sum(1 for g in with_heads if (g.get('bz_score') or 0) >= 4)})"]
+    # fall predictions (earnings table -3): did they fall?
+    f_rows = []
+    for f in falls:
+        o = outcome(bars.get(f["ticker"], []), f["t"])
+        if o:
+            f_rows.append({**f, "o": o})
+    if f_rows:
+        n = len(f_rows)
+        lines += ["", f"## fall predictions ({n}; a year of these: 36%-40% fell 5%+, 19%-23% fell 10%+, 9% rose)", "",
+                  f"fell 5%+: {pct(sum(r['o']['close_r'] <= -0.05 for r in f_rows), n)}, "
+                  f"fell 10%+: {pct(sum(r['o']['close_r'] <= -0.10 for r in f_rows), n)}, "
+                  f"rose (the up rule): {pct(sum(up(r['o']) for r in f_rows), n)}", ""]
+        for r in sorted(f_rows, key=lambda r: r["o"]["close_r"]):
+            lines.append(f"- {r['ticker']} close {r['o']['close_r'] * 100:+.1f}% {r['title'][:90]}")
     text = "\n".join(lines) + "\n"
     (OUT / "report.md").write_text(text, encoding="utf-8")
     print(text)
